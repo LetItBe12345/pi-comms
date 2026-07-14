@@ -25,7 +25,6 @@
 npm ci
 npm run typecheck
 npm test
-npm run build
 ```
 
 协议、Broker、路由和数据库使用自动测试。Pi Session、TUI 和中文输入使用人工验收。

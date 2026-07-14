@@ -11,8 +11,7 @@
     "broker": "tsx src/broker/server.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
-    "build": "tsc --noEmit",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
