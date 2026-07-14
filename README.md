@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-项目正在开发中，目前处于 Node.js 通信验证阶段，尚无可用版本。
+项目正在开发中，目前处于 Pi Extension 最小验证阶段，尚无可用版本。
 
 MVP 只支持：
 
@@ -35,6 +35,7 @@ Pi Session B Extension ─┘
 ```bash
 npm ci
 npm run check
+npm run broker
 ```
 
 ## 文档

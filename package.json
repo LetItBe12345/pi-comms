@@ -8,6 +8,7 @@
   },
   "packageManager": "npm@10.9.8",
   "scripts": {
+    "broker": "tsx src/broker/server.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "build": "tsc --noEmit",
