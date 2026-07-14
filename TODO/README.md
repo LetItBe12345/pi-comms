@@ -13,7 +13,7 @@
 
 | 阶段 | 文件 | 目标 | 状态 | 依赖 |
 | --- | --- | --- | --- | --- |
-| 0 | [环境准备](./in-progress/00-environment.md) | 准备可运行的开发环境 | in-progress | 无 |
+| 0 | [环境准备](./done/00-environment.md) | 准备可运行的开发环境 | done | 无 |
 | 1 | [Node.js 通信验证](./in-progress/01-node-broker.md) | 两个普通客户端经 Broker 通信 | in-progress | 阶段 0 |
 | 2 | [Pi Extension 最小验证](./in-progress/02-pi-extension.md) | Extension 能连接 Broker | in-progress | 阶段 1 |
 | 3 | [远程 Agent 闭环](./in-progress/03-agent-roundtrip.md) | A 请求 B，并收到唯一回答 | in-progress | 阶段 2 |
