@@ -7,3 +7,4 @@
 - [阶段 0：环境准备](./00-environment.md)
 - [阶段 1：普通 Node.js 通信验证](./01-node-broker.md)
 - [阶段 2：Pi Extension 最小验证](./02-pi-extension.md)
+- [阶段 3：远程 Agent 闭环](./03-agent-roundtrip.md)

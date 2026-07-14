@@ -9,6 +9,9 @@ import {
   createEnvelope,
   encodeEnvelope,
   JsonlDecoder,
+  type AgentFailureReason,
+  type AgentRequestPayload,
+  type AgentResultPayload,
 } from "../protocol.js";
 
 const STATUS_KEY = "pi-comms";
@@ -26,13 +29,17 @@ export function createCommsExtension(
   return (pi: ExtensionAPI) => {
     let socket: Socket | undefined;
     let connectTask: Promise<boolean> | undefined;
+    let context: ExtensionContext | undefined;
     let ui: ExtensionUIContext | undefined;
     let sessionId: string | undefined;
     let clientId: string | undefined;
     let knownClients = new Set<string>();
+    let activeRequest: AgentRequestPayload | undefined;
+    let lastAssistantText: string | undefined;
     let shuttingDown = false;
 
     function updateContext(ctx: ExtensionContext): void {
+      context = ctx;
       ui = ctx.ui;
       sessionId = ctx.sessionManager.getSessionId();
     }
@@ -178,9 +185,21 @@ export function createCommsExtension(
           return false;
         }
 
-        case "send.failed":
-          ui?.notify("测试消息发送失败：目标不在线", "error");
+        case "agent.deliver": {
+          if (!isAgentRequest(payload)) {
+            ui?.notify("收到无效的 Agent 请求", "error");
+            return false;
+          }
+          handleAgentDelivery(payload);
           return false;
+        }
+
+        case "send.failed": {
+          const reason =
+            typeof payload.reason === "string" ? payload.reason : "unknown";
+          ui?.notify(`请求失败：${failureMessage(reason)}`, "error");
+          return false;
+        }
 
         case "error":
           ui?.notify(
@@ -192,6 +211,38 @@ export function createCommsExtension(
         default:
           return false;
       }
+    }
+
+    function handleAgentDelivery(request: AgentRequestPayload): void {
+      if (activeRequest !== undefined || context?.isIdle() !== true) {
+        sendAgentFailure(request.requestId, "agent_busy");
+        return;
+      }
+
+      activeRequest = request;
+      lastAssistantText = undefined;
+      try {
+        pi.sendUserMessage(formatAgentRequest(request));
+      } catch {
+        activeRequest = undefined;
+        sendAgentFailure(request.requestId, "delivery_failed");
+      }
+    }
+
+    function sendAgentFailure(
+      requestId: string,
+      reason: AgentFailureReason,
+    ): void {
+      sendAgentResult({ requestId, ok: false, reason });
+    }
+
+    function sendAgentResult(result: AgentResultPayload): boolean {
+      if (socket === undefined || socket.destroyed || clientId === undefined) {
+        ui?.notify("Agent 回答回传失败：Broker 未连接", "error");
+        return false;
+      }
+      socket.write(encodeEnvelope(createEnvelope("agent.result", result)));
+      return true;
     }
 
     async function disconnect(): Promise<void> {
@@ -222,8 +273,45 @@ export function createCommsExtension(
     pi.on("session_shutdown", async (_event, ctx) => {
       shuttingDown = true;
       updateContext(ctx);
+      activeRequest = undefined;
+      lastAssistantText = undefined;
       await disconnect();
       ctx.ui.setStatus(STATUS_KEY, undefined);
+    });
+
+    pi.on("input", (event, ctx) => {
+      updateContext(ctx);
+      if (activeRequest !== undefined && event.source !== "extension") {
+        ctx.ui.notify("正在处理远程请求，请稍后", "warning");
+        return { action: "handled" as const };
+      }
+      return { action: "continue" as const };
+    });
+
+    pi.on("message_end", (event, ctx) => {
+      updateContext(ctx);
+      if (activeRequest === undefined || event.message.role !== "assistant") {
+        return;
+      }
+      lastAssistantText = extractAssistantText(event.message.content);
+    });
+
+    pi.on("agent_settled", (_event, ctx) => {
+      updateContext(ctx);
+      if (activeRequest === undefined) {
+        return;
+      }
+
+      const requestId = activeRequest.requestId;
+      const answer = lastAssistantText;
+      activeRequest = undefined;
+      lastAssistantText = undefined;
+
+      if (answer === undefined) {
+        sendAgentFailure(requestId, "no_text");
+      } else {
+        sendAgentResult({ requestId, ok: true, text: answer });
+      }
     });
 
     pi.registerCommand("comms-test", {
@@ -244,6 +332,69 @@ export function createCommsExtension(
       },
     });
   };
+}
+
+function isAgentRequest(payload: unknown): payload is AgentRequestPayload {
+  if (!isRecord(payload)) {
+    return false;
+  }
+  return (
+    typeof payload.requestId === "string" &&
+    typeof payload.groupId === "string" &&
+    typeof payload.senderId === "string" &&
+    typeof payload.senderName === "string" &&
+    typeof payload.targetAgentId === "string" &&
+    typeof payload.text === "string" &&
+    typeof payload.chainId === "string" &&
+    typeof payload.round === "number"
+  );
+}
+
+function formatAgentRequest(request: AgentRequestPayload): string {
+  return [
+    "[Pi Comms 远程请求]",
+    `发送者：${request.senderName}`,
+    `群组：${request.groupId}`,
+    `目标：@${request.targetAgentId}`,
+    `消息：${request.text}`,
+    "",
+    "请直接回答该消息。",
+  ].join("\n");
+}
+
+function extractAssistantText(content: unknown): string | undefined {
+  if (!Array.isArray(content)) {
+    return typeof content === "string" && content.trim()
+      ? content.trim()
+      : undefined;
+  }
+
+  const text = content
+    .filter(
+      (item): item is { type: "text"; text: string } =>
+        isRecord(item) && item.type === "text" && typeof item.text === "string",
+    )
+    .map((item) => item.text)
+    .join("")
+    .trim();
+  return text || undefined;
+}
+
+function failureMessage(reason: string): string {
+  switch (reason) {
+    case "target_offline":
+      return "目标 Agent 不在线";
+    case "target_disconnected":
+      return "目标 Agent 已断线";
+    case "agent_busy":
+      return "目标 Agent 正忙";
+    case "no_text":
+      return "Agent 未产生文本回答";
+    case "delivery_failed":
+      return "请求无法注入目标 Agent";
+    default:
+      return "未知错误";
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

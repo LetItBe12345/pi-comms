@@ -16,6 +16,8 @@ import {
   type BrokerEnvelope,
   type Envelope,
   type ErrorPayload,
+  type AgentResultPayload,
+  type SendFailedPayload,
 } from "../protocol.js";
 
 export const DEFAULT_SOCKET_PATH = join(
@@ -40,6 +42,7 @@ export function createBrokerServer(
 ): BrokerServer {
   const socketPath = options.socketPath ?? DEFAULT_SOCKET_PATH;
   const clients = new Map<string, Socket>();
+  const pendingRequests = new Map<string, { targetClientId: string }>();
   const server = createServer(handleConnection);
   let started = false;
   let closing = false;
@@ -94,6 +97,7 @@ export function createBrokerServer(
             online: false,
           }) as BrokerEnvelope,
         );
+        failRequestsForDisconnectedTarget(clientId);
       }
     });
   }
@@ -113,7 +117,18 @@ export function createBrokerServer(
       return;
     }
 
+    if (parsed.envelope.type === "agent.result") {
+      handleAgentResult(senderClientId, senderSocket, parsed.envelope.payload);
+      return;
+    }
+
     const { id, payload } = parsed.envelope;
+
+    if (payload.targetClientId === undefined && payload.text.startsWith("@")) {
+      handleAgentRequest(senderClientId, senderSocket, id, payload.text);
+      return;
+    }
+
     const message = createEnvelope(
       "chat.message",
       {
@@ -145,6 +160,115 @@ export function createBrokerServer(
     }
 
     send(target, message);
+  }
+
+  function handleAgentRequest(
+    senderClientId: string,
+    senderSocket: Socket,
+    requestId: string,
+    rawText: string,
+  ): void {
+    const mention = parseAgentMention(rawText);
+    if (mention === undefined) {
+      sendError(senderSocket, {
+        code: "invalid_payload",
+        message: "@Agent 格式应为：@完整clientId 消息正文",
+        requestId,
+      });
+      return;
+    }
+
+    const publicMessage = createEnvelope(
+      "chat.message",
+      {
+        senderClientId,
+        targetClientId: mention.targetClientId,
+        text: rawText,
+        requestId,
+      },
+      { id: requestId },
+    ) as BrokerEnvelope;
+    broadcast(publicMessage);
+
+    const target = clients.get(mention.targetClientId);
+    if (target === undefined || target.destroyed) {
+      broadcastFailure({
+        requestId,
+        targetClientId: mention.targetClientId,
+        reason: "target_offline",
+      });
+      return;
+    }
+
+    pendingRequests.set(requestId, {
+      targetClientId: mention.targetClientId,
+    });
+    send(
+      target,
+      createEnvelope("agent.deliver", {
+        requestId,
+        groupId: "default",
+        senderId: senderClientId,
+        senderName: `Client-${senderClientId.slice(0, 8)}`,
+        targetAgentId: mention.targetClientId,
+        text: mention.text,
+        chainId: requestId,
+        round: 1,
+      }) as BrokerEnvelope,
+    );
+  }
+
+  function handleAgentResult(
+    senderClientId: string,
+    senderSocket: Socket,
+    result: AgentResultPayload,
+  ): void {
+    const pending = pendingRequests.get(result.requestId);
+    if (pending === undefined || pending.targetClientId !== senderClientId) {
+      sendError(senderSocket, {
+        code: "invalid_payload",
+        message: "agent.result 没有对应的待处理请求",
+        requestId: result.requestId,
+      });
+      return;
+    }
+
+    pendingRequests.delete(result.requestId);
+    if (!result.ok) {
+      broadcastFailure({
+        requestId: result.requestId,
+        targetClientId: senderClientId,
+        reason: result.reason,
+      });
+      return;
+    }
+
+    broadcast(
+      createEnvelope("chat.message", {
+        senderClientId,
+        text: result.text,
+        requestId: result.requestId,
+        kind: "agent" as const,
+      }) as BrokerEnvelope,
+    );
+  }
+
+  function failRequestsForDisconnectedTarget(targetClientId: string): void {
+    for (const [requestId, pending] of pendingRequests) {
+      if (pending.targetClientId !== targetClientId) {
+        continue;
+      }
+      pendingRequests.delete(requestId);
+      broadcastFailure({
+        requestId,
+        targetClientId,
+        reason: "target_disconnected",
+      });
+    }
+  }
+
+  function broadcastFailure(payload: SendFailedPayload): void {
+    broadcast(createEnvelope("send.failed", payload) as BrokerEnvelope);
   }
 
   function sendError(socket: Socket, payload: ErrorPayload): void {
@@ -212,6 +336,18 @@ export function createBrokerServer(
   }
 
   return { socketPath, start, close };
+}
+
+function parseAgentMention(
+  text: string,
+): { targetClientId: string; text: string } | undefined {
+  const match = text.match(
+    /^@([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\s+([\s\S]*\S)$/i,
+  );
+  if (match === null) {
+    return undefined;
+  }
+  return { targetClientId: match[1], text: match[2] };
 }
 
 function send(socket: Socket, envelope: Envelope): void {
