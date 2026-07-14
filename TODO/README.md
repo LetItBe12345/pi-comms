@@ -15,7 +15,7 @@
 | --- | --- | --- | --- | --- |
 | 0 | [环境准备](./done/00-environment.md) | 准备可运行的开发环境 | done | 无 |
 | 1 | [Node.js 通信验证](./done/01-node-broker.md) | 两个普通客户端经 Broker 通信 | done | 阶段 0 |
-| 2 | [Pi Extension 最小验证](./in-progress/02-pi-extension.md) | Extension 能连接 Broker | in-progress | 阶段 1 |
+| 2 | [Pi Extension 最小验证](./done/02-pi-extension.md) | Extension 能连接 Broker | done | 阶段 1 |
 | 3 | [远程 Agent 闭环](./in-progress/03-agent-roundtrip.md) | A 请求 B，并收到唯一回答 | in-progress | 阶段 2 |
 | 4 | [队列与稳定性](./in-progress/04-queue-reliability.md) | 串行处理、断线恢复、去重 | in-progress | 阶段 3 |
 | 5 | [群组与成员](./in-progress/05-groups-members.md) | 建立群组和双成员模型 | in-progress | 阶段 4 |
