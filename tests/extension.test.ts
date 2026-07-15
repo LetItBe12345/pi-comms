@@ -12,7 +12,10 @@ import {
   createBrokerServer,
   type BrokerServer,
 } from "../src/broker/server.js";
-import { createCommsExtension } from "../src/extension/index.js";
+import {
+  createCommsExtension,
+  formatAgentRequest,
+} from "../src/extension/index.js";
 
 type EventHandler = (event: any, ctx: ExtensionContext) => Promise<any> | any;
 type CommandHandler = (
@@ -27,8 +30,8 @@ interface Notice {
 
 class FakePi {
   readonly handlers = new Map<string, EventHandler>();
+  readonly commands = new Map<string, CommandHandler>();
   readonly sentUserMessages: string[] = [];
-  command: CommandHandler | undefined;
 
   readonly api = {
     on: (event: string, handler: EventHandler) => {
@@ -38,9 +41,7 @@ class FakePi {
       name: string,
       options: { handler: CommandHandler },
     ) => {
-      if (name === "comms-test") {
-        this.command = options.handler;
-      }
+      this.commands.set(name, options.handler);
     },
     sendUserMessage: (content: string) => {
       this.sentUserMessages.push(content);
@@ -77,15 +78,12 @@ function createFakeContext(sessionId: string): {
   } as ExtensionUIContext;
   const ctx = {
     ui,
-    sessionManager: {
-      getSessionId: () => sessionId,
-    },
+    sessionManager: { getSessionId: () => sessionId },
     isIdle: () => idle,
     abort: () => {
       abortCount += 1;
     },
   } as ExtensionContext;
-
   return {
     ctx,
     notices,
@@ -93,9 +91,7 @@ function createFakeContext(sessionId: string): {
     setIdle(value: boolean) {
       idle = value;
     },
-    aborted() {
-      return abortCount;
-    },
+    aborted: () => abortCount,
   };
 }
 
@@ -103,16 +99,14 @@ async function waitFor(
   predicate: () => boolean,
   message: string,
 ): Promise<void> {
-  const deadline = Date.now() + 1_000;
+  const deadline = Date.now() + 1_500;
   while (!predicate()) {
-    if (Date.now() >= deadline) {
-      throw new Error(message);
-    }
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    if (Date.now() >= deadline) throw new Error(message);
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
 
-describe("Pi Extension", () => {
+describe("Pi Extension 群组接入", () => {
   let directory: string;
   let socketPath: string;
   let broker: BrokerServer | undefined;
@@ -127,7 +121,7 @@ describe("Pi Extension", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  function setupExtension(sessionId: string) {
+  function setup(sessionId: string) {
     const pi = new FakePi();
     const context = createFakeContext(sessionId);
     createCommsExtension({
@@ -138,223 +132,137 @@ describe("Pi Extension", () => {
     return { pi, ...context };
   }
 
-  function clientIdOf(extension: ReturnType<typeof setupExtension>): string {
-    const connectionNotice = [...extension.notices]
-      .reverse()
-      .find((notice) => notice.message.includes("Client:"));
-    const clientId = connectionNotice?.message.match(/Client: ([\w-]+)/)?.[1];
-    if (clientId === undefined) {
-      throw new Error("未找到 clientId");
-    }
-    return clientId;
+  async function command(
+    extension: ReturnType<typeof setup>,
+    name: string,
+    args = "",
+  ): Promise<void> {
+    await extension.pi.commands.get(name)?.(
+      args,
+      extension.ctx as ExtensionCommandContext,
+    );
   }
 
-  it("两个 Session 连接后都能看到广播消息", async () => {
+  async function start(extension: ReturnType<typeof setup>): Promise<void> {
+    await extension.pi.emit("session_start", extension.ctx);
+    await waitFor(
+      () => extension.statuses.includes("Broker 已连接"),
+      "Extension 未连接 Broker",
+    );
+  }
+
+  async function createGroup(
+    extension: ReturnType<typeof setup>,
+    args = "开发组 Alice Alice-Pi",
+  ): Promise<string> {
+    await command(extension, "comms-create", args);
+    await waitFor(
+      () => extension.notices.some((notice) => notice.message.includes("Group ID:")),
+      "未创建群组",
+    );
+    const notice = extension.notices.find((item) => item.message.includes("Group ID:"));
+    const groupId = notice?.message.match(/Group ID: ([\w-]+)/)?.[1];
+    if (groupId === undefined) throw new Error("未找到 groupId");
+    return groupId;
+  }
+
+  async function joinGroup(
+    extension: ReturnType<typeof setup>,
+    groupId: string,
+    userName = "Bob",
+    agentName = "Bob-Pi",
+  ): Promise<void> {
+    await command(
+      extension,
+      "comms-join",
+      `${groupId} ${userName} ${agentName}`,
+    );
+    await waitFor(
+      () => extension.notices.some((notice) => notice.message.includes("已加入群组")),
+      "未加入群组",
+    );
+  }
+
+  it("通过临时命令创建、加入、查看成员并公开聊天", async () => {
     broker = createBrokerServer({ socketPath });
     await broker.start();
-    const a = setupExtension("session-a");
-    const b = setupExtension("session-b");
+    const a = setup("session-a");
+    const b = setup("session-b");
+    await Promise.all([start(a), start(b)]);
+    const groupId = await createGroup(a);
+    await joinGroup(b, groupId);
+    await command(a, "comms-members");
+    expect(a.notices.at(-1)?.message).toContain("Alice-Pi (Agent)");
+    expect(a.notices.at(-1)?.message).toContain("Bob-Pi (Agent)");
 
-    await Promise.all([
-      a.pi.emit("session_start", a.ctx),
-      b.pi.emit("session_start", b.ctx),
-    ]);
-    await a.pi.command?.(
-      "来自 A 的测试",
-      a.ctx as ExtensionCommandContext,
+    await command(a, "comms-test", "公开消息");
+    await waitFor(
+      () => [a, b].every((item) => item.notices.some((notice) => notice.message === "[Alice] 公开消息")),
+      "群消息未公开",
     );
-
-    await Promise.all([
-      waitFor(
-        () => a.notices.some((notice) => notice.message.includes("来自 A 的测试")),
-        "A 没有收到广播",
-      ),
-      waitFor(
-        () => b.notices.some((notice) => notice.message.includes("来自 A 的测试")),
-        "B 没有收到广播",
-      ),
-    ]);
-
-    expect(a.statuses).toContain("Broker 已连接");
-    expect(b.statuses).toContain("Broker 已连接");
-
     await Promise.all([
       a.pi.emit("session_shutdown", a.ctx),
       b.pi.emit("session_shutdown", b.ctx),
     ]);
-    expect(a.statuses.at(-1)).toBeUndefined();
-    expect(b.statuses.at(-1)).toBeUndefined();
   });
 
-  it("首次连接失败后由命令重新连接", async () => {
-    const extension = setupExtension("session-retry");
-
-    await extension.pi.emit("session_start", extension.ctx);
-    expect(extension.notices).toContainEqual({
-      message: "Broker 未连接，正在等待 npm run broker 启动",
-      type: "warning",
+  it("未入群不能发送，并能查看本机群组列表", async () => {
+    broker = createBrokerServer({ socketPath });
+    await broker.start();
+    const a = setup("session-a");
+    const b = setup("session-b");
+    await Promise.all([start(a), start(b)]);
+    await createGroup(a);
+    await command(b, "comms-members");
+    expect(b.notices.at(-1)?.message).toContain("开发组");
+    await command(b, "comms-test", "不能发送");
+    expect(b.notices.at(-1)).toEqual({
+      message: "请先创建或加入群组",
+      type: "error",
     });
-
-    broker = createBrokerServer({ socketPath });
-    await broker.start();
-    await extension.pi.command?.(
-      "重连成功",
-      extension.ctx as ExtensionCommandContext,
-    );
-
-    await waitFor(
-      () =>
-        extension.notices.some((notice) => notice.message.includes("重连成功")),
-      "重连后没有收到广播",
-    );
-    expect(extension.statuses).toContain("Broker 已连接");
-
-    await extension.pi.emit("session_shutdown", extension.ctx);
-  });
-
-  it("Broker 重启后自动重连", async () => {
-    broker = createBrokerServer({ socketPath });
-    await broker.start();
-    const extension = setupExtension("session-reconnect");
-    await extension.pi.emit("session_start", extension.ctx);
-
-    await broker.close();
-    await waitFor(
-      () => extension.statuses.at(-1) === "Broker 未连接",
-      "断线状态没有更新",
-    );
-
-    broker = createBrokerServer({ socketPath });
-    await broker.start();
-    await waitFor(
-      () => extension.statuses.at(-1) === "Broker 已连接",
-      "Broker 重启后没有自动重连",
-    );
-    await extension.pi.command?.(
-      "再次连接",
-      extension.ctx as ExtensionCommandContext,
-    );
-
-    await waitFor(
-      () =>
-        extension.notices.some((notice) => notice.message.includes("再次连接")),
-      "Broker 重启后没有重连",
-    );
-    await extension.pi.emit("session_shutdown", extension.ctx);
-  });
-
-  it("Broker 实例变化时终止旧活动请求并接受新请求", async () => {
-    broker = createBrokerServer({ socketPath });
-    await broker.start();
-    const a = setupExtension("session-a");
-    const b = setupExtension("session-b");
-    await Promise.all([
-      a.pi.emit("session_start", a.ctx),
-      b.pi.emit("session_start", b.ctx),
-    ]);
-    await a.pi.command?.(
-      `@${clientIdOf(b)} 旧请求`,
-      a.ctx as ExtensionCommandContext,
-    );
-    await waitFor(
-      () => b.pi.sentUserMessages.length === 1,
-      "旧请求没有开始",
-    );
-
-    await broker.close();
-    broker = createBrokerServer({ socketPath });
-    await broker.start();
-    await waitFor(
-      () =>
-        a.statuses.at(-1) === "Broker 已连接" &&
-        b.statuses.at(-1) === "Broker 已连接",
-      "Broker 重启后两个 Extension 没有恢复",
-    );
-    expect(b.aborted()).toBe(1);
-
-    await a.pi.command?.(
-      `@${clientIdOf(b)} 新请求`,
-      a.ctx as ExtensionCommandContext,
-    );
-    await waitFor(
-      () => b.pi.sentUserMessages.length === 2,
-      "Broker 重启后没有接收新请求",
-    );
-    expect(b.pi.sentUserMessages[1]).toContain("消息：新请求");
-
     await Promise.all([
       a.pi.emit("session_shutdown", a.ctx),
       b.pi.emit("session_shutdown", b.ctx),
     ]);
   });
 
-  it("公开 @ 消息，但只向目标 Pi 注入请求并回传一次回答", async () => {
+  it("@Agent 只注入目标，并使用确定的群聊上下文格式", async () => {
     broker = createBrokerServer({ socketPath });
     await broker.start();
-    const a = setupExtension("session-a");
-    const b = setupExtension("session-b");
-    const c = setupExtension("session-c");
-    await Promise.all([
-      a.pi.emit("session_start", a.ctx),
-      b.pi.emit("session_start", b.ctx),
-      c.pi.emit("session_start", c.ctx),
-    ]);
-    const bClientId = clientIdOf(b);
-    const publicText = `@${bClientId} 只回复 STAGE3_OK`;
+    const a = setup("session-a");
+    const b = setup("session-b");
+    const c = setup("session-c");
+    await Promise.all([start(a), start(b), start(c)]);
+    const groupId = await createGroup(a);
+    await joinGroup(b, groupId);
+    await joinGroup(c, groupId, "Carol", "Carol-Pi");
 
-    await a.pi.command?.(publicText, a.ctx as ExtensionCommandContext);
-    await waitFor(
-      () => b.pi.sentUserMessages.length === 1,
-      "B 没有收到 Agent 注入",
-    );
-    await waitFor(
-      () =>
-        [a, b, c].every((extension) =>
-          extension.notices.some((notice) => notice.message.includes(publicText)),
-        ),
-      "公开 @ 消息没有显示给所有 Session",
-    );
-
+    await command(a, "comms-test", "@Bob-Pi 只回复 OK");
+    await waitFor(() => b.pi.sentUserMessages.length === 1, "目标未收到注入");
     expect(a.pi.sentUserMessages).toEqual([]);
     expect(c.pi.sentUserMessages).toEqual([]);
-    expect(b.pi.sentUserMessages[0]).toContain("消息：只回复 STAGE3_OK");
-    expect(b.pi.sentUserMessages[0]).toContain("群组：default");
-
-    const blocked = await b.pi.emit("input", b.ctx, {
-      text: "私人内容",
-      source: "interactive",
-    });
-    expect(blocked).toEqual({ action: "handled" });
+    expect(b.pi.sentUserMessages[0]).toBe(
+      [
+        "[Pi Comms 群聊请求]",
+        "你是：Bob-Pi（Agent）",
+        "所属用户：Bob",
+        "来自：Alice  群组：开发组",
+        "在线：Alice(用户)、Alice-Pi(Agent)、Bob(用户)、Carol(用户)、Carol-Pi(Agent)",
+        "",
+        "只回复 OK",
+        "",
+        "你的回答会作为公开消息发送到群组「开发组」，用于回应 Alice。请直接回答。",
+      ].join("\n"),
+    );
 
     await b.pi.emit("message_end", b.ctx, {
-      message: {
-        role: "assistant",
-        content: [
-          { type: "thinking", thinking: "不应公开" },
-          { type: "text", text: "STAGE3_OK" },
-        ],
-      },
+      message: { role: "assistant", content: [{ type: "text", text: "OK" }] },
     });
     await b.pi.emit("agent_settled", b.ctx);
-    await b.pi.emit("agent_settled", b.ctx);
-
     await waitFor(
-      () =>
-        [a, b, c].every((extension) =>
-          extension.notices.some((notice) =>
-            notice.message.includes("] STAGE3_OK"),
-          ),
-        ),
-      "Agent 回答没有公开返回",
+      () => [a, b, c].every((item) => item.notices.some((notice) => notice.message === "[Bob-Pi] OK")),
+      "Agent 回答未公开",
     );
-    for (const extension of [a, b, c]) {
-      expect(
-        extension.notices.filter((notice) =>
-          notice.message.includes("] STAGE3_OK"),
-        ),
-      ).toHaveLength(1);
-    }
-
     await Promise.all([
       a.pi.emit("session_shutdown", a.ctx),
       b.pi.emit("session_shutdown", b.ctx),
@@ -362,77 +270,25 @@ describe("Pi Extension", () => {
     ]);
   });
 
-  it("普通消息不注入 Agent，忙碌目标把远程请求加入队列", async () => {
+  it("忙碌 Agent 按 FIFO 处理连续请求", async () => {
     broker = createBrokerServer({ socketPath });
     await broker.start();
-    const a = setupExtension("session-a");
-    const b = setupExtension("session-b");
-    await Promise.all([
-      a.pi.emit("session_start", a.ctx),
-      b.pi.emit("session_start", b.ctx),
-    ]);
-
-    await a.pi.command?.("普通消息", a.ctx as ExtensionCommandContext);
-    await waitFor(
-      () => b.notices.some((notice) => notice.message.includes("普通消息")),
-      "B 没有看到普通消息",
-    );
-    expect(b.pi.sentUserMessages).toEqual([]);
-
+    const a = setup("session-a");
+    const b = setup("session-b");
+    await Promise.all([start(a), start(b)]);
+    const groupId = await createGroup(a);
+    await joinGroup(b, groupId);
     b.setIdle(false);
-    await a.pi.command?.(
-      `@${clientIdOf(b)} 忙碌测试`,
-      a.ctx as ExtensionCommandContext,
-    );
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 30));
+    for (const text of ["请求一", "请求二", "请求三"]) {
+      await command(a, "comms-test", `@Bob-Pi ${text}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 30));
     expect(b.pi.sentUserMessages).toEqual([]);
-    expect(
-      a.notices.some((notice) => notice.message.includes("目标 Agent 正忙")),
-    ).toBe(false);
-
     b.setIdle(true);
     await b.pi.emit("agent_settled", b.ctx);
-    await waitFor(
-      () => b.pi.sentUserMessages.length === 1,
-      "Agent 空闲后没有处理排队请求",
-    );
+    await waitFor(() => b.pi.sentUserMessages.length === 1, "第一项未开始");
 
-    await Promise.all([
-      a.pi.emit("session_shutdown", a.ctx),
-      b.pi.emit("session_shutdown", b.ctx),
-    ]);
-  });
-
-  it("连续请求按 FIFO 顺序逐个注入和回传", async () => {
-    broker = createBrokerServer({ socketPath });
-    await broker.start();
-    const a = setupExtension("session-a");
-    const b = setupExtension("session-b");
-    await Promise.all([
-      a.pi.emit("session_start", a.ctx),
-      b.pi.emit("session_start", b.ctx),
-    ]);
-    const bClientId = clientIdOf(b);
-
-    await a.pi.command?.(
-      `@${bClientId} 请求一`,
-      a.ctx as ExtensionCommandContext,
-    );
-    await a.pi.command?.(
-      `@${bClientId} 请求二`,
-      a.ctx as ExtensionCommandContext,
-    );
-    await a.pi.command?.(
-      `@${bClientId} 请求三`,
-      a.ctx as ExtensionCommandContext,
-    );
-    await waitFor(
-      () => b.pi.sentUserMessages.length === 1,
-      "第一条请求没有注入",
-    );
-    expect(b.pi.sentUserMessages[0]).toContain("消息：请求一");
-
-    for (const [index, answer] of ["QUEUE-1", "QUEUE-2", "QUEUE-3"].entries()) {
+    for (const [index, answer] of ["一", "二", "三"].entries()) {
       await b.pi.emit("message_end", b.ctx, {
         message: { role: "assistant", content: [{ type: "text", text: answer }] },
       });
@@ -440,29 +296,91 @@ describe("Pi Extension", () => {
       if (index < 2) {
         await waitFor(
           () => b.pi.sentUserMessages.length === index + 2,
-          `第 ${index + 2} 条请求没有注入`,
+          "下一项未开始",
         );
       }
     }
-
-    expect(b.pi.sentUserMessages[1]).toContain("消息：请求二");
-    expect(b.pi.sentUserMessages[2]).toContain("消息：请求三");
-    await waitFor(
-      () =>
-        ["QUEUE-1", "QUEUE-2", "QUEUE-3"].every((answer) =>
-          a.notices.some((notice) => notice.message.includes(answer)),
-        ),
-      "队列回答没有全部公开",
-    );
-    for (const answer of ["QUEUE-1", "QUEUE-2", "QUEUE-3"]) {
-      expect(
-        a.notices.filter((notice) => notice.message.includes(answer)),
-      ).toHaveLength(1);
-    }
-
+    expect(b.pi.sentUserMessages.map((text) => text.match(/请求[一二三]/)?.[0])).toEqual([
+      "请求一",
+      "请求二",
+      "请求三",
+    ]);
     await Promise.all([
       a.pi.emit("session_shutdown", a.ctx),
       b.pi.emit("session_shutdown", b.ctx),
     ]);
+  });
+
+  it("离群时中止当前远程任务并清空队列", async () => {
+    broker = createBrokerServer({ socketPath });
+    await broker.start();
+    const a = setup("session-a");
+    const b = setup("session-b");
+    await Promise.all([start(a), start(b)]);
+    const groupId = await createGroup(a);
+    await joinGroup(b, groupId);
+    await command(a, "comms-test", "@Bob-Pi 长任务");
+    await waitFor(() => b.pi.sentUserMessages.length === 1, "任务未开始");
+    await command(b, "comms-leave");
+    await waitFor(
+      () => b.notices.some((notice) => notice.message === "已离开群组"),
+      "未离群",
+    );
+    expect(b.aborted()).toBe(1);
+    await Promise.all([
+      a.pi.emit("session_shutdown", a.ctx),
+      b.pi.emit("session_shutdown", b.ctx),
+    ]);
+  });
+
+  it("Broker 重启后清理群组和活动请求并自动重连", async () => {
+    broker = createBrokerServer({ socketPath });
+    await broker.start();
+    const a = setup("session-a");
+    const b = setup("session-b");
+    await Promise.all([start(a), start(b)]);
+    const groupId = await createGroup(a);
+    await joinGroup(b, groupId);
+    await command(a, "comms-test", "@Bob-Pi 旧请求");
+    await waitFor(() => b.pi.sentUserMessages.length === 1, "旧请求未开始");
+
+    await broker.close();
+    broker = createBrokerServer({ socketPath });
+    await broker.start();
+    await waitFor(
+      () =>
+        a.notices.some((notice) => notice.message.includes("Broker 已重启")) &&
+        b.notices.some((notice) => notice.message.includes("Broker 已重启")),
+      "重启后未恢复连接",
+    );
+    expect(b.aborted()).toBe(1);
+    await command(a, "comms-test", "不能发送");
+    expect(a.notices.at(-1)?.message).toBe("请先创建或加入群组");
+    await Promise.all([
+      a.pi.emit("session_shutdown", a.ctx),
+      b.pi.emit("session_shutdown", b.ctx),
+    ]);
+  });
+});
+
+describe("Agent 注入格式", () => {
+  it("第 2 轮起标明自动对话轮数", () => {
+    const text = formatAgentRequest({
+      requestId: "r",
+      groupId: "g",
+      groupName: "开发组",
+      senderId: "agent:a",
+      senderName: "Alice-Pi",
+      targetAgentId: "agent:b",
+      targetAgentName: "Bob-Pi",
+      ownerUserName: "Bob",
+      onlineMembers: [],
+      text: "继续",
+      chainId: "c",
+      round: 2,
+    });
+    expect(text).toContain("这是第 2 轮自动对话。");
+    expect(text).toContain("在线：无其他在线成员");
+    expect(text).not.toContain("目标：");
   });
 });

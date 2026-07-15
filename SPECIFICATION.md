@@ -180,6 +180,7 @@ interface Message {
   groupId: string;
   senderId: string;
   senderName: string;
+  senderType: "user" | "agent";
   text: string;
   mentionIds: string[];
   timestamp: number;
@@ -196,8 +197,16 @@ interface Message {
 interface AgentRequest {
   requestId: string;
   groupId: string;
+  groupName: string;
   senderId: string;
+  senderName: string;
   targetAgentId: string;
+  targetAgentName: string;
+  ownerUserName: string;
+  onlineMembers: Array<{
+    displayName: string;
+    type: "user" | "agent";
+  }>;
   text: string;
   chainId: string;
   round: number;
@@ -210,8 +219,9 @@ interface AgentRequest {
 
 - `client.hello`
 - `client.goodbye`
-- `join`
-- `leave`
+- `group.create`
+- `group.join`
+- `group.leave`
 - `chat.send`
 - `agent.deliver.ack`
 - `agent.result`
@@ -222,6 +232,7 @@ interface AgentRequest {
 ### 9.2 Broker → Client
 
 - `snapshot`
+- `groups.changed`
 - `chat.message`
 - `presence.changed`
 - `agent.deliver`
@@ -244,12 +255,19 @@ interface Envelope<T = unknown> {
 ## 10. 名称与成员规则
 
 - 用户进入前必须设置用户名称和 Agent 名称。
+- 群组由 Broker 生成不可变 UUID；群名只用于显示。
+- 同一 Broker 内群名唯一，英文大小写不敏感；空群保留到 Broker 重启。
 - 同一群内所有显示名称唯一，用户名称和 Agent 名称之间也不能重复。
+- 英文名称比较不区分大小写，显示时保留原写法。
 - 名称冲突时禁止加入。
 - 名称只用于显示和 `@`；内部路由只使用 ID。
 - 名称长度为 1～24 个字符。
 - 名称只允许中文、英文、数字、`_` 和 `-`，不允许空格。
 - 一个连接同时注册一个用户成员和一个 Agent 成员。
+- 成员 ID 分别为 `user:<clientId>` 和 `agent:<clientId>`。
+- 一个 Session 同时只能加入一个群组，切换前必须先离开。
+- 消息、成员事件和失败状态只广播到所属群组。
+- 意外断线时两个成员立即离线，名称保留 3 秒；超时后移除。
 - Session 关闭时两个成员同时离线。
 
 ## 11. Agent 消息规则
@@ -258,7 +276,26 @@ interface Envelope<T = unknown> {
 
 - 普通群聊消息不注入 Agent，只有明确 `@Agent` 才处理。
 - 每次只注入当前消息，不注入完整群聊历史。
-- 注入内容包含发送者、群名、消息正文和目标。
+- `@用户名称` 只公开提醒；`@Agent名称` 同时注入目标 Session。
+- 只识别消息开头的一个 `@名称`，内部使用成员 ID 路由。
+- 注入内容包含接收方身份、所属用户、发送者、群名、在线成员和消息正文。
+- 在线成员不包含接收方自己；正文移除开头的 `@Agent名称` 后保持原样。
+- 第 2 轮起注明自动对话轮数。
+- 注入格式固定为：
+
+```text
+[Pi Comms 群聊请求]
+你是：{targetAgentName}（Agent）
+所属用户：{ownerUserName}
+来自：{senderName}  群组：{groupName}
+在线：Alice(用户)、Bob-Pi(Agent)
+
+{消息正文}
+
+你的回答会作为公开消息发送到群组「{groupName}」，用于回应 {senderName}。请直接回答。
+```
+
+- 不注入完整群聊历史、未 `@Agent` 的普通消息和私人 Session 内容。
 - 目标离线或拒绝接收时，群聊中显示失败状态。
 
 ### 11.2 接收权限
@@ -308,6 +345,7 @@ seenRequestIds: Set<string>;
 - 断线后每秒自动重连。
 - 同一 Broker 实例内，使用 Session 标识恢复原 `clientId`。
 - 意外断线保留 3 秒恢复窗口；正常关闭不等待。
+- 3 秒内重连恢复原群组和两个成员 ID；超时后必须重新加入。
 - `snapshot` 携带 `brokerInstanceId`。实例变化时终止活动远程请求并清理旧队列；跨 Broker 重启恢复留到 SQLite 阶段。
 
 ### 12.2 `/comms`
@@ -319,7 +357,7 @@ seenRequestIds: Set<string>;
 
 ### 12.3 `session_shutdown`
 
-- 发送 `leave`。
+- 发送 `group.leave` 或 `client.goodbye`。
 - 让用户和 Agent 同时离线。
 - 关闭 Socket。
 - 清理队列和 TUI 状态。

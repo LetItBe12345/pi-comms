@@ -71,15 +71,10 @@ describe("JSONL 协议", () => {
 });
 
 describe("客户端消息校验", () => {
-  it("接受广播和定向 chat.send", () => {
+  it("接受群聊消息", () => {
     const broadcast = createEnvelope("chat.send", { text: "公开消息" });
-    const direct = createEnvelope("chat.send", {
-      text: "定向消息",
-      targetClientId: "client-b",
-    });
 
     expect(parseClientEnvelope(broadcast).ok).toBe(true);
-    expect(parseClientEnvelope(direct).ok).toBe(true);
   });
 
   it("拒绝空消息和未知类型", () => {
@@ -134,5 +129,29 @@ describe("客户端消息校验", () => {
         createEnvelope("agent.deliver.ack", { requestId: "request-a" }),
       ).ok,
     ).toBe(true);
+  });
+
+  it("接受创建、加入和离开群组", () => {
+    expect(
+      parseClientEnvelope(
+        createEnvelope("group.create", {
+          groupName: "开发组",
+          userName: "Alice",
+          agentName: "Alice-Pi",
+        }),
+      ).ok,
+    ).toBe(true);
+    expect(
+      parseClientEnvelope(
+        createEnvelope("group.join", {
+          groupId: "group-a",
+          userName: "Bob",
+          agentName: "Bob-Pi",
+        }),
+      ).ok,
+    ).toBe(true);
+    expect(parseClientEnvelope(createEnvelope("group.leave", {})).ok).toBe(
+      true,
+    );
   });
 });

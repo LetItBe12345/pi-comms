@@ -12,11 +12,14 @@ import {
   type AgentRequestPayload,
   type AgentResultPayload,
   type BrokerEnvelope,
+  type ClientEnvelope,
   type ClientHelloEnvelope,
   type Envelope,
   type ErrorPayload,
   type SendFailedPayload,
 } from "../protocol.js";
+import type { Member } from "../types.js";
+import { GroupState, GroupStateError } from "./group-state.js";
 
 export const DEFAULT_SOCKET_PATH = join(
   homedir(),
@@ -47,6 +50,9 @@ interface ClientSession {
 
 interface PendingRequest {
   targetClientId: string;
+  targetAgentId: string;
+  targetName: string;
+  groupId: string;
   request: AgentRequestPayload;
   deliveryAcknowledged: boolean;
 }
@@ -60,6 +66,7 @@ export function createBrokerServer(
   const instanceId = randomUUID();
   const clients = new Map<string, Socket>();
   const sessions = new Map<string, ClientSession>();
+  const groups = new GroupState();
   const pendingRequests = new Map<string, PendingRequest>();
   const completedRequests = new Map<string, string>();
   const closedRequestIds = new Set<string>();
@@ -75,13 +82,9 @@ export function createBrokerServer(
     socket.on("data", (chunk) => {
       for (const result of decoder.push(chunk)) {
         if (!result.ok) {
-          sendError(socket, {
-            code: "invalid_json",
-            message: result.error,
-          });
+          sendError(socket, { code: "invalid_json", message: result.error });
           continue;
         }
-
         const parsed = parseClientEnvelope(result.value);
         if (!parsed.ok) {
           sendError(socket, {
@@ -134,15 +137,11 @@ export function createBrokerServer(
       }
     });
 
-    socket.on("error", () => {
-      socket.destroy();
-    });
-
+    socket.on("error", () => socket.destroy());
     socket.once("close", () => {
-      if (clientId === undefined || sessionId === undefined) {
-        return;
+      if (clientId !== undefined && sessionId !== undefined) {
+        handleUnexpectedDisconnect(sessionId, clientId, socket);
       }
-      handleUnexpectedDisconnect(sessionId, clientId, socket);
     });
   }
 
@@ -156,7 +155,6 @@ export function createBrokerServer(
       session = { clientId: randomUUID() };
       sessions.set(sessionId, session);
     }
-
     if (session.disconnectTimer !== undefined) {
       clearTimeout(session.disconnectTimer);
       session.disconnectTimer = undefined;
@@ -168,21 +166,12 @@ export function createBrokerServer(
     const clientId = session.clientId;
     session.socket = socket;
     clients.set(clientId, socket);
-
-    send(
-      socket,
-      createEnvelope("snapshot", {
-        brokerInstanceId: instanceId,
-        clientId,
-        clients: [...clients.keys()],
-      }) as BrokerEnvelope,
-    );
-    broadcast(
-      createEnvelope("presence.changed", {
-        clientId,
-        online: true,
-      }) as BrokerEnvelope,
-    );
+    const reconnectedMembers = groups.setOnline(clientId, true);
+    sendSnapshot(clientId, socket);
+    if (reconnectedMembers.length > 0) {
+      broadcastPresence(reconnectedMembers, clientId);
+      broadcastGroupsChanged();
+    }
     resendUnacknowledgedDeliveries(clientId, socket);
     return { sessionId, clientId };
   }
@@ -195,27 +184,26 @@ export function createBrokerServer(
     if (clients.get(clientId) !== socket) {
       return;
     }
-
     clients.delete(clientId);
     const session = sessions.get(sessionId);
-    if (session !== undefined && session.socket === socket) {
+    if (session?.socket === socket) {
       session.socket = undefined;
     }
     if (closing) {
       return;
     }
 
-    broadcast(
-      createEnvelope("presence.changed", {
-        clientId,
-        online: false,
-      }) as BrokerEnvelope,
-    );
+    const offlineMembers = groups.setOnline(clientId, false);
+    broadcastPresence(offlineMembers, clientId);
+    if (offlineMembers.length > 0) {
+      broadcastGroupsChanged();
+    }
     if (session !== undefined) {
       session.disconnectTimer = setTimeout(() => {
         session.disconnectTimer = undefined;
         if (!clients.has(clientId)) {
-          failRequestsForDisconnectedTarget(clientId);
+          groups.removeIfJoined(clientId);
+          failRequestsForTarget(clientId, "target_offline");
         }
       }, disconnectGraceMs);
     }
@@ -231,157 +219,235 @@ export function createBrokerServer(
       clearTimeout(session.disconnectTimer);
     }
     sessions.delete(sessionId);
-    if (clients.get(clientId) === socket) {
-      clients.delete(clientId);
-      broadcast(
-        createEnvelope("presence.changed", {
-          clientId,
-          online: false,
-        }) as BrokerEnvelope,
-      );
-      failRequestsForDisconnectedTarget(clientId);
+    if (clients.get(clientId) !== socket) {
+      return;
     }
+    leaveClientGroup(clientId);
+    clients.delete(clientId);
   }
 
   function handleClientMessage(
-    senderClientId: string,
-    senderSocket: Socket,
-    envelope: Exclude<
-      ReturnType<typeof parseClientEnvelope>,
-      { ok: false }
-    >["envelope"],
+    clientId: string,
+    socket: Socket,
+    envelope: Exclude<ClientEnvelope, ClientHelloEnvelope>,
   ): void {
     if (envelope.type === "agent.deliver.ack") {
       const pending = pendingRequests.get(envelope.payload.requestId);
-      if (pending?.targetClientId === senderClientId) {
+      if (pending?.targetClientId === clientId) {
         pending.deliveryAcknowledged = true;
       }
       return;
     }
-
     if (envelope.type === "agent.result") {
-      handleAgentResult(senderClientId, senderSocket, envelope.payload);
+      handleAgentResult(clientId, socket, envelope.payload);
       return;
     }
-
-    if (envelope.type !== "chat.send") {
+    if (envelope.type === "group.create") {
+      handleGroupCreate(clientId, socket, envelope.id, envelope.payload);
       return;
     }
-
-    const { id, payload } = envelope;
-    if (payload.targetClientId === undefined && payload.text.startsWith("@")) {
-      handleAgentRequest(senderClientId, senderSocket, id, payload.text);
+    if (envelope.type === "group.join") {
+      handleGroupJoin(clientId, socket, envelope.id, envelope.payload);
       return;
     }
-
-    const message = createEnvelope(
-      "chat.message",
-      {
-        senderClientId,
-        text: payload.text,
-        ...(payload.targetClientId === undefined
-          ? {}
-          : { targetClientId: payload.targetClientId }),
-      },
-      { id },
-    ) as BrokerEnvelope;
-
-    if (payload.targetClientId === undefined) {
-      broadcast(message);
+    if (envelope.type === "group.leave") {
+      handleGroupLeave(clientId, socket, envelope.id);
       return;
     }
-
-    const target = clients.get(payload.targetClientId);
-    if (target === undefined || target.destroyed) {
-      send(
-        senderSocket,
-        createEnvelope("send.failed", {
-          requestId: id,
-          targetClientId: payload.targetClientId,
-          reason: "target_offline" as const,
-        }) as BrokerEnvelope,
-      );
-      return;
+    if (envelope.type === "chat.send") {
+      handleChatSend(clientId, socket, envelope.id, envelope.payload.text);
     }
-    send(target, message);
   }
 
-  function handleAgentRequest(
-    senderClientId: string,
-    senderSocket: Socket,
+  function handleGroupCreate(
+    clientId: string,
+    socket: Socket,
     requestId: string,
-    rawText: string,
+    payload: { groupName: string; userName: string; agentName: string },
   ): void {
-    const existing = pendingRequests.get(requestId);
-    if (existing !== undefined) {
-      const target = clients.get(existing.targetClientId);
-      if (
-        !existing.deliveryAcknowledged &&
-        target !== undefined &&
-        !target.destroyed
-      ) {
-        sendAgentDelivery(target, existing.request);
+    try {
+      groups.createGroup(
+        clientId,
+        payload.groupName,
+        payload.userName,
+        payload.agentName,
+      );
+      sendSnapshot(clientId, socket);
+      broadcastGroupsChanged();
+    } catch (error) {
+      sendGroupError(socket, requestId, error);
+    }
+  }
+
+  function handleGroupJoin(
+    clientId: string,
+    socket: Socket,
+    requestId: string,
+    payload: { groupId: string; userName: string; agentName: string },
+  ): void {
+    try {
+      const membership = groups.joinGroup(
+        clientId,
+        payload.groupId,
+        payload.userName,
+        payload.agentName,
+      );
+      sendSnapshot(clientId, socket);
+      broadcastPresence([membership.user, membership.agent], clientId);
+      broadcastGroupsChanged();
+    } catch (error) {
+      sendGroupError(socket, requestId, error);
+    }
+  }
+
+  function handleGroupLeave(
+    clientId: string,
+    socket: Socket,
+    requestId: string,
+  ): void {
+    try {
+      leaveClientGroup(clientId, true);
+      sendSnapshot(clientId, socket);
+    } catch (error) {
+      sendGroupError(socket, requestId, error);
+    }
+  }
+
+  function leaveClientGroup(clientId: string, required = false): void {
+    const membership = groups.membershipForClient(clientId);
+    if (membership === undefined) {
+      if (required) {
+        groups.leaveGroup(clientId);
       }
       return;
     }
-    if (completedRequests.has(requestId) || closedRequestIds.has(requestId)) {
-      return;
-    }
+    const offlineMembers = groups.setOnline(clientId, false);
+    broadcastPresence(offlineMembers, clientId);
+    groups.leaveGroup(clientId);
+    failRequestsForTarget(clientId, "target_offline");
+    broadcastGroupsChanged();
+  }
 
-    const mention = parseAgentMention(rawText);
-    if (mention === undefined) {
-      sendError(senderSocket, {
-        code: "invalid_payload",
-        message: "@Agent 格式应为：@完整clientId 消息正文",
+  function handleChatSend(
+    clientId: string,
+    socket: Socket,
+    requestId: string,
+    text: string,
+  ): void {
+    const membership = groups.membershipForClient(clientId);
+    const group = groups.groupForClient(clientId);
+    if (membership === undefined || group === undefined) {
+      sendError(socket, {
+        code: "not_in_group",
+        message: "请先创建或加入群组",
         requestId,
       });
       return;
     }
+    if (
+      pendingRequests.has(requestId) ||
+      completedRequests.has(requestId) ||
+      closedRequestIds.has(requestId)
+    ) {
+      return;
+    }
 
-    broadcast(
-      createEnvelope(
-        "chat.message",
-        {
-          senderClientId,
-          targetClientId: mention.targetClientId,
-          text: rawText,
-          requestId,
-        },
-        { id: requestId },
-      ) as BrokerEnvelope,
+    const mention = parseMention(text);
+    const target =
+      mention === undefined
+        ? undefined
+        : groups.findMemberByName(group.groupId, mention.name);
+    const messagePayload = {
+      groupId: group.groupId,
+      senderId: membership.user.memberId,
+      senderName: membership.user.displayName,
+      senderType: "user" as const,
+      text,
+      mentionIds: target === undefined ? [] : [target.memberId],
+      ...(mention === undefined ? {} : { requestId }),
+    };
+    broadcastToGroup(
+      group.groupId,
+      createEnvelope("chat.message", messagePayload, { id: requestId }) as BrokerEnvelope,
     );
 
-    const target = clients.get(mention.targetClientId);
-    if (target === undefined || target.destroyed) {
+    if (mention === undefined) {
+      return;
+    }
+    if (target === undefined) {
       closedRequestIds.add(requestId);
       broadcastFailure({
         requestId,
-        targetClientId: mention.targetClientId,
+        groupId: group.groupId,
+        targetName: mention.name,
+        reason: "target_not_found",
+      });
+      return;
+    }
+    if (!target.online) {
+      closedRequestIds.add(requestId);
+      broadcastFailure({
+        requestId,
+        groupId: group.groupId,
+        targetName: target.displayName,
+        ...(target.type === "agent" ? { targetAgentId: target.memberId } : {}),
         reason: "target_offline",
       });
       return;
     }
+    if (target.type === "user") {
+      return;
+    }
+    if (mention.text === undefined || !mention.text.trim()) {
+      sendError(socket, {
+        code: "invalid_payload",
+        message: "@Agent 后需要消息正文",
+        requestId,
+      });
+      return;
+    }
 
+    const targetSocket = clients.get(target.clientId);
+    const targetMembership = groups.membershipForClient(target.clientId);
+    if (targetSocket === undefined || targetMembership === undefined) {
+      broadcastFailure({
+        requestId,
+        groupId: group.groupId,
+        targetName: target.displayName,
+        targetAgentId: target.memberId,
+        reason: "target_offline",
+      });
+      return;
+    }
     const request: AgentRequestPayload = {
       requestId,
-      groupId: "default",
-      senderId: senderClientId,
-      senderName: `Client-${senderClientId.slice(0, 8)}`,
-      targetAgentId: mention.targetClientId,
+      groupId: group.groupId,
+      groupName: group.groupName,
+      senderId: membership.user.memberId,
+      senderName: membership.user.displayName,
+      targetAgentId: target.memberId,
+      targetAgentName: target.displayName,
+      ownerUserName: targetMembership.user.displayName,
+      onlineMembers: groups
+        .onlineMembers(group.groupId)
+        .filter((member) => member.memberId !== target.memberId)
+        .map((member) => ({
+          displayName: member.displayName,
+          type: member.type,
+        })),
       text: mention.text,
       chainId: requestId,
       round: 1,
     };
     pendingRequests.set(requestId, {
-      targetClientId: mention.targetClientId,
+      targetClientId: target.clientId,
+      targetAgentId: target.memberId,
+      targetName: target.displayName,
+      groupId: group.groupId,
       request,
       deliveryAcknowledged: false,
     });
-    sendAgentDelivery(target, request);
-  }
-
-  function sendAgentDelivery(socket: Socket, request: AgentRequestPayload): void {
-    send(socket, createEnvelope("agent.deliver", request) as BrokerEnvelope);
+    send(targetSocket, createEnvelope("agent.deliver", request) as BrokerEnvelope);
   }
 
   function resendUnacknowledgedDeliveries(
@@ -393,34 +459,41 @@ export function createBrokerServer(
         pending.targetClientId === targetClientId &&
         !pending.deliveryAcknowledged
       ) {
-        sendAgentDelivery(socket, pending.request);
+        send(
+          socket,
+          createEnvelope("agent.deliver", pending.request) as BrokerEnvelope,
+        );
       }
     }
   }
 
   function handleAgentResult(
-    senderClientId: string,
-    senderSocket: Socket,
+    clientId: string,
+    socket: Socket,
     result: AgentResultPayload,
   ): void {
-    if (completedRequests.get(result.requestId) === senderClientId) {
-      sendResultAck(senderSocket, result.requestId, true);
+    if (completedRequests.get(result.requestId) === clientId) {
+      sendResultAck(socket, result.requestId, true);
       return;
     }
-
     const pending = pendingRequests.get(result.requestId);
-    if (pending === undefined || pending.targetClientId !== senderClientId) {
-      sendResultAck(senderSocket, result.requestId, false);
+    if (pending === undefined || pending.targetClientId !== clientId) {
+      sendResultAck(socket, result.requestId, false);
       return;
     }
 
     pendingRequests.delete(result.requestId);
-    completedRequests.set(result.requestId, senderClientId);
+    completedRequests.set(result.requestId, clientId);
     if (result.ok) {
-      broadcast(
+      broadcastToGroup(
+        pending.groupId,
         createEnvelope("chat.message", {
-          senderClientId,
+          groupId: pending.groupId,
+          senderId: pending.request.targetAgentId,
+          senderName: pending.request.targetAgentName,
+          senderType: "agent" as const,
           text: result.text,
+          mentionIds: [pending.request.senderId],
           requestId: result.requestId,
           kind: "agent" as const,
         }) as BrokerEnvelope,
@@ -428,11 +501,13 @@ export function createBrokerServer(
     } else {
       broadcastFailure({
         requestId: result.requestId,
-        targetClientId: senderClientId,
+        groupId: pending.groupId,
+        targetName: pending.targetName,
+        targetAgentId: pending.targetAgentId,
         reason: result.reason,
       });
     }
-    sendResultAck(senderSocket, result.requestId, true);
+    sendResultAck(socket, result.requestId, true);
   }
 
   function sendResultAck(
@@ -450,7 +525,10 @@ export function createBrokerServer(
     );
   }
 
-  function failRequestsForDisconnectedTarget(targetClientId: string): void {
+  function failRequestsForTarget(
+    targetClientId: string,
+    reason: "target_offline" | "target_disconnected",
+  ): void {
     for (const [requestId, pending] of pendingRequests) {
       if (pending.targetClientId !== targetClientId) {
         continue;
@@ -459,24 +537,88 @@ export function createBrokerServer(
       closedRequestIds.add(requestId);
       broadcastFailure({
         requestId,
-        targetClientId,
-        reason: "target_disconnected",
+        groupId: pending.groupId,
+        targetName: pending.targetName,
+        targetAgentId: pending.targetAgentId,
+        reason,
       });
     }
   }
 
+  function sendSnapshot(clientId: string, socket: Socket): void {
+    const group = groups.groupForClient(clientId);
+    send(
+      socket,
+      createEnvelope("snapshot", {
+        brokerInstanceId: instanceId,
+        clientId,
+        groups: groups.summaries(),
+        ...(group === undefined ? {} : { group }),
+        members:
+          group === undefined ? [] : groups.onlineMembers(group.groupId),
+      }) as BrokerEnvelope,
+    );
+  }
+
+  function broadcastPresence(members: Member[], excludeClientId?: string): void {
+    for (const member of members) {
+      broadcastToGroup(
+        member.groupId,
+        createEnvelope("presence.changed", { ...member }) as BrokerEnvelope,
+        excludeClientId,
+      );
+    }
+  }
+
+  function broadcastGroupsChanged(): void {
+    const envelope = createEnvelope("groups.changed", {
+      groups: groups.summaries(),
+    }) as BrokerEnvelope;
+    for (const socket of clients.values()) {
+      send(socket, envelope);
+    }
+  }
+
   function broadcastFailure(payload: SendFailedPayload): void {
-    broadcast(createEnvelope("send.failed", payload) as BrokerEnvelope);
+    broadcastToGroup(
+      payload.groupId,
+      createEnvelope("send.failed", payload) as BrokerEnvelope,
+    );
+  }
+
+  function broadcastToGroup(
+    groupId: string,
+    envelope: BrokerEnvelope,
+    excludeClientId?: string,
+  ): void {
+    for (const clientId of groups.onlineClientIds(groupId)) {
+      if (clientId !== excludeClientId) {
+        const socket = clients.get(clientId);
+        if (socket !== undefined) {
+          send(socket, envelope);
+        }
+      }
+    }
+  }
+
+  function sendGroupError(
+    socket: Socket,
+    requestId: string,
+    error: unknown,
+  ): void {
+    if (error instanceof GroupStateError) {
+      sendError(socket, {
+        code: error.code,
+        message: error.message,
+        requestId,
+      });
+      return;
+    }
+    throw error;
   }
 
   function sendError(socket: Socket, payload: ErrorPayload): void {
     send(socket, createEnvelope("error", payload) as BrokerEnvelope);
-  }
-
-  function broadcast(envelope: BrokerEnvelope): void {
-    for (const socket of clients.values()) {
-      send(socket, envelope);
-    }
   }
 
   async function start(): Promise<void> {
@@ -488,7 +630,6 @@ export function createBrokerServer(
       throw new Error(`Broker 已经在运行：${socketPath}`);
     }
     await removeSocketIfPresent(socketPath);
-
     await new Promise<void>((resolveStart, rejectStart) => {
       const onError = (error: Error) => {
         server.off("listening", onListening);
@@ -520,15 +661,8 @@ export function createBrokerServer(
     clients.clear();
     sessions.clear();
     pendingRequests.clear();
-
     await new Promise<void>((resolveClose, rejectClose) => {
-      server.close((error) => {
-        if (error) {
-          rejectClose(error);
-        } else {
-          resolveClose();
-        }
-      });
+      server.close((error) => (error ? rejectClose(error) : resolveClose()));
     });
     started = false;
   }
@@ -536,15 +670,16 @@ export function createBrokerServer(
   return { socketPath, instanceId, start, close };
 }
 
-function parseAgentMention(
+function parseMention(
   text: string,
-): { targetClientId: string; text: string } | undefined {
-  const match = text.match(
-    /^@([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\s+([\s\S]*\S)$/i,
-  );
+): { name: string; text?: string } | undefined {
+  if (!text.startsWith("@")) {
+    return undefined;
+  }
+  const match = text.match(/^@([^\s]+)(?:[ \t]+([\s\S]*))?$/);
   return match === null
-    ? undefined
-    : { targetClientId: match[1], text: match[2] };
+    ? { name: text.slice(1) }
+    : { name: match[1], ...(match[2] === undefined ? {} : { text: match[2] }) };
 }
 
 function send(socket: Socket, envelope: Envelope): void {
@@ -585,9 +720,7 @@ async function runBroker(): Promise<void> {
   const broker = createBrokerServer();
   await broker.start();
   console.log(`Pi Comms Broker 正在监听 ${broker.socketPath}`);
-  const shutdown = async () => {
-    await broker.close();
-  };
+  const shutdown = async () => broker.close();
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
