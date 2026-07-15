@@ -130,6 +130,8 @@ describe("Pi Extension 群组接入", () => {
       socketPath,
       reconnectIntervalMs: 20,
       resultRetryIntervalMs: 20,
+      registerTestCommands: true,
+      startBroker: () => {},
     })(pi.api);
     return { pi, ...context };
   }
@@ -147,10 +149,6 @@ describe("Pi Extension 群组接入", () => {
 
   async function start(extension: ReturnType<typeof setup>): Promise<void> {
     await extension.pi.emit("session_start", extension.ctx);
-    await waitFor(
-      () => extension.statuses.includes("Broker 已连接"),
-      "Extension 未连接 Broker",
-    );
   }
 
   async function createGroup(

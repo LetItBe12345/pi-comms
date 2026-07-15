@@ -13,6 +13,10 @@ export class RemoteQueue {
     return this.#activeRequest;
   }
 
+  get hasWork(): boolean {
+    return this.#activeRequest !== undefined || this.#queue.length > 0;
+  }
+
   enqueue(request: AgentRequestPayload): boolean {
     if (this.#seenRequestIds.has(request.requestId)) {
       return false;

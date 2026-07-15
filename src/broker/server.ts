@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, unlink } from "node:fs/promises";
+import { link, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -75,6 +75,7 @@ export function createBrokerServer(
   const disconnectGraceMs =
     options.disconnectGraceMs ?? DEFAULT_DISCONNECT_GRACE_MS;
   const instanceId = randomUUID();
+  const lockPath = `${socketPath}.lock`;
   const clients = new Map<string, Socket>();
   const sessions = new Map<string, ClientSession>();
   let groups = new GroupState();
@@ -85,6 +86,7 @@ export function createBrokerServer(
   const server = createServer(handleConnection);
   let started = false;
   let closing = false;
+  let ownsLock = false;
 
   function handleConnection(socket: Socket): void {
     const decoder = new JsonlDecoder();
@@ -214,7 +216,13 @@ export function createBrokerServer(
       session.disconnectTimer = setTimeout(() => {
         session.disconnectTimer = undefined;
         if (!clients.has(clientId)) {
-          groups.removeIfJoined(clientId);
+          const removed = groups.removeIfJoined(clientId);
+          if (removed !== undefined) {
+            broadcastPresenceRemoved(removed.groupId, [
+              removed.user.memberId,
+              removed.agent.memberId,
+            ]);
+          }
           failRequestsForTarget(clientId, "target_offline");
         }
       }, disconnectGraceMs);
@@ -253,6 +261,13 @@ export function createBrokerServer(
     }
     if (envelope.type === "agent.result") {
       handleAgentResult(clientId, socket, envelope.payload);
+      return;
+    }
+    if (envelope.type === "agent.status") {
+      const agent = groups.setAgentStatus(clientId, envelope.payload.status);
+      if (agent !== undefined) {
+        broadcastPresence([agent]);
+      }
       return;
     }
     if (envelope.type === "group.create") {
@@ -343,7 +358,11 @@ export function createBrokerServer(
     }
     const offlineMembers = groups.setOnline(clientId, false);
     broadcastPresence(offlineMembers, clientId);
-    groups.leaveGroup(clientId);
+    const removed = groups.leaveGroup(clientId);
+    broadcastPresenceRemoved(removed.groupId, [
+      removed.user.memberId,
+      removed.agent.memberId,
+    ]);
     failRequestsForTarget(clientId, "target_offline");
     broadcastGroupsChanged();
   }
@@ -680,8 +699,7 @@ export function createBrokerServer(
         clientId,
         groups: groups.summaries(),
         ...(group === undefined ? {} : { group }),
-        members:
-          group === undefined ? [] : groups.onlineMembers(group.groupId),
+        members: group === undefined ? [] : groups.members(group.groupId),
         messages:
           group === undefined ? [] : db().recentMessages(group.groupId),
       }) as BrokerEnvelope,
@@ -705,6 +723,16 @@ export function createBrokerServer(
     for (const socket of clients.values()) {
       send(socket, envelope);
     }
+  }
+
+  function broadcastPresenceRemoved(
+    groupId: string,
+    memberIds: string[],
+  ): void {
+    broadcastToGroup(
+      groupId,
+      createEnvelope("presence.removed", { groupId, memberIds }) as BrokerEnvelope,
+    );
   }
 
   function broadcastFailure(payload: SendFailedPayload): void {
@@ -758,29 +786,37 @@ export function createBrokerServer(
       return;
     }
     await mkdir(dirname(socketPath), { recursive: true });
-    if (await canConnect(socketPath)) {
-      throw new Error(`Broker 已经在运行：${socketPath}`);
+    await acquireBrokerLock(lockPath);
+    ownsLock = true;
+    try {
+      if (await canConnect(socketPath)) {
+        throw new Error(`Broker 已经在运行：${socketPath}`);
+      }
+      database = new BrokerDatabase(dbPath);
+      groups = new GroupState(database.groups());
+      await removeSocketIfPresent(socketPath);
+      await new Promise<void>((resolveStart, rejectStart) => {
+        const onError = (error: Error) => {
+          server.off("listening", onListening);
+          rejectStart(error);
+        };
+        const onListening = () => {
+          server.off("error", onError);
+          resolveStart();
+        };
+        server.once("error", onError);
+        server.once("listening", onListening);
+        server.listen(socketPath);
+      });
+      started = true;
+      closing = false;
+    } catch (error) {
+      database?.close();
+      database = undefined;
+      await releaseBrokerLock(lockPath);
+      ownsLock = false;
+      throw error;
     }
-    database = new BrokerDatabase(dbPath);
-    groups = new GroupState(database.groups());
-    await removeSocketIfPresent(socketPath);
-    await new Promise<void>((resolveStart, rejectStart) => {
-      const onError = (error: Error) => {
-        server.off("listening", onListening);
-        database?.close();
-        database = undefined;
-        rejectStart(error);
-      };
-      const onListening = () => {
-        server.off("error", onError);
-        resolveStart();
-      };
-      server.once("error", onError);
-      server.once("listening", onListening);
-      server.listen(socketPath);
-    });
-    started = true;
-    closing = false;
   }
 
   async function close(): Promise<void> {
@@ -803,6 +839,10 @@ export function createBrokerServer(
     started = false;
     database?.close();
     database = undefined;
+    if (ownsLock) {
+      await releaseBrokerLock(lockPath);
+      ownsLock = false;
+    }
   }
 
   function db(): BrokerDatabase {
@@ -858,6 +898,44 @@ async function removeSocketIfPresent(socketPath: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       throw error;
     }
+  }
+}
+
+async function acquireBrokerLock(lockPath: string): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const candidatePath = `${lockPath}.${process.pid}.${randomUUID()}`;
+    try {
+      await writeFile(candidatePath, String(process.pid), { flag: "wx" });
+      await link(candidatePath, lockPath);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const ownerPid = Number.parseInt(await readFile(lockPath, "utf8").catch(() => ""), 10);
+      if (Number.isInteger(ownerPid) && processExists(ownerPid)) {
+        throw new Error(`Broker 已经在运行：${lockPath}`);
+      }
+      await releaseBrokerLock(lockPath);
+    } finally {
+      await releaseBrokerLock(candidatePath);
+    }
+  }
+  throw new Error(`无法获取 Broker 锁：${lockPath}`);
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function releaseBrokerLock(lockPath: string): Promise<void> {
+  try {
+    await unlink(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 

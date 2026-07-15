@@ -208,6 +208,37 @@ describe("Local Broker 群组与成员", () => {
       (message) => message.payload.displayName === "Bob-Pi",
     );
     expect(online.payload.memberId).toBe(`agent:${bClientId}`);
+
+    b.send("agent.status", { status: "busy" });
+    const busy = await a.waitFor(
+      "presence.changed",
+      (message) =>
+        message.payload.displayName === "Bob-Pi" &&
+        message.payload.agentStatus === "busy",
+    );
+    expect(busy.payload.type).toBe("agent");
+  });
+
+  it("断线恢复期显示离线，超时后明确移除成员", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const b = await connect();
+    const joined = await joinGroup(b, created.payload.group!.groupId);
+    const bClientId = joined.payload.clientId;
+
+    await b.close();
+    await a.waitFor(
+      "presence.changed",
+      (message) => message.payload.clientId === bClientId && !message.payload.online,
+    );
+    const removed = await a.waitFor(
+      "presence.removed",
+      (message) => message.payload.memberIds.includes(`user:${bClientId}`),
+    );
+    expect(removed.payload.memberIds).toEqual([
+      `user:${bClientId}`,
+      `agent:${bClientId}`,
+    ]);
   });
 
   it("拒绝非法名称、大小写冲突和重复入群", async () => {
@@ -440,5 +471,18 @@ describe("Local Broker 群组与成员", () => {
     expect((await client.waitFor("snapshot")).payload.clientId).toBeTypeOf("string");
     await client.close();
     await another.close();
+  });
+
+  it("并发启动时只允许一个 Broker 获得 Socket", async () => {
+    const racePath = join(directory, "race.sock");
+    const raceDbPath = join(directory, "race.db");
+    const candidates = [
+      createBrokerServer({ socketPath: racePath, dbPath: raceDbPath }),
+      createBrokerServer({ socketPath: racePath, dbPath: raceDbPath }),
+    ];
+    const results = await Promise.allSettled(candidates.map((candidate) => candidate.start()));
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    await Promise.all(candidates.map((candidate) => candidate.close()));
   });
 });

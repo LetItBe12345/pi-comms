@@ -25,6 +25,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "dependencies": {
+    "@earendil-works/pi-tui": "^0.80.6",
     "better-sqlite3": "^12.11.1"
   }
 }

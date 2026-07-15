@@ -41,4 +41,4 @@
 
 ## 下一阶段
 
-[阶段 7：最小 TUI](../in-progress/07-tui.md)
+[阶段 7：最小 TUI](./07-tui.md)

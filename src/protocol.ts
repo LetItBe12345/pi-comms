@@ -6,6 +6,7 @@ import type {
   Member,
   MemberType,
   OnlineMember,
+  AgentActivityStatus,
 } from "./types.js";
 
 export interface Envelope<T = unknown> {
@@ -46,6 +47,15 @@ export interface GroupJoinPayload {
 }
 
 export interface PresenceChangedPayload extends Member {}
+
+export interface PresenceRemovedPayload {
+  groupId: string;
+  memberIds: string[];
+}
+
+export interface AgentStatusPayload {
+  status: AgentActivityStatus;
+}
 
 export interface GroupsChangedPayload {
   groups: GroupSummary[];
@@ -170,6 +180,9 @@ export type GroupLeaveEnvelope = Envelope<Record<string, never>> & {
 export type ChatSendEnvelope = Envelope<ChatSendPayload> & {
   type: "chat.send";
 };
+export type AgentStatusEnvelope = Envelope<AgentStatusPayload> & {
+  type: "agent.status";
+};
 export type AgentDeliverAckEnvelope = Envelope<AgentDeliverAckPayload> & {
   type: "agent.deliver.ack";
 };
@@ -184,6 +197,7 @@ export type ClientEnvelope =
   | GroupJoinEnvelope
   | GroupLeaveEnvelope
   | ChatSendEnvelope
+  | AgentStatusEnvelope
   | AgentDeliverAckEnvelope
   | AgentResultEnvelope;
 
@@ -191,6 +205,7 @@ export type BrokerEnvelope =
   | (Envelope<SnapshotPayload> & { type: "snapshot" })
   | (Envelope<GroupsChangedPayload> & { type: "groups.changed" })
   | (Envelope<PresenceChangedPayload> & { type: "presence.changed" })
+  | (Envelope<PresenceRemovedPayload> & { type: "presence.removed" })
   | (Envelope<ChatMessagePayload> & { type: "chat.message" })
   | (Envelope<AgentRequestPayload> & { type: "agent.deliver" })
   | (Envelope<AgentResultAckPayload> & { type: "agent.result.ack" })
@@ -300,6 +315,10 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
       return { ok: true, envelope: value as unknown as GroupLeaveEnvelope };
     case "chat.send":
       return requireStrings(value, requestId, ["text"]);
+    case "agent.status":
+      return value.payload.status === "idle" || value.payload.status === "busy"
+        ? { ok: true, envelope: value as unknown as AgentStatusEnvelope }
+        : invalid("invalid_payload", "agent.status status 无效", requestId);
     case "agent.deliver.ack":
       return requireStrings(value, requestId, ["requestId"]);
     case "agent.result":
