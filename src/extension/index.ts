@@ -9,6 +9,7 @@ import type {
   AgentResultAckPayload,
   AgentResultPayload,
   BrokerEnvelope,
+  HistoryMessage,
   SnapshotPayload,
 } from "../protocol.js";
 import type { Group, GroupSummary, Member } from "../types.js";
@@ -40,6 +41,10 @@ export function createCommsExtension(
     let clientId: string | undefined;
     let brokerInstanceId: string | undefined;
     let currentGroup: Group | undefined;
+    let desiredMembership:
+      | { groupId: string; userName: string; agentName: string }
+      | undefined;
+    let history: HistoryMessage[] = [];
     let availableGroups: GroupSummary[] = [];
     let members = new Map<string, Member>();
     let lastAssistantText: string | undefined;
@@ -120,7 +125,7 @@ export function createCommsExtension(
         brokerInstanceId !== snapshot.brokerInstanceId;
       if (brokerRestarted) {
         clearRemoteWork();
-        ui?.notify("Broker 已重启，群组和旧远程请求已清理", "warning");
+        ui?.notify("Broker 已重启，旧远程请求已中止，正在恢复群组", "warning");
       }
 
       const previousGroupId = currentGroup?.groupId;
@@ -128,17 +133,44 @@ export function createCommsExtension(
       clientId = snapshot.clientId;
       availableGroups = snapshot.groups;
       currentGroup = snapshot.group;
+      history = snapshot.messages;
       members = new Map(
         snapshot.members.map((member) => [member.memberId, member]),
       );
+      if (snapshot.group !== undefined) {
+        const ownMembers = snapshot.members.filter(
+          (member) => member.clientId === snapshot.clientId,
+        );
+        const user = ownMembers.find((member) => member.type === "user");
+        const agent = ownMembers.find((member) => member.type === "agent");
+        if (user !== undefined && agent !== undefined) {
+          desiredMembership = {
+            groupId: snapshot.group.groupId,
+            userName: user.displayName,
+            agentName: agent.displayName,
+          };
+        }
+      }
       setConnected(true);
-      if (snapshot.group !== undefined && previousGroupId !== snapshot.group.groupId) {
+      if (
+        snapshot.group !== undefined &&
+        previousGroupId !== snapshot.group.groupId
+      ) {
         ui?.notify(
           `已加入群组：${snapshot.group.groupName}\nGroup ID: ${snapshot.group.groupId}`,
           "info",
         );
-      } else if (snapshot.group === undefined && previousGroupId !== undefined) {
+        if (history.length > 0) {
+          ui?.notify(`已加载 ${history.length} 条历史消息`, "info");
+        }
+      } else if (
+        snapshot.group === undefined &&
+        previousGroupId !== undefined &&
+        !brokerRestarted
+      ) {
         ui?.notify("已离开群组", "info");
+        desiredMembership = undefined;
+        history = [];
       } else if (previousGroupId === undefined && !brokerRestarted) {
         ui?.notify(
           `Broker 已连接\nSession: ${sessionId}\nClient: ${clientId}`,
@@ -147,6 +179,13 @@ export function createCommsExtension(
       }
       flushPendingResults();
       tryStartNext();
+      if (
+        brokerRestarted &&
+        snapshot.group === undefined &&
+        desiredMembership !== undefined
+      ) {
+        brokerClient.send("group.join", desiredMembership);
+      }
     }
 
     function handleAgentDelivery(request: AgentRequestPayload): void {
@@ -242,6 +281,8 @@ export function createCommsExtension(
       await brokerClient.stop();
       clientId = undefined;
       currentGroup = undefined;
+      desiredMembership = undefined;
+      history = [];
       availableGroups = [];
       members.clear();
       ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -322,6 +363,11 @@ export function createCommsExtension(
           userName: values[1],
           agentName: values[2],
         });
+        desiredMembership = {
+          groupId: values[0],
+          userName: values[1],
+          agentName: values[2],
+        };
       },
     });
 
@@ -360,6 +406,8 @@ export function createCommsExtension(
           return;
         }
         clearRemoteWork();
+        desiredMembership = undefined;
+        history = [];
         brokerClient.send("group.leave", {});
       },
     });

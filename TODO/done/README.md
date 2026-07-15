@@ -10,3 +10,4 @@
 - [阶段 3：远程 Agent 闭环](./03-agent-roundtrip.md)
 - [阶段 4：队列与稳定性](./04-queue-reliability.md)
 - [阶段 5：群组与成员](./05-groups-members.md)
+- [阶段 6：SQLite 持久化](./06-sqlite.md)

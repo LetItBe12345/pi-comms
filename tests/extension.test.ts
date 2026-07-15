@@ -109,11 +109,13 @@ async function waitFor(
 describe("Pi Extension 群组接入", () => {
   let directory: string;
   let socketPath: string;
+  let dbPath: string;
   let broker: BrokerServer | undefined;
 
   beforeEach(async () => {
     directory = await mkdtemp(join(tmpdir(), "pi-comms-extension-"));
     socketPath = join(directory, "broker.sock");
+    dbPath = join(directory, "comms.db");
   });
 
   afterEach(async () => {
@@ -184,7 +186,7 @@ describe("Pi Extension 群组接入", () => {
   }
 
   it("通过临时命令创建、加入、查看成员并公开聊天", async () => {
-    broker = createBrokerServer({ socketPath });
+    broker = createBrokerServer({ socketPath, dbPath });
     await broker.start();
     const a = setup("session-a");
     const b = setup("session-b");
@@ -207,7 +209,7 @@ describe("Pi Extension 群组接入", () => {
   });
 
   it("未入群不能发送，并能查看本机群组列表", async () => {
-    broker = createBrokerServer({ socketPath });
+    broker = createBrokerServer({ socketPath, dbPath });
     await broker.start();
     const a = setup("session-a");
     const b = setup("session-b");
@@ -227,7 +229,7 @@ describe("Pi Extension 群组接入", () => {
   });
 
   it("@Agent 只注入目标，并使用确定的群聊上下文格式", async () => {
-    broker = createBrokerServer({ socketPath });
+    broker = createBrokerServer({ socketPath, dbPath });
     await broker.start();
     const a = setup("session-a");
     const b = setup("session-b");
@@ -271,7 +273,7 @@ describe("Pi Extension 群组接入", () => {
   });
 
   it("忙碌 Agent 按 FIFO 处理连续请求", async () => {
-    broker = createBrokerServer({ socketPath });
+    broker = createBrokerServer({ socketPath, dbPath });
     await broker.start();
     const a = setup("session-a");
     const b = setup("session-b");
@@ -312,7 +314,7 @@ describe("Pi Extension 群组接入", () => {
   });
 
   it("离群时中止当前远程任务并清空队列", async () => {
-    broker = createBrokerServer({ socketPath });
+    broker = createBrokerServer({ socketPath, dbPath });
     await broker.start();
     const a = setup("session-a");
     const b = setup("session-b");
@@ -333,8 +335,8 @@ describe("Pi Extension 群组接入", () => {
     ]);
   });
 
-  it("Broker 重启后清理群组和活动请求并自动重连", async () => {
-    broker = createBrokerServer({ socketPath });
+  it("Broker 重启后中止旧请求、自动重新入群并加载历史", async () => {
+    broker = createBrokerServer({ socketPath, dbPath });
     await broker.start();
     const a = setup("session-a");
     const b = setup("session-b");
@@ -345,7 +347,7 @@ describe("Pi Extension 群组接入", () => {
     await waitFor(() => b.pi.sentUserMessages.length === 1, "旧请求未开始");
 
     await broker.close();
-    broker = createBrokerServer({ socketPath });
+    broker = createBrokerServer({ socketPath, dbPath });
     await broker.start();
     await waitFor(
       () =>
@@ -354,8 +356,23 @@ describe("Pi Extension 群组接入", () => {
       "重启后未恢复连接",
     );
     expect(b.aborted()).toBe(1);
-    await command(a, "comms-test", "不能发送");
-    expect(a.notices.at(-1)?.message).toBe("请先创建或加入群组");
+    await waitFor(
+      () =>
+        a.notices.filter((notice) => notice.message.includes("已加入群组"))
+          .length >= 2 &&
+        b.notices.filter((notice) => notice.message.includes("已加入群组"))
+          .length >= 2,
+      "重启后未自动重新入群",
+    );
+    expect(a.notices.some((notice) => notice.message.includes("已加载 1 条历史消息"))).toBe(true);
+    await command(a, "comms-test", "恢复后消息");
+    await waitFor(
+      () =>
+        [a, b].every((item) =>
+          item.notices.some((notice) => notice.message === "[Alice] 恢复后消息"),
+        ),
+      "恢复后无法发送",
+    );
     await Promise.all([
       a.pi.emit("session_shutdown", a.ctx),
       b.pi.emit("session_shutdown", b.ctx),

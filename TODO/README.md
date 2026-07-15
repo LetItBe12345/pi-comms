@@ -19,7 +19,7 @@
 | 3 | [远程 Agent 闭环](./done/03-agent-roundtrip.md) | A 请求 B，并收到唯一回答 | done | 阶段 2 |
 | 4 | [队列与稳定性](./done/04-queue-reliability.md) | 串行处理、断线恢复、去重 | done | 阶段 3 |
 | 5 | [群组与成员](./done/05-groups-members.md) | 建立群组和双成员模型 | done | 阶段 4 |
-| 6 | [SQLite 持久化](./in-progress/06-sqlite.md) | 固定持久化边界 | in-progress | 阶段 5 |
+| 6 | [SQLite 持久化](./done/06-sqlite.md) | 固定持久化边界 | done | 阶段 5 |
 | 7 | [最小 TUI](./in-progress/07-tui.md) | 提供可用的群聊界面 | in-progress | 阶段 6 |
 | 8 | [权限系统](./in-progress/08-permissions.md) | 支持三种 Agent 接收权限 | in-progress | 阶段 7 |
 | 9 | [Agent 对 Agent](./in-progress/09-agent-to-agent.md) | 支持最多 10 轮自动通信 | in-progress | 阶段 8 |

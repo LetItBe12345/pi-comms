@@ -32,11 +32,18 @@ export class GroupState {
   readonly #groups = new Map<string, GroupRecord>();
   readonly #memberships = new Map<string, Membership>();
 
+  constructor(initialGroups: Group[] = []) {
+    for (const group of initialGroups) {
+      this.#groups.set(group.groupId, { ...group, memberships: new Map() });
+    }
+  }
+
   createGroup(
     clientId: string,
     groupName: string,
     userName: string,
     agentName: string,
+    groupId = randomUUID(),
   ): Membership {
     this.#ensureNotJoined(clientId);
     validateDisplayName(groupName);
@@ -50,12 +57,19 @@ export class GroupState {
     }
 
     const group: GroupRecord = {
-      groupId: randomUUID(),
+      groupId,
       groupName,
       memberships: new Map(),
     };
     this.#groups.set(group.groupId, group);
     return this.#join(group, clientId, userName, agentName);
+  }
+
+  removeGroup(groupId: string): void {
+    const group = this.#groups.get(groupId);
+    if (group !== undefined && group.memberships.size === 0) {
+      this.#groups.delete(groupId);
+    }
   }
 
   joinGroup(

@@ -21,6 +21,7 @@ export class BrokerClient {
   readonly #onMessage: (message: BrokerEnvelope) => void;
   readonly #onDisconnected: (wasConnected: boolean) => void;
   #sessionId: string | undefined;
+  #clientId: string | undefined;
   #socket: Socket | undefined;
   #connectTask: Promise<boolean> | undefined;
   #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -114,7 +115,14 @@ export class BrokerClient {
 
       socket.once("connect", () => {
         socket.write(
-          encodeEnvelope(createEnvelope("client.hello", { sessionId })),
+          encodeEnvelope(
+            createEnvelope("client.hello", {
+              sessionId,
+              ...(this.#clientId === undefined
+                ? {}
+                : { clientId: this.#clientId }),
+            }),
+          ),
         );
       });
       socket.on("data", (chunk) => {
@@ -124,6 +132,7 @@ export class BrokerClient {
           }
           const message = result.value as BrokerEnvelope;
           if (message.type === "snapshot") {
+            this.#clientId = message.payload.clientId;
             reachedSnapshot = true;
             this.#connected = true;
             settle(true);

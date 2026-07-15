@@ -21,10 +21,12 @@ export interface SnapshotPayload {
   groups: GroupSummary[];
   group?: Group;
   members: Member[];
+  messages: HistoryMessage[];
 }
 
 export interface ClientHelloPayload {
   sessionId: string;
+  clientId?: string;
 }
 
 export interface ClientGoodbyePayload {
@@ -62,6 +64,31 @@ export interface ChatMessagePayload {
   mentionIds: string[];
   requestId?: string;
   kind?: "agent";
+  status: MessageStatus;
+  failureReason?: MessageFailureReason;
+}
+
+export type MessageStatus =
+  | "sent"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "interrupted";
+
+export type MessageFailureReason =
+  | "target_not_found"
+  | "target_offline"
+  | "target_disconnected"
+  | "agent_busy"
+  | "delivery_failed"
+  | "no_text"
+  | "broker_restarted";
+
+export interface HistoryMessage extends ChatMessagePayload {
+  messageId: string;
+  timestamp: number;
+  chainId?: string;
+  round?: number;
 }
 
 export interface AgentRequestPayload {
@@ -103,11 +130,7 @@ export interface SendFailedPayload {
   groupId: string;
   targetName: string;
   targetAgentId?: string;
-  reason:
-    | "target_not_found"
-    | "target_offline"
-    | "target_disconnected"
-    | AgentFailureReason;
+  reason: Exclude<MessageFailureReason, "broker_restarted">;
 }
 
 export type ProtocolErrorCode =
@@ -120,7 +143,8 @@ export type ProtocolErrorCode =
   | "member_name_conflict"
   | "invalid_name"
   | "already_in_group"
-  | "not_in_group";
+  | "not_in_group"
+  | "database_error";
 
 export interface ErrorPayload {
   code: ProtocolErrorCode;
@@ -250,7 +274,14 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
   }
 
   switch (value.type) {
-    case "client.hello":
+    case "client.hello": {
+      const result = requireStrings(value, requestId, ["sessionId"]);
+      const clientId = value.payload.clientId;
+      return result.ok && clientId !== undefined &&
+        (typeof clientId !== "string" || !clientId.trim())
+        ? invalid("invalid_payload", "client.hello clientId 无效", requestId)
+        : result;
+    }
     case "client.goodbye":
       return requireStrings(value, requestId, ["sessionId"]);
     case "group.create":

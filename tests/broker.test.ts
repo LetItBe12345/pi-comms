@@ -111,13 +111,15 @@ class TestClient {
 describe("Local Broker 群组与成员", () => {
   let directory: string;
   let socketPath: string;
+  let dbPath: string;
   let broker: BrokerServer;
   let clients: TestClient[];
 
   beforeEach(async () => {
     directory = await mkdtemp(join(tmpdir(), "pi-comms-"));
     socketPath = join(directory, "broker.sock");
-    broker = createBrokerServer({ socketPath, disconnectGraceMs: 80 });
+    dbPath = join(directory, "comms.db");
+    broker = createBrokerServer({ socketPath, dbPath, disconnectGraceMs: 80 });
     clients = [];
     await broker.start();
   });
@@ -426,10 +428,13 @@ describe("Local Broker 群组与成员", () => {
   });
 
   it("拒绝第二个 Broker，并清理失效 Socket 文件", async () => {
-    await expect(createBrokerServer({ socketPath }).start()).rejects.toThrow("Broker 已经在运行");
+    await expect(createBrokerServer({ socketPath, dbPath }).start()).rejects.toThrow("Broker 已经在运行");
     const stalePath = join(directory, "stale.sock");
     await writeFile(stalePath, "stale");
-    const another = createBrokerServer({ socketPath: stalePath });
+    const another = createBrokerServer({
+      socketPath: stalePath,
+      dbPath: join(directory, "stale.db"),
+    });
     await another.start();
     const client = await TestClient.connect(stalePath);
     expect((await client.waitFor("snapshot")).payload.clientId).toBeTypeOf("string");

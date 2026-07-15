@@ -143,6 +143,9 @@ Pi Session B Extension ─┘
 - 消息状态。
 - Agent 请求和结果。
 - `chainId` 和通信轮数。
+- 默认路径为 `~/.pi/comms/comms.db`，只有 Broker 可以访问。
+- 使用 WAL、`synchronous=FULL` 和 `PRAGMA user_version`。
+- 不持久化成员关系、在线状态、Socket 和临时队列。
 
 ### 7.3 Broker 内存保存
 
@@ -184,7 +187,8 @@ interface Message {
   text: string;
   mentionIds: string[];
   timestamp: number;
-  status: string;
+  status: "sent" | "processing" | "completed" | "failed" | "interrupted";
+  failureReason?: string;
   requestId?: string;
   chainId?: string;
   round?: number;
@@ -382,6 +386,14 @@ seenRequestIds: Set<string>;
 技术验证阶段使用 Broker 内存状态，不接数据库，重点验证双 Session 请求/回答闭环以及消息只回传一次。
 
 闭环跑通后、完整 TUI 开始前接入 SQLite。群聊历史从 SQLite 读取，Agent 请求状态可从 SQLite 恢复。
+
+- 消息写入成功后才能广播。
+- `@Agent` 公开消息与请求记录必须在同一事务中写入。
+- Agent 回答、请求完成状态和原消息状态必须在同一事务中写入。
+- SQLite 保留全部公开消息；加入群组时按时间正序返回最近 100 条。
+- Broker 重启时，`pending` 和 `delivered` 请求改为 `interrupted`，不自动重试。
+- 仍在运行的 Extension 使用原 `clientId` 和名称自动重新加入；Pi 重启后需要手动加入。
+- 数据库无法打开或迁移失败时，Broker 启动失败，不自动重建数据库。
 
 ## 15. 目标项目结构
 

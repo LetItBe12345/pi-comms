@@ -12,6 +12,7 @@ import {
   type AgentRequestPayload,
   type AgentResultPayload,
   type BrokerEnvelope,
+  type ChatMessagePayload,
   type ClientEnvelope,
   type ClientHelloEnvelope,
   type Envelope,
@@ -19,6 +20,7 @@ import {
   type SendFailedPayload,
 } from "../protocol.js";
 import type { Member } from "../types.js";
+import { BrokerDatabase, historyMessage } from "./database.js";
 import { GroupState, GroupStateError } from "./group-state.js";
 
 export const DEFAULT_SOCKET_PATH = join(
@@ -27,16 +29,24 @@ export const DEFAULT_SOCKET_PATH = join(
   "comms",
   "broker.sock",
 );
+export const DEFAULT_DATABASE_PATH = join(
+  homedir(),
+  ".pi",
+  "comms",
+  "comms.db",
+);
 
 const DEFAULT_DISCONNECT_GRACE_MS = 3_000;
 
 export interface BrokerServerOptions {
   socketPath?: string;
+  dbPath?: string;
   disconnectGraceMs?: number;
 }
 
 export interface BrokerServer {
   readonly socketPath: string;
+  readonly dbPath: string;
   readonly instanceId: string;
   start(): Promise<void>;
   close(): Promise<void>;
@@ -61,12 +71,14 @@ export function createBrokerServer(
   options: BrokerServerOptions = {},
 ): BrokerServer {
   const socketPath = options.socketPath ?? DEFAULT_SOCKET_PATH;
+  const dbPath = options.dbPath ?? DEFAULT_DATABASE_PATH;
   const disconnectGraceMs =
     options.disconnectGraceMs ?? DEFAULT_DISCONNECT_GRACE_MS;
   const instanceId = randomUUID();
   const clients = new Map<string, Socket>();
   const sessions = new Map<string, ClientSession>();
-  const groups = new GroupState();
+  let groups = new GroupState();
+  let database: BrokerDatabase | undefined;
   const pendingRequests = new Map<string, PendingRequest>();
   const completedRequests = new Map<string, string>();
   const closedRequestIds = new Set<string>();
@@ -152,7 +164,7 @@ export function createBrokerServer(
     const sessionId = hello.payload.sessionId;
     let session = sessions.get(sessionId);
     if (session === undefined) {
-      session = { clientId: randomUUID() };
+      session = { clientId: hello.payload.clientId ?? randomUUID() };
       sessions.set(sessionId, session);
     }
     if (session.disconnectTimer !== undefined) {
@@ -234,6 +246,7 @@ export function createBrokerServer(
     if (envelope.type === "agent.deliver.ack") {
       const pending = pendingRequests.get(envelope.payload.requestId);
       if (pending?.targetClientId === clientId) {
+        db().markDelivered(envelope.payload.requestId);
         pending.deliveryAcknowledged = true;
       }
       return;
@@ -265,16 +278,23 @@ export function createBrokerServer(
     requestId: string,
     payload: { groupName: string; userName: string; agentName: string },
   ): void {
+    let groupId: string | undefined;
     try {
-      groups.createGroup(
+      const membership = groups.createGroup(
         clientId,
         payload.groupName,
         payload.userName,
         payload.agentName,
       );
+      groupId = membership.groupId;
+      db().insertGroup({ groupId, groupName: payload.groupName });
       sendSnapshot(clientId, socket);
       broadcastGroupsChanged();
     } catch (error) {
+      if (groupId !== undefined) {
+        groups.removeIfJoined(clientId);
+        groups.removeGroup(groupId);
+      }
       sendGroupError(socket, requestId, error);
     }
   }
@@ -344,11 +364,7 @@ export function createBrokerServer(
       });
       return;
     }
-    if (
-      pendingRequests.has(requestId) ||
-      completedRequests.has(requestId) ||
-      closedRequestIds.has(requestId)
-    ) {
+    if (db().hasMessage(requestId)) {
       return;
     }
 
@@ -357,7 +373,7 @@ export function createBrokerServer(
       mention === undefined
         ? undefined
         : groups.findMemberByName(group.groupId, mention.name);
-    const messagePayload = {
+    const basePayload = {
       groupId: group.groupId,
       senderId: membership.user.memberId,
       senderName: membership.user.displayName,
@@ -366,57 +382,116 @@ export function createBrokerServer(
       mentionIds: target === undefined ? [] : [target.memberId],
       ...(mention === undefined ? {} : { requestId }),
     };
-    broadcastToGroup(
-      group.groupId,
-      createEnvelope("chat.message", messagePayload, { id: requestId }) as BrokerEnvelope,
-    );
 
     if (mention === undefined) {
+      const message = createEnvelope(
+        "chat.message",
+        { ...basePayload, status: "sent" as const },
+        { id: requestId },
+      );
+      try {
+        db().insertMessage(
+          historyMessage(message.id, message.timestamp, message.payload, "sent"),
+        );
+      } catch (error) {
+        sendGroupError(socket, requestId, error);
+        return;
+      }
+      broadcastToGroup(group.groupId, message as BrokerEnvelope);
       return;
     }
-    if (target === undefined) {
+
+    const failMention = (
+      reason: "target_not_found" | "target_offline" | "delivery_failed",
+    ): void => {
+      const messagePayload: ChatMessagePayload = {
+        ...basePayload,
+        status: "failed",
+        failureReason: reason,
+      };
+      const message = createEnvelope("chat.message", messagePayload, {
+        id: requestId,
+      });
+      try {
+        db().insertFailedAgentRequest(
+          historyMessage(
+            message.id,
+            message.timestamp,
+            message.payload,
+            "failed",
+            reason,
+          ),
+          {
+            requestId,
+            groupId: group.groupId,
+            messageId: message.id,
+            senderId: membership.user.memberId,
+            senderName: membership.user.displayName,
+            ...(target?.type === "agent"
+              ? { targetAgentId: target.memberId }
+              : {}),
+            targetAgentName: target?.displayName ?? mention.name,
+            ...(target?.type === "agent"
+              ? {
+                  ownerUserName: groups.membershipForClient(target.clientId)?.user
+                    .displayName,
+                }
+              : {}),
+            text: mention.text ?? "",
+            chainId: requestId,
+            round: 1,
+            failureReason: reason,
+          },
+        );
+      } catch (error) {
+        sendGroupError(socket, requestId, error);
+        return;
+      }
       closedRequestIds.add(requestId);
+      broadcastToGroup(group.groupId, message as BrokerEnvelope);
       broadcastFailure({
         requestId,
         groupId: group.groupId,
-        targetName: mention.name,
-        reason: "target_not_found",
+        targetName: target?.displayName ?? mention.name,
+        ...(target?.type === "agent" ? { targetAgentId: target.memberId } : {}),
+        reason,
       });
+    };
+
+    if (target === undefined) {
+      failMention("target_not_found");
       return;
     }
     if (!target.online) {
-      closedRequestIds.add(requestId);
-      broadcastFailure({
-        requestId,
-        groupId: group.groupId,
-        targetName: target.displayName,
-        ...(target.type === "agent" ? { targetAgentId: target.memberId } : {}),
-        reason: "target_offline",
-      });
+      failMention("target_offline");
       return;
     }
     if (target.type === "user") {
+      const message = createEnvelope(
+        "chat.message",
+        { ...basePayload, status: "sent" as const },
+        { id: requestId },
+      );
+      try {
+        db().insertMessage(
+          historyMessage(message.id, message.timestamp, message.payload, "sent"),
+        );
+      } catch (error) {
+        sendGroupError(socket, requestId, error);
+        return;
+      }
+      broadcastToGroup(group.groupId, message as BrokerEnvelope);
       return;
     }
     if (mention.text === undefined || !mention.text.trim()) {
-      sendError(socket, {
-        code: "invalid_payload",
-        message: "@Agent 后需要消息正文",
-        requestId,
-      });
+      failMention("delivery_failed");
       return;
     }
 
     const targetSocket = clients.get(target.clientId);
     const targetMembership = groups.membershipForClient(target.clientId);
     if (targetSocket === undefined || targetMembership === undefined) {
-      broadcastFailure({
-        requestId,
-        groupId: group.groupId,
-        targetName: target.displayName,
-        targetAgentId: target.memberId,
-        reason: "target_offline",
-      });
+      failMention("target_offline");
       return;
     }
     const request: AgentRequestPayload = {
@@ -439,6 +514,25 @@ export function createBrokerServer(
       chainId: requestId,
       round: 1,
     };
+    const message = createEnvelope(
+      "chat.message",
+      { ...basePayload, status: "processing" as const },
+      { id: requestId },
+    );
+    try {
+      db().insertAgentRequest(
+        historyMessage(
+          message.id,
+          message.timestamp,
+          message.payload,
+          "processing",
+        ),
+        request,
+      );
+    } catch (error) {
+      sendGroupError(socket, requestId, error);
+      return;
+    }
     pendingRequests.set(requestId, {
       targetClientId: target.clientId,
       targetAgentId: target.memberId,
@@ -447,6 +541,7 @@ export function createBrokerServer(
       request,
       deliveryAcknowledged: false,
     });
+    broadcastToGroup(group.groupId, message as BrokerEnvelope);
     send(targetSocket, createEnvelope("agent.deliver", request) as BrokerEnvelope);
   }
 
@@ -472,7 +567,10 @@ export function createBrokerServer(
     socket: Socket,
     result: AgentResultPayload,
   ): void {
-    if (completedRequests.get(result.requestId) === clientId) {
+    if (
+      completedRequests.get(result.requestId) === clientId ||
+      db().requestStatus(result.requestId) === "completed"
+    ) {
       sendResultAck(socket, result.requestId, true);
       return;
     }
@@ -482,23 +580,48 @@ export function createBrokerServer(
       return;
     }
 
-    pendingRequests.delete(result.requestId);
-    completedRequests.set(result.requestId, clientId);
     if (result.ok) {
-      broadcastToGroup(
-        pending.groupId,
-        createEnvelope("chat.message", {
-          groupId: pending.groupId,
-          senderId: pending.request.targetAgentId,
-          senderName: pending.request.targetAgentName,
-          senderType: "agent" as const,
-          text: result.text,
-          mentionIds: [pending.request.senderId],
-          requestId: result.requestId,
-          kind: "agent" as const,
-        }) as BrokerEnvelope,
-      );
+      const answer = createEnvelope("chat.message", {
+        groupId: pending.groupId,
+        senderId: pending.request.targetAgentId,
+        senderName: pending.request.targetAgentName,
+        senderType: "agent" as const,
+        text: result.text,
+        mentionIds: [pending.request.senderId],
+        requestId: result.requestId,
+        kind: "agent" as const,
+        status: "sent" as const,
+      });
+      try {
+        db().completeRequest(result.requestId, {
+          ...historyMessage(
+            answer.id,
+            answer.timestamp,
+            answer.payload,
+            "sent",
+          ),
+          chainId: pending.request.chainId,
+          round: pending.request.round,
+        });
+      } catch {
+        sendResultAck(socket, result.requestId, false);
+        return;
+      }
+      pendingRequests.delete(result.requestId);
+      completedRequests.set(result.requestId, clientId);
+      broadcastToGroup(pending.groupId, answer as BrokerEnvelope);
     } else {
+      try {
+        if (!db().failRequest(result.requestId, result.reason)) {
+          sendResultAck(socket, result.requestId, false);
+          return;
+        }
+      } catch {
+        sendResultAck(socket, result.requestId, false);
+        return;
+      }
+      pendingRequests.delete(result.requestId);
+      completedRequests.set(result.requestId, clientId);
       broadcastFailure({
         requestId: result.requestId,
         groupId: pending.groupId,
@@ -535,6 +658,9 @@ export function createBrokerServer(
       }
       pendingRequests.delete(requestId);
       closedRequestIds.add(requestId);
+      if (!db().failRequest(requestId, reason)) {
+        continue;
+      }
       broadcastFailure({
         requestId,
         groupId: pending.groupId,
@@ -556,6 +682,8 @@ export function createBrokerServer(
         ...(group === undefined ? {} : { group }),
         members:
           group === undefined ? [] : groups.onlineMembers(group.groupId),
+        messages:
+          group === undefined ? [] : db().recentMessages(group.groupId),
       }) as BrokerEnvelope,
     );
   }
@@ -614,7 +742,11 @@ export function createBrokerServer(
       });
       return;
     }
-    throw error;
+    sendError(socket, {
+      code: "database_error",
+      message: error instanceof Error ? error.message : "数据库操作失败",
+      requestId,
+    });
   }
 
   function sendError(socket: Socket, payload: ErrorPayload): void {
@@ -629,10 +761,14 @@ export function createBrokerServer(
     if (await canConnect(socketPath)) {
       throw new Error(`Broker 已经在运行：${socketPath}`);
     }
+    database = new BrokerDatabase(dbPath);
+    groups = new GroupState(database.groups());
     await removeSocketIfPresent(socketPath);
     await new Promise<void>((resolveStart, rejectStart) => {
       const onError = (error: Error) => {
         server.off("listening", onListening);
+        database?.close();
+        database = undefined;
         rejectStart(error);
       };
       const onListening = () => {
@@ -665,9 +801,18 @@ export function createBrokerServer(
       server.close((error) => (error ? rejectClose(error) : resolveClose()));
     });
     started = false;
+    database?.close();
+    database = undefined;
   }
 
-  return { socketPath, instanceId, start, close };
+  function db(): BrokerDatabase {
+    if (database === undefined) {
+      throw new Error("Broker 数据库尚未启动");
+    }
+    return database;
+  }
+
+  return { socketPath, dbPath, instanceId, start, close };
 }
 
 function parseMention(
