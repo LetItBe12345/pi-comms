@@ -57,7 +57,7 @@ class FakePi {
   }
 }
 
-function createFakeContext(sessionId: string): {
+function createFakeContext(sessionId: string, branch: unknown[] = []): {
   ctx: ExtensionContext;
   notices: Notice[];
   statuses: Array<string | undefined>;
@@ -78,12 +78,16 @@ function createFakeContext(sessionId: string): {
   } as ExtensionUIContext;
   const ctx = {
     ui,
-    sessionManager: { getSessionId: () => sessionId },
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getBranch: () => branch,
+      getEntries: () => branch,
+    },
     isIdle: () => idle,
     abort: () => {
       abortCount += 1;
     },
-  } as ExtensionContext;
+  } as unknown as ExtensionContext;
   return {
     ctx,
     notices,
@@ -123,9 +127,9 @@ describe("Pi Extension 群组接入", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  function setup(sessionId: string) {
+  function setup(sessionId: string, branch: unknown[] = []) {
     const pi = new FakePi();
-    const context = createFakeContext(sessionId);
+    const context = createFakeContext(sessionId, branch);
     createCommsExtension({
       socketPath,
       reconnectIntervalMs: 20,
@@ -267,6 +271,35 @@ describe("Pi Extension 群组接入", () => {
       a.pi.emit("session_shutdown", a.ctx),
       b.pi.emit("session_shutdown", b.ctx),
       c.pi.emit("session_shutdown", c.ctx),
+    ]);
+  });
+
+  it("从 Session 恢复需要批准权限，未批准前不注入", async () => {
+    broker = createBrokerServer({ socketPath, dbPath });
+    await broker.start();
+    const a = setup("session-a");
+    const b = setup("session-b", [{
+      type: "custom",
+      customType: "pi-comms-permission",
+      data: { permission: "approval" },
+    }]);
+    await Promise.all([start(a), start(b)]);
+    const groupId = await createGroup(a);
+    await joinGroup(b, groupId);
+
+    await command(a, "comms-test", "@Bob-Pi 等待批准");
+    await waitFor(
+      () =>
+        a.notices.some(
+          (notice) => notice.message === "[Alice] @Bob-Pi 等待批准",
+        ),
+      "待批准消息未公开",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(b.pi.sentUserMessages).toEqual([]);
+    await Promise.all([
+      a.pi.emit("session_shutdown", a.ctx),
+      b.pi.emit("session_shutdown", b.ctx),
     ]);
   });
 

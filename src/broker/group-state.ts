@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type {
   AgentActivityStatus,
+  AgentPermission,
   Group,
   GroupSummary,
   Member,
@@ -143,6 +144,23 @@ export class GroupState {
     return { ...agent };
   }
 
+  setAgentPermission(
+    clientId: string,
+    permission: AgentPermission,
+  ): Member | undefined {
+    const agent = this.#memberships.get(clientId)?.agent;
+    if (agent === undefined) return undefined;
+    agent.agentPermission = permission;
+    return { ...agent };
+  }
+
+  setPendingApprovalCount(clientId: string, count: number): Member | undefined {
+    const agent = this.#memberships.get(clientId)?.agent;
+    if (agent === undefined) return undefined;
+    agent.pendingApprovalCount = count;
+    return { ...agent };
+  }
+
   groupForClient(clientId: string): Group | undefined {
     const membership = this.#memberships.get(clientId);
     const group =
@@ -254,6 +272,8 @@ export class GroupState {
         groupId: group.groupId,
         online: true,
         agentStatus: "idle",
+        agentPermission: "auto",
+        pendingApprovalCount: 0,
       },
     };
     group.memberships.set(clientId, membership);

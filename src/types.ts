@@ -1,5 +1,6 @@
 export type MemberType = "user" | "agent";
 export type AgentActivityStatus = "idle" | "busy";
+export type AgentPermission = "auto" | "approval" | "blocked";
 
 export interface Group {
   groupId: string;
@@ -18,6 +19,8 @@ export interface Member {
   groupId: string;
   online: boolean;
   agentStatus?: AgentActivityStatus;
+  agentPermission?: AgentPermission;
+  pendingApprovalCount?: number;
 }
 
 export interface OnlineMember {

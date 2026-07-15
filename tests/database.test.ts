@@ -22,7 +22,7 @@ describe("Broker SQLite", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  it("初始化 v1 Schema、WAL 和 FULL，并恢复群组", () => {
+  it("初始化 v2 Schema、WAL 和 FULL，并恢复群组", () => {
     const store = new BrokerDatabase(dbPath);
     expect(store.configuration()).toEqual({
       journalMode: "wal",
@@ -32,7 +32,7 @@ describe("Broker SQLite", () => {
     store.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(1);
+    expect(raw.pragma("user_version", { simple: true })).toBe(2);
     expect(raw.pragma("journal_mode", { simple: true })).toBe("wal");
     const tables = raw
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -108,6 +108,103 @@ describe("Broker SQLite", () => {
     expect(reopened.recentMessages("g")[0]).toMatchObject({
       status: "interrupted",
       failureReason: "broker_restarted",
+    });
+    reopened.close();
+  });
+
+  it("保存待批准请求，并在批准或拒绝后更新公开消息", () => {
+    const store = new BrokerDatabase(dbPath);
+    store.insertGroup({ groupId: "g", groupName: "开发组" });
+    const makeRequest = (id: string): AgentRequestPayload => ({
+      requestId: id,
+      groupId: "g",
+      groupName: "开发组",
+      senderId: "user:a",
+      senderName: "Alice",
+      targetAgentId: "agent:b",
+      targetAgentName: "Bob-Pi",
+      ownerUserName: "Bob",
+      onlineMembers: [],
+      text: "回答",
+      chainId: id,
+      round: 1,
+    });
+    const makeMessage = (id: string): ChatMessagePayload => ({
+      groupId: "g",
+      senderId: "user:a",
+      senderName: "Alice",
+      senderType: "user",
+      text: "@Bob-Pi 回答",
+      mentionIds: ["agent:b"],
+      requestId: id,
+      status: "waiting_approval",
+    });
+
+    store.insertAgentRequest(
+      historyMessage("approve", 1, makeMessage("approve"), "waiting_approval"),
+      makeRequest("approve"),
+      true,
+    );
+    store.insertAgentRequest(
+      historyMessage("reject", 2, makeMessage("reject"), "waiting_approval"),
+      makeRequest("reject"),
+      true,
+    );
+    expect(store.requestStatus("approve")).toBe("awaiting_approval");
+    expect(store.approveRequest("approve")).toBe(true);
+    expect(store.rejectRequest("reject")).toBe(true);
+    expect(store.requestStatus("approve")).toBe("pending");
+    expect(store.requestStatus("reject")).toBe("rejected");
+    expect(store.recentMessages("g")).toEqual([
+      expect.objectContaining({ messageId: "approve", status: "queued" }),
+      expect.objectContaining({
+        messageId: "reject",
+        status: "failed",
+        failureReason: "request_rejected",
+      }),
+    ]);
+    store.close();
+  });
+
+  it("Broker 重启后让待批准请求失效", () => {
+    const store = new BrokerDatabase(dbPath);
+    store.insertGroup({ groupId: "g", groupName: "开发组" });
+    const payload: ChatMessagePayload = {
+      groupId: "g",
+      senderId: "user:a",
+      senderName: "Alice",
+      senderType: "user",
+      text: "@Bob-Pi 等待",
+      mentionIds: ["agent:b"],
+      requestId: "waiting",
+      status: "waiting_approval",
+    };
+    const request: AgentRequestPayload = {
+      requestId: "waiting",
+      groupId: "g",
+      groupName: "开发组",
+      senderId: "user:a",
+      senderName: "Alice",
+      targetAgentId: "agent:b",
+      targetAgentName: "Bob-Pi",
+      ownerUserName: "Bob",
+      onlineMembers: [],
+      text: "等待",
+      chainId: "waiting",
+      round: 1,
+    };
+    store.insertAgentRequest(
+      historyMessage("waiting", 1, payload, "waiting_approval"),
+      request,
+      true,
+    );
+    store.close();
+
+    const reopened = new BrokerDatabase(dbPath);
+    expect(reopened.requestStatus("waiting")).toBe("invalid");
+    expect(reopened.recentMessages("g")[0]).toMatchObject({
+      status: "failed",
+      failureReason: "request_invalid",
     });
     reopened.close();
   });
