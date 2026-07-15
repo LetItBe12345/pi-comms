@@ -208,9 +208,12 @@ interface AgentRequest {
 
 ### 9.1 Client → Broker
 
+- `client.hello`
+- `client.goodbye`
 - `join`
 - `leave`
 - `chat.send`
+- `agent.deliver.ack`
 - `agent.result`
 - `permission.update`
 - `request.approve`
@@ -222,6 +225,7 @@ interface AgentRequest {
 - `chat.message`
 - `presence.changed`
 - `agent.deliver`
+- `agent.result.ack`
 - `request.pending`
 - `send.failed`
 - `error`
@@ -271,6 +275,8 @@ interface Envelope<T = unknown> {
 remoteQueue: AgentRequest[];
 activeRequest: AgentRequest | null;
 lastAssistantText: string | null;
+pendingResults: Map<string, AgentResult>;
+seenRequestIds: Set<string>;
 ```
 
 - Agent 空闲时立即处理；忙碌时入队，不抢占当前任务。
@@ -279,6 +285,9 @@ lastAssistantText: string | null;
 - `agent_settled` 后回传结果，再处理下一条队列。
 - 只有存在 `activeRequest` 时才广播回答。
 - `requestId` 必须让请求与回答一一对应。
+- 请求进入队列后发送 `agent.deliver.ack`；重复请求只确认，不再次入队。
+- 回答保留到收到 `agent.result.ack`；未确认回答在重连后继续发送。
+- Broker 对重复回答只确认一次接收状态，不再次公开广播。
 - 普通用户与 Pi 的私人对话不得进入群聊。
 
 ### 11.4 Agent 对 Agent
@@ -296,6 +305,10 @@ lastAssistantText: string | null;
 - 初始化 Session 状态。
 - 获取 Session 文件或内部标识。
 - 准备 Broker 连接。
+- 断线后每秒自动重连。
+- 同一 Broker 实例内，使用 Session 标识恢复原 `clientId`。
+- 意外断线保留 3 秒恢复窗口；正常关闭不等待。
+- `snapshot` 携带 `brokerInstanceId`。实例变化时终止活动远程请求并清理旧队列；跨 Broker 重启恢复留到 SQLite 阶段。
 
 ### 12.2 `/comms`
 

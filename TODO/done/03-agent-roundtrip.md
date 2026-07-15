@@ -32,4 +32,4 @@
 
 ## 下一阶段
 
-[阶段 4：队列与稳定性](../in-progress/04-queue-reliability.md)
+[阶段 4：队列与稳定性](./04-queue-reliability.md)

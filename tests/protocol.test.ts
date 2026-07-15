@@ -117,4 +117,22 @@ describe("客户端消息校验", () => {
     expect(parseClientEnvelope(success).ok).toBe(true);
     expect(parseClientEnvelope(failure).ok).toBe(true);
   });
+
+  it("接受连接握手、正常关闭和投递确认", () => {
+    expect(
+      parseClientEnvelope(
+        createEnvelope("client.hello", { sessionId: "session-a" }),
+      ).ok,
+    ).toBe(true);
+    expect(
+      parseClientEnvelope(
+        createEnvelope("client.goodbye", { sessionId: "session-a" }),
+      ).ok,
+    ).toBe(true);
+    expect(
+      parseClientEnvelope(
+        createEnvelope("agent.deliver.ack", { requestId: "request-a" }),
+      ).ok,
+    ).toBe(true);
+  });
 });

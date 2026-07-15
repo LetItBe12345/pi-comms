@@ -17,7 +17,7 @@
 | 1 | [Node.js 通信验证](./done/01-node-broker.md) | 两个普通客户端经 Broker 通信 | done | 阶段 0 |
 | 2 | [Pi Extension 最小验证](./done/02-pi-extension.md) | Extension 能连接 Broker | done | 阶段 1 |
 | 3 | [远程 Agent 闭环](./done/03-agent-roundtrip.md) | A 请求 B，并收到唯一回答 | done | 阶段 2 |
-| 4 | [队列与稳定性](./in-progress/04-queue-reliability.md) | 串行处理、断线恢复、去重 | in-progress | 阶段 3 |
+| 4 | [队列与稳定性](./done/04-queue-reliability.md) | 串行处理、断线恢复、去重 | done | 阶段 3 |
 | 5 | [群组与成员](./in-progress/05-groups-members.md) | 建立群组和双成员模型 | in-progress | 阶段 4 |
 | 6 | [SQLite 持久化](./in-progress/06-sqlite.md) | 固定持久化边界 | in-progress | 阶段 5 |
 | 7 | [最小 TUI](./in-progress/07-tui.md) | 提供可用的群聊界面 | in-progress | 阶段 6 |
