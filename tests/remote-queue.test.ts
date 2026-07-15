@@ -6,9 +6,13 @@ function request(requestId: string): AgentRequestPayload {
   return {
     requestId,
     groupId: "default",
+    groupName: "开发组",
     senderId: "sender",
     senderName: "Sender",
     targetAgentId: "target",
+    targetAgentName: "Target-Pi",
+    ownerUserName: "Target",
+    onlineMembers: [],
     text: requestId,
     chainId: requestId,
     round: 1,

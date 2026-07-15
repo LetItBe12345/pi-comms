@@ -9,3 +9,4 @@
 - [阶段 2：Pi Extension 最小验证](./02-pi-extension.md)
 - [阶段 3：远程 Agent 闭环](./03-agent-roundtrip.md)
 - [阶段 4：队列与稳定性](./04-queue-reliability.md)
+- [阶段 5：群组与成员](./05-groups-members.md)

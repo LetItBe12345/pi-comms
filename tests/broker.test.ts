@@ -1,17 +1,15 @@
-import { writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createEnvelope,
   encodeEnvelope,
   JsonlDecoder,
-  type BrokerEnvelope,
   type AgentResultPayload,
-  type ChatSendPayload,
+  type BrokerEnvelope,
 } from "../src/protocol.js";
 import {
   createBrokerServer,
@@ -26,26 +24,22 @@ type EnvelopeByType<T extends BrokerEnvelopeType> = Extract<
 
 class TestClient {
   readonly messages: BrokerEnvelope[] = [];
+  readonly sessionId: string;
   readonly #socket: Socket;
   readonly #decoder = new JsonlDecoder();
   readonly #listeners = new Set<() => void>();
 
   private constructor(socketPath: string, sessionId: string) {
+    this.sessionId = sessionId;
     this.#socket = createConnection(socketPath);
     this.#socket.once("connect", () => {
-      this.#socket.write(
-        encodeEnvelope(createEnvelope("client.hello", { sessionId })),
-      );
+      this.send("client.hello", { sessionId });
     });
     this.#socket.on("data", (chunk) => {
       for (const result of this.#decoder.push(chunk)) {
-        if (!result.ok) {
-          throw new Error(result.error);
-        }
+        if (!result.ok) throw new Error(result.error);
         this.messages.push(result.value as BrokerEnvelope);
-        for (const listener of this.#listeners) {
-          listener();
-        }
+        for (const listener of this.#listeners) listener();
       }
     });
   }
@@ -55,35 +49,23 @@ class TestClient {
     sessionId: string = randomUUID(),
   ): Promise<TestClient> {
     const client = new TestClient(socketPath, sessionId);
-    await new Promise<void>((resolveConnection, rejectConnection) => {
-      client.#socket.once("connect", resolveConnection);
-      client.#socket.once("error", rejectConnection);
+    await new Promise<void>((resolve, reject) => {
+      client.#socket.once("connect", resolve);
+      client.#socket.once("error", reject);
     });
+    await client.waitFor("snapshot");
     return client;
   }
 
-  send(id: string, payload: ChatSendPayload): void {
+  send(type: string, payload: unknown, id: string = randomUUID()): string {
     this.#socket.write(
-      encodeEnvelope(
-        createEnvelope("chat.send", payload, { id, timestamp: 1 }),
-      ),
+      encodeEnvelope(createEnvelope(type, payload, { id, timestamp: 1 })),
     );
+    return id;
   }
 
-  sendResult(id: string, payload: AgentResultPayload): void {
-    this.#socket.write(
-      encodeEnvelope(
-        createEnvelope("agent.result", payload, { id, timestamp: 1 }),
-      ),
-    );
-  }
-
-  acknowledgeDelivery(requestId: string): void {
-    this.#socket.write(
-      encodeEnvelope(
-        createEnvelope("agent.deliver.ack", { requestId }),
-      ),
-    );
+  sendResult(payload: AgentResultPayload): void {
+    this.send("agent.result", payload);
   }
 
   writeRaw(value: string): void {
@@ -94,47 +76,39 @@ class TestClient {
     type: T,
     predicate: (message: EnvelopeByType<T>) => boolean = () => true,
   ): Promise<EnvelopeByType<T>> {
-    const findMessage = () =>
+    const find = () =>
       this.messages.find(
         (message): message is EnvelopeByType<T> =>
           message.type === type && predicate(message as EnvelopeByType<T>),
       );
-    const existing = findMessage();
-    if (existing) {
-      return existing;
-    }
-
-    return new Promise<EnvelopeByType<T>>((resolveMessage, rejectMessage) => {
+    const existing = find();
+    if (existing) return existing;
+    return new Promise<EnvelopeByType<T>>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.#listeners.delete(check);
-        rejectMessage(new Error(`等待 ${type} 超时`));
+        reject(new Error(`等待 ${type} 超时`));
       }, 1_000);
       const check = () => {
-        const message = findMessage();
-        if (!message) {
-          return;
-        }
+        const message = find();
+        if (!message) return;
         clearTimeout(timeout);
         this.#listeners.delete(check);
-        resolveMessage(message);
+        resolve(message);
       };
-
       this.#listeners.add(check);
     });
   }
 
   async close(): Promise<void> {
-    if (this.#socket.destroyed) {
-      return;
-    }
-    await new Promise<void>((resolveClose) => {
-      this.#socket.once("close", resolveClose);
-      this.#socket.end();
+    if (this.#socket.destroyed) return;
+    await new Promise<void>((resolve) => {
+      this.#socket.once("close", resolve);
+      this.#socket.destroy();
     });
   }
 }
 
-describe("Local Broker", () => {
+describe("Local Broker 群组与成员", () => {
   let directory: string;
   let socketPath: string;
   let broker: BrokerServer;
@@ -143,7 +117,7 @@ describe("Local Broker", () => {
   beforeEach(async () => {
     directory = await mkdtemp(join(tmpdir(), "pi-comms-"));
     socketPath = join(directory, "broker.sock");
-    broker = createBrokerServer({ socketPath, disconnectGraceMs: 100 });
+    broker = createBrokerServer({ socketPath, disconnectGraceMs: 80 });
     clients = [];
     await broker.start();
   });
@@ -154,409 +128,312 @@ describe("Local Broker", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  async function connectClient(sessionId?: string): Promise<{
-    client: TestClient;
-    clientId: string;
-  }> {
+  async function connect(sessionId?: string): Promise<TestClient> {
     const client = await TestClient.connect(socketPath, sessionId);
     clients.push(client);
-    const snapshot = await client.waitFor("snapshot");
-    return { client, clientId: snapshot.payload.clientId };
+    return client;
   }
 
-  it("给 A 和 B 分配 ID，并发布在线状态", async () => {
-    const a = await connectClient();
-    const b = await connectClient();
+  async function createGroup(
+    client: TestClient,
+    groupName = "开发组",
+    userName = "Alice",
+    agentName = "Alice-Pi",
+  ) {
+    client.send("group.create", { groupName, userName, agentName });
+    return client.waitFor("snapshot", (message) => message.payload.group !== undefined);
+  }
 
-    const bOnline = await a.client.waitFor(
-      "presence.changed",
-      (message) =>
-        message.payload.clientId === b.clientId && message.payload.online,
+  async function joinGroup(
+    client: TestClient,
+    groupId: string,
+    userName = "Bob",
+    agentName = "Bob-Pi",
+  ) {
+    client.send("group.join", { groupId, userName, agentName });
+    return client.waitFor(
+      "snapshot",
+      (message) => message.payload.group?.groupId === groupId,
     );
-    const bSnapshot = await b.client.waitFor("snapshot");
+  }
 
-    expect(a.clientId).not.toBe(b.clientId);
-    expect(bOnline.payload.online).toBe(true);
-    expect(new Set(bSnapshot.payload.clients)).toEqual(
-      new Set([a.clientId, b.clientId]),
-    );
-    expect(bSnapshot.payload.brokerInstanceId).toBe(broker.instanceId);
-  });
+  it("连接后不自动入群，并返回本机群组列表", async () => {
+    const a = await connect();
+    const initial = await a.waitFor("snapshot");
+    expect(initial.payload).toMatchObject({
+      brokerInstanceId: broker.instanceId,
+      groups: [],
+      members: [],
+    });
+    expect(initial.payload.group).toBeUndefined();
 
-  it("把 A 的公开消息发送给 A 和 B", async () => {
-    const a = await connectClient();
-    const b = await connectClient();
-
-    a.client.send("public-1", { text: "公开消息" });
-
-    const [messageForA, messageForB] = await Promise.all([
-      a.client.waitFor("chat.message", (message) => message.id === "public-1"),
-      b.client.waitFor("chat.message", (message) => message.id === "public-1"),
+    const created = await createGroup(a);
+    const b = await connect();
+    const bSnapshot = await b.waitFor("snapshot");
+    expect(bSnapshot.payload.groups).toEqual([
+      {
+        groupId: created.payload.group!.groupId,
+        groupName: "开发组",
+        onlineSessionCount: 1,
+      },
     ]);
-    expect(messageForA.payload).toEqual({
-      senderClientId: a.clientId,
-      text: "公开消息",
-    });
-    expect(messageForA.timestamp).toBeGreaterThan(1);
-    expect(messageForB).toEqual(messageForA);
   });
 
-  it("把 A 的定向消息只发送给 B", async () => {
-    const a = await connectClient();
-    const b = await connectClient();
+  it("两个 Session 入群后看到四个稳定成员", async () => {
+    const a = await connect("session-a");
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect("session-b");
+    const joined = await joinGroup(b, groupId);
 
-    a.client.send("direct-1", {
-      text: "只给 B",
-      targetClientId: b.clientId,
+    expect(joined.payload.members.map((member) => member.displayName)).toEqual([
+      "Alice",
+      "Alice-Pi",
+      "Bob",
+      "Bob-Pi",
+    ]);
+    const bClientId = joined.payload.clientId;
+    expect(joined.payload.members).toContainEqual({
+      memberId: `user:${bClientId}`,
+      clientId: bClientId,
+      type: "user",
+      displayName: "Bob",
+      groupId,
+      online: true,
     });
-
-    const messageForB = await b.client.waitFor(
-      "chat.message",
-      (message) => message.id === "direct-1",
+    const online = await a.waitFor(
+      "presence.changed",
+      (message) => message.payload.displayName === "Bob-Pi",
     );
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 30));
+    expect(online.payload.memberId).toBe(`agent:${bClientId}`);
+  });
 
-    expect(messageForB.payload).toEqual({
-      senderClientId: a.clientId,
-      text: "只给 B",
-      targetClientId: b.clientId,
-    });
+  it("拒绝非法名称、大小写冲突和重复入群", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect();
+    b.send("group.join", { groupId, userName: "alice", agentName: "Bob-Pi" }, "name-conflict");
     expect(
-      a.client.messages.some(
-        (message) => message.type === "chat.message" && message.id === "direct-1",
-      ),
+      await b.waitFor("error", (message) => message.payload.requestId === "name-conflict"),
+    ).toMatchObject({ payload: { code: "member_name_conflict" } });
+
+    const c = await connect();
+    c.send("group.create", {
+      groupName: "非法 群",
+      userName: "Carol",
+      agentName: "Carol-Pi",
+    }, "invalid-name");
+    expect(
+      await c.waitFor("error", (message) => message.payload.requestId === "invalid-name"),
+    ).toMatchObject({ payload: { code: "invalid_name" } });
+
+    a.send("group.create", {
+      groupName: "新群",
+      userName: "A2",
+      agentName: "A2-Pi",
+    }, "already-in-group");
+    expect(
+      await a.waitFor("error", (message) => message.payload.requestId === "already-in-group"),
+    ).toMatchObject({ payload: { code: "already_in_group" } });
+  });
+
+  it("群名唯一，空群保留且离群后可以加入其他群", async () => {
+    const a = await connect();
+    const first = await createGroup(a, "Team-A");
+    const firstId = first.payload.group!.groupId;
+    a.send("group.leave", {}, "leave-a");
+    await a.waitFor("snapshot", (message) => message.payload.group === undefined && message.payload.groups.length === 1);
+
+    const b = await connect();
+    b.send("group.create", {
+      groupName: "team-a",
+      userName: "Bob",
+      agentName: "Bob-Pi",
+    }, "duplicate-group");
+    expect(
+      await b.waitFor("error", (message) => message.payload.requestId === "duplicate-group"),
+    ).toMatchObject({ payload: { code: "group_name_conflict" } });
+
+    const rejoined = await joinGroup(a, firstId, "Alice2", "Alice2-Pi");
+    expect(rejoined.payload.group?.groupId).toBe(firstId);
+  });
+
+  it("群聊和成员事件严格按群隔离", async () => {
+    const a = await connect();
+    const groupA = await createGroup(a, "A群");
+    const b = await connect();
+    await joinGroup(b, groupA.payload.group!.groupId);
+    const c = await connect();
+    await createGroup(c, "C群", "Carol", "Carol-Pi");
+
+    a.send("chat.send", { text: "只在 A 群" }, "group-message");
+    await Promise.all([
+      a.waitFor("chat.message", (message) => message.id === "group-message"),
+      b.waitFor("chat.message", (message) => message.id === "group-message"),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(
+      c.messages.some((message) => message.type === "chat.message" && message.id === "group-message"),
     ).toBe(false);
   });
 
-  it("公开 @ 请求并只向目标发送 agent.deliver", async () => {
-    const a = await connectClient();
-    const b = await connectClient();
-    const c = await connectClient();
-    const text = `@${b.clientId} 只回复 STAGE3_OK`;
+  it("按 Agent 名称公开消息并注入完整群组上下文", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect();
+    await joinGroup(b, groupId);
+    const c = await connect();
+    await joinGroup(c, groupId, "Carol", "Carol-Pi");
 
-    a.client.send("request-1", { text });
-
-    const [publicA, publicB, publicC, delivery] = await Promise.all([
-      a.client.waitFor("chat.message", (message) => message.id === "request-1"),
-      b.client.waitFor("chat.message", (message) => message.id === "request-1"),
-      c.client.waitFor("chat.message", (message) => message.id === "request-1"),
-      b.client.waitFor(
-        "agent.deliver",
-        (message) => message.payload.requestId === "request-1",
-      ),
+    a.send("chat.send", { text: "@bob-pi  原样正文" }, "agent-request");
+    const [publicMessage, delivery] = await Promise.all([
+      c.waitFor("chat.message", (message) => message.id === "agent-request"),
+      b.waitFor("agent.deliver", (message) => message.payload.requestId === "agent-request"),
     ]);
-
-    expect(publicA).toEqual(publicB);
-    expect(publicB).toEqual(publicC);
-    expect(publicA.payload).toMatchObject({
-      senderClientId: a.clientId,
-      targetClientId: b.clientId,
-      requestId: "request-1",
-      text,
+    expect(publicMessage.payload).toMatchObject({
+      senderId: expect.stringMatching(/^user:/),
+      senderName: "Alice",
+      senderType: "user",
+      text: "@bob-pi  原样正文",
+      mentionIds: [expect.stringMatching(/^agent:/)],
     });
-    expect(delivery.payload).toEqual({
-      requestId: "request-1",
-      groupId: "default",
-      senderId: a.clientId,
-      senderName: `Client-${a.clientId.slice(0, 8)}`,
-      targetAgentId: b.clientId,
-      text: "只回复 STAGE3_OK",
-      chainId: "request-1",
+    expect(delivery.payload).toMatchObject({
+      groupId,
+      groupName: "开发组",
+      senderName: "Alice",
+      targetAgentName: "Bob-Pi",
+      ownerUserName: "Bob",
+      text: "原样正文",
       round: 1,
     });
-    expect(
-      c.client.messages.some((message) => message.type === "agent.deliver"),
-    ).toBe(false);
+    expect(delivery.payload.onlineMembers).not.toContainEqual({
+      displayName: "Bob-Pi",
+      type: "agent",
+    });
+    expect(delivery.payload.onlineMembers).toContainEqual({
+      displayName: "Bob",
+      type: "user",
+    });
+    expect(c.messages.some((message) => message.type === "agent.deliver")).toBe(false);
   });
 
-  it("只接受目标的一次 Agent 回答并公开广播", async () => {
-    const a = await connectClient();
-    const b = await connectClient();
-    const c = await connectClient();
-    a.client.send("request-result", {
-      text: `@${b.clientId} 请回答`,
-    });
-    await b.client.waitFor("agent.deliver");
-
-    c.client.sendResult("fake-result", {
-      requestId: "request-result",
-      ok: true,
-      text: "伪造回答",
-    });
-    const rejected = await c.client.waitFor(
-      "agent.result.ack",
-      (message) => message.payload.requestId === "request-result",
-    );
-    b.client.sendResult("real-result", {
-      requestId: "request-result",
-      ok: true,
-      text: "真实回答",
-    });
-    const answer = await a.client.waitFor(
-      "chat.message",
-      (message) =>
-        message.payload.kind === "agent" &&
-        message.payload.requestId === "request-result",
-    );
-    b.client.sendResult("duplicate-result", {
-      requestId: "request-result",
-      ok: true,
-      text: "重复回答",
-    });
-    const duplicate = await b.client.waitFor(
-      "agent.result.ack",
-      (message) => message.payload.requestId === "request-result",
-    );
-
-    expect(rejected.payload).toEqual({
-      requestId: "request-result",
-      accepted: false,
-      reason: "unknown_request",
-    });
-    expect(answer.payload).toEqual({
-      senderClientId: b.clientId,
-      text: "真实回答",
-      requestId: "request-result",
-      kind: "agent",
-    });
-    expect(duplicate.payload).toEqual({
-      requestId: "request-result",
-      accepted: true,
-    });
-    expect(
-      a.client.messages.filter(
-        (message) =>
-          message.type === "chat.message" &&
-          message.payload.kind === "agent" &&
-          message.payload.requestId === "request-result",
-      ),
-    ).toHaveLength(1);
+  it("@用户只公开提醒，不注入 Agent", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const b = await connect();
+    await joinGroup(b, created.payload.group!.groupId);
+    a.send("chat.send", { text: "@Bob 请查看" }, "user-mention");
+    const message = await b.waitFor("chat.message", (item) => item.id === "user-mention");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(message.payload.mentionIds).toEqual([expect.stringMatching(/^user:/)]);
+    expect(b.messages.some((item) => item.type === "agent.deliver")).toBe(false);
   });
 
-  it("同一 Session 短暂断线后保持 clientId 且不重复投递已确认请求", async () => {
-    const a = await connectClient("session-a");
-    const b = await connectClient("session-b");
-    a.client.send("stable-request", {
-      text: `@${b.clientId} 请回答`,
-    });
-    await b.client.waitFor("agent.deliver");
-    b.client.acknowledgeDelivery("stable-request");
+  it("目标不存在或离线时公开消息和失败状态", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect("session-b");
+    await joinGroup(b, groupId);
 
-    await b.client.close();
-    const reconnected = await connectClient("session-b");
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 120));
+    a.send("chat.send", { text: "@Nobody 在吗" }, "missing-target");
+    await a.waitFor("chat.message", (message) => message.id === "missing-target");
+    expect(
+      await a.waitFor("send.failed", (message) => message.payload.requestId === "missing-target"),
+    ).toMatchObject({ payload: { reason: "target_not_found" } });
 
-    expect(reconnected.clientId).toBe(b.clientId);
+    await b.close();
+    await a.waitFor("presence.changed", (message) => message.payload.displayName === "Bob-Pi" && !message.payload.online);
+    a.send("chat.send", { text: "@Bob-Pi 在吗" }, "offline-target");
     expect(
-      reconnected.client.messages.some(
-        (message) => message.type === "agent.deliver",
-      ),
-    ).toBe(false);
-    expect(
-      a.client.messages.some(
-        (message) =>
-          message.type === "send.failed" &&
-          message.payload.requestId === "stable-request",
-      ),
-    ).toBe(false);
+      await a.waitFor("send.failed", (message) => message.payload.requestId === "offline-target"),
+    ).toMatchObject({ payload: { reason: "target_offline" } });
   });
 
-  it("重连时重新投递尚未确认的请求", async () => {
-    const a = await connectClient("session-a");
-    const b = await connectClient("session-b");
-    a.client.send("retry-delivery", {
-      text: `@${b.clientId} 请回答`,
-    });
-    await b.client.waitFor("agent.deliver");
+  it("短暂断线恢复成员 ID，并重新投递未确认请求", async () => {
+    const a = await connect("session-a");
+    const created = await createGroup(a);
+    const b = await connect("session-b");
+    const joined = await joinGroup(b, created.payload.group!.groupId);
+    const oldAgent = joined.payload.members.find((member) => member.displayName === "Bob-Pi")!;
+    a.send("chat.send", { text: "@Bob-Pi 请回答" }, "retry-request");
+    await b.waitFor("agent.deliver");
+    await b.close();
 
-    await b.client.close();
-    const reconnected = await connectClient("session-b");
-    const redelivery = await reconnected.client.waitFor(
-      "agent.deliver",
-      (message) => message.payload.requestId === "retry-delivery",
-    );
-
-    expect(reconnected.clientId).toBe(b.clientId);
+    const reconnected = await connect("session-b");
+    const snapshot = await reconnected.waitFor("snapshot", (message) => message.payload.group !== undefined);
+    const redelivery = await reconnected.waitFor("agent.deliver", (message) => message.payload.requestId === "retry-request");
+    expect(snapshot.payload.members).toContainEqual(oldAgent);
     expect(redelivery.payload.text).toBe("请回答");
   });
 
-  it("结果发送者重连后重发结果不会重复广播", async () => {
-    const a = await connectClient("session-a");
-    const b = await connectClient("session-b");
-    a.client.send("completed-before-reconnect", {
-      text: `@${b.clientId} 请回答`,
-    });
-    await b.client.waitFor("agent.deliver");
-    b.client.sendResult("first-result", {
-      requestId: "completed-before-reconnect",
-      ok: true,
+  it("只接受目标的一次回答，发送者离群后仍在原群公开", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect();
+    await joinGroup(b, groupId);
+    const c = await connect();
+    await joinGroup(c, groupId, "Carol", "Carol-Pi");
+    a.send("chat.send", { text: "@Bob-Pi 请回答" }, "result-request");
+    await b.waitFor("agent.deliver");
+    a.send("group.leave", {});
+    await a.waitFor("snapshot", (message) => message.payload.group === undefined);
+
+    b.sendResult({ requestId: "result-request", ok: true, text: "唯一回答" });
+    const answer = await c.waitFor("chat.message", (message) => message.payload.kind === "agent");
+    b.sendResult({ requestId: "result-request", ok: true, text: "重复回答" });
+    await b.waitFor("agent.result.ack", (message) => message.payload.requestId === "result-request");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(answer.payload).toMatchObject({
+      groupId,
+      senderName: "Bob-Pi",
+      senderType: "agent",
       text: "唯一回答",
     });
-    await b.client.waitFor(
-      "agent.result.ack",
-      (message) => message.payload.requestId === "completed-before-reconnect",
-    );
-    await a.client.waitFor(
-      "chat.message",
-      (message) => message.payload.kind === "agent",
-    );
-
-    await b.client.close();
-    const reconnected = await connectClient("session-b");
-    reconnected.client.sendResult("retry-result", {
-      requestId: "completed-before-reconnect",
-      ok: true,
-      text: "唯一回答",
-    });
-    const ack = await reconnected.client.waitFor(
-      "agent.result.ack",
-      (message) => message.payload.requestId === "completed-before-reconnect",
-    );
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 30));
-
-    expect(ack.payload.accepted).toBe(true);
     expect(
-      a.client.messages.filter(
-        (message) =>
-          message.type === "chat.message" &&
-          message.payload.kind === "agent" &&
-          message.payload.requestId === "completed-before-reconnect",
-      ),
+      c.messages.filter((message) => message.type === "chat.message" && message.payload.kind === "agent"),
     ).toHaveLength(1);
   });
 
-  it("公开 @ 离线目标及失败状态", async () => {
-    const a = await connectClient();
-    const b = await connectClient();
-    const offlineId = "12345678-1234-4123-8123-123456789abc";
+  it("超过恢复期移除两个成员并让待处理请求失败", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const b = await connect();
+    await joinGroup(b, created.payload.group!.groupId);
+    a.send("chat.send", { text: "@Bob-Pi 慢请求" }, "slow-request");
+    await b.waitFor("agent.deliver");
+    await b.close();
+    const failure = await a.waitFor("send.failed", (message) => message.payload.requestId === "slow-request");
+    expect(failure.payload.reason).toBe("target_offline");
 
-    a.client.send("offline-agent", {
-      text: `@${offlineId} 在吗`,
-    });
-
-    const [publicMessage, failureForA, failureForB] = await Promise.all([
-      b.client.waitFor(
-        "chat.message",
-        (message) => message.id === "offline-agent",
-      ),
-      a.client.waitFor(
-        "send.failed",
-        (message) => message.payload.requestId === "offline-agent",
-      ),
-      b.client.waitFor(
-        "send.failed",
-        (message) => message.payload.requestId === "offline-agent",
-      ),
-    ]);
-
-    expect(publicMessage.payload.targetClientId).toBe(offlineId);
-    expect(failureForA).toEqual(failureForB);
-    expect(failureForA.payload.reason).toBe("target_offline");
+    const reconnected = await connect(b.sessionId);
+    const snapshot = await reconnected.waitFor("snapshot");
+    expect(snapshot.payload.group).toBeUndefined();
   });
 
-  it("格式错误的 @ 请求只向发送者返回错误", async () => {
-    const a = await connectClient();
-    const b = await connectClient();
-
-    a.client.send("invalid-mention", { text: "@不是完整ID 消息" });
-    const error = await a.client.waitFor(
-      "error",
-      (message) => message.payload.requestId === "invalid-mention",
-    );
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 30));
-
-    expect(error.payload.message).toContain("@Agent 格式");
+  it("坏消息返回错误但连接继续服务", async () => {
+    const a = await connect();
+    a.writeRaw("{bad json}\n");
+    expect((await a.waitFor("error")).payload.code).toBe("invalid_json");
+    await createGroup(a);
+    a.send("chat.send", { text: "仍然在线" }, "after-error");
     expect(
-      b.client.messages.some(
-        (message) =>
-          message.type === "chat.message" && message.id === "invalid-mention",
-      ),
-    ).toBe(false);
+      (await a.waitFor("chat.message", (message) => message.id === "after-error")).payload.text,
+    ).toBe("仍然在线");
   });
 
-  it("目标接收请求后断线会公开失败", async () => {
-    const a = await connectClient();
-    const b = await connectClient();
-    a.client.send("disconnect-agent", {
-      text: `@${b.clientId} 请回答`,
-    });
-    await b.client.waitFor("agent.deliver");
-
-    await b.client.close();
-    const failed = await a.client.waitFor(
-      "send.failed",
-      (message) => message.payload.requestId === "disconnect-agent",
-    );
-
-    expect(failed.payload.reason).toBe("target_disconnected");
-  });
-
-  it("目标断开后返回失败，Broker 继续服务", async () => {
-    const a = await connectClient();
-    const b = await connectClient();
-    await b.client.close();
-
-    await a.client.waitFor(
-      "presence.changed",
-      (message) =>
-        message.payload.clientId === b.clientId && !message.payload.online,
-    );
-    a.client.send("offline-1", {
-      text: "还在吗",
-      targetClientId: b.clientId,
-    });
-
-    const failed = await a.client.waitFor(
-      "send.failed",
-      (message) => message.payload.requestId === "offline-1",
-    );
-    const c = await connectClient();
-    a.client.send("after-disconnect", { text: "继续工作" });
-    const messageForC = await c.client.waitFor(
-      "chat.message",
-      (message) => message.id === "after-disconnect",
-    );
-
-    expect(failed.payload).toEqual({
-      requestId: "offline-1",
-      targetClientId: b.clientId,
-      reason: "target_offline",
-    });
-    expect(messageForC.payload.text).toBe("继续工作");
-  });
-
-  it("坏消息返回错误但不关闭连接", async () => {
-    const a = await connectClient();
-    a.client.writeRaw("{bad json}\n");
-
-    const error = await a.client.waitFor("error");
-    a.client.send("after-error", { text: "仍然在线" });
-    const message = await a.client.waitFor(
-      "chat.message",
-      (item) => item.id === "after-error",
-    );
-
-    expect(error.payload.code).toBe("invalid_json");
-    expect(message.payload.text).toBe("仍然在线");
-  });
-
-  it("拒绝在同一路径启动第二个 Broker", async () => {
-    const anotherBroker = createBrokerServer({ socketPath });
-
-    await expect(anotherBroker.start()).rejects.toThrow("Broker 已经在运行");
-  });
-
-  it("启动时清理失效的 Socket 文件", async () => {
+  it("拒绝第二个 Broker，并清理失效 Socket 文件", async () => {
+    await expect(createBrokerServer({ socketPath }).start()).rejects.toThrow("Broker 已经在运行");
     const stalePath = join(directory, "stale.sock");
     await writeFile(stalePath, "stale");
-    const anotherBroker = createBrokerServer({ socketPath: stalePath });
-
-    await anotherBroker.start();
+    const another = createBrokerServer({ socketPath: stalePath });
+    await another.start();
     const client = await TestClient.connect(stalePath);
-    const snapshot = await client.waitFor("snapshot");
-
-    expect(snapshot.payload.clientId).toBeTypeOf("string");
+    expect((await client.waitFor("snapshot")).payload.clientId).toBeTypeOf("string");
     await client.close();
-    await anotherBroker.close();
+    await another.close();
   });
 });

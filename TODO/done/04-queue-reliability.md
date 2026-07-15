@@ -27,4 +27,4 @@
 
 ## 下一阶段
 
-[阶段 5：群组与成员](../in-progress/05-groups-members.md)
+[阶段 5：群组与成员](./05-groups-members.md)
