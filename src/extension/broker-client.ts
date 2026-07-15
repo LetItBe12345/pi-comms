@@ -61,12 +61,13 @@ export class BrokerClient {
     }
   }
 
-  send(type: string, payload: unknown): boolean {
+  send(type: string, payload: unknown): string | undefined {
     if (!this.#connected || this.#socket === undefined || this.#socket.destroyed) {
-      return false;
+      return undefined;
     }
-    this.#socket.write(encodeEnvelope(createEnvelope(type, payload)));
-    return true;
+    const envelope = createEnvelope(type, payload);
+    this.#socket.write(encodeEnvelope(envelope));
+    return envelope.id;
   }
 
   async stop(): Promise<void> {

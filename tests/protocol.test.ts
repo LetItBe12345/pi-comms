@@ -129,6 +129,12 @@ describe("客户端消息校验", () => {
         createEnvelope("agent.deliver.ack", { requestId: "request-a" }),
       ).ok,
     ).toBe(true);
+    expect(
+      parseClientEnvelope(createEnvelope("agent.status", { status: "busy" })).ok,
+    ).toBe(true);
+    expect(
+      parseClientEnvelope(createEnvelope("agent.status", { status: "unknown" })).ok,
+    ).toBe(false);
   });
 
   it("接受创建、加入和离开群组", () => {

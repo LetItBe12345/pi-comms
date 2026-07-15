@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
-import type { Group, GroupSummary, Member } from "../types.js";
+import type {
+  AgentActivityStatus,
+  Group,
+  GroupSummary,
+  Member,
+} from "../types.js";
 
 export type GroupStateErrorCode =
   | "group_not_found"
@@ -84,14 +89,17 @@ export class GroupState {
       throw new GroupStateError("group_not_found", "群组不存在");
     }
     this.#validateMemberNames(userName, agentName);
-    const requested = new Set([normalizeName(userName), normalizeName(agentName)]);
-    for (const membership of group.memberships.values()) {
-      if (
-        requested.has(normalizeName(membership.user.displayName)) ||
-        requested.has(normalizeName(membership.agent.displayName))
-      ) {
-        throw new GroupStateError("member_name_conflict", "成员名称已被使用");
-      }
+    const existingNames = new Set(
+      [...group.memberships.values()].flatMap((membership) => [
+        normalizeName(membership.user.displayName),
+        normalizeName(membership.agent.displayName),
+      ]),
+    );
+    if (existingNames.has(normalizeName(userName))) {
+      throw new GroupStateError("member_name_conflict", "用户名称已被使用");
+    }
+    if (existingNames.has(normalizeName(agentName))) {
+      throw new GroupStateError("member_name_conflict", "Agent 名称已被使用");
     }
     return this.#join(group, clientId, userName, agentName);
   }
@@ -123,6 +131,18 @@ export class GroupState {
     return [membership.user, membership.agent];
   }
 
+  setAgentStatus(
+    clientId: string,
+    status: AgentActivityStatus,
+  ): Member | undefined {
+    const agent = this.#memberships.get(clientId)?.agent;
+    if (agent === undefined) {
+      return undefined;
+    }
+    agent.agentStatus = status;
+    return { ...agent };
+  }
+
   groupForClient(clientId: string): Group | undefined {
     const membership = this.#memberships.get(clientId);
     const group =
@@ -144,6 +164,16 @@ export class GroupState {
     return [...group.memberships.values()]
       .flatMap((membership) => [membership.user, membership.agent])
       .filter((member) => member.online)
+      .map((member) => ({ ...member }));
+  }
+
+  members(groupId: string): Member[] {
+    const group = this.#groups.get(groupId);
+    if (group === undefined) {
+      return [];
+    }
+    return [...group.memberships.values()]
+      .flatMap((membership) => [membership.user, membership.agent])
       .map((member) => ({ ...member }));
   }
 
@@ -223,6 +253,7 @@ export class GroupState {
         displayName: agentName,
         groupId: group.groupId,
         online: true,
+        agentStatus: "idle",
       },
     };
     group.memberships.set(clientId, membership);

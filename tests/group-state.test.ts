@@ -17,7 +17,7 @@ describe("GroupState", () => {
     const first = state.createGroup("a", "群组", "Alice", "Alice-Pi");
     state.setOnline("a", false);
     expect(() => state.joinGroup("b", first.groupId, "alice", "Bob-Pi")).toThrow(
-      "成员名称已被使用",
+      "用户名称已被使用",
     );
     state.leaveGroup("a");
     expect(() => state.joinGroup("b", first.groupId, "alice", "Bob-Pi")).not.toThrow();

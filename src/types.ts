@@ -1,4 +1,5 @@
 export type MemberType = "user" | "agent";
+export type AgentActivityStatus = "idle" | "busy";
 
 export interface Group {
   groupId: string;
@@ -16,6 +17,7 @@ export interface Member {
   displayName: string;
   groupId: string;
   online: boolean;
+  agentStatus?: AgentActivityStatus;
 }
 
 export interface OnlineMember {

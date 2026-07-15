@@ -11,3 +11,4 @@
 - [阶段 4：队列与稳定性](./04-queue-reliability.md)
 - [阶段 5：群组与成员](./05-groups-members.md)
 - [阶段 6：SQLite 持久化](./06-sqlite.md)
+- [阶段 7：最小 TUI](./07-tui.md)

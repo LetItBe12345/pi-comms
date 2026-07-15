@@ -1,3 +1,6 @@
+import { spawn } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -13,17 +16,20 @@ import type {
   SnapshotPayload,
 } from "../protocol.js";
 import type { Group, GroupSummary, Member } from "../types.js";
+import { ChatView } from "../tui/chat-view.js";
 import { BrokerClient } from "./broker-client.js";
 import { RemoteQueue } from "./remote-queue.js";
 
 const STATUS_KEY = "pi-comms";
-const DEFAULT_TEST_MESSAGE = "来自 Pi Session 的测试消息";
 const DEFAULT_RESULT_RETRY_INTERVAL_MS = 1_000;
+const DEFAULT_BROKER_START_TIMEOUT_MS = 2_000;
 
 export interface CommsExtensionOptions {
   socketPath?: string;
   reconnectIntervalMs?: number;
   resultRetryIntervalMs?: number;
+  startBroker?: () => Promise<void> | void;
+  registerTestCommands?: boolean;
 }
 
 export function createCommsExtension(
@@ -32,6 +38,7 @@ export function createCommsExtension(
   const socketPath = options.socketPath ?? DEFAULT_SOCKET_PATH;
   const resultRetryIntervalMs =
     options.resultRetryIntervalMs ?? DEFAULT_RESULT_RETRY_INTERVAL_MS;
+  const startBroker = options.startBroker ?? startLocalBroker;
 
   return (pi: ExtensionAPI) => {
     const remoteQueue = new RemoteQueue();
@@ -50,6 +57,11 @@ export function createCommsExtension(
     let lastAssistantText: string | undefined;
     let resultRetryTimer: ReturnType<typeof setInterval> | undefined;
     let shuttingDown = false;
+    let commsOpen = false;
+    let activeView: ChatView | undefined;
+    let cachedUserName = "";
+    let cachedAgentName = "";
+    let brokerStartTask: Promise<boolean> | undefined;
 
     const brokerClient = new BrokerClient({
       socketPath,
@@ -57,10 +69,10 @@ export function createCommsExtension(
       onMessage: handleBrokerMessage,
       onDisconnected: (wasConnected) => {
         clientId = undefined;
-        members.clear();
         setConnected(false);
-        if (!shuttingDown && wasConnected) {
-          ui?.notify("Broker 连接已断开，正在自动重连", "warning");
+        if (!shuttingDown && commsOpen) {
+          activeView?.setConnection("reconnecting");
+          void connectOrStartBroker();
         }
       },
     });
@@ -72,10 +84,13 @@ export function createCommsExtension(
     }
 
     function setConnected(connected: boolean): void {
-      ui?.setStatus(
-        STATUS_KEY,
-        connected ? "Broker 已连接" : "Broker 未连接",
-      );
+      activeView?.setConnection(connected ? "connected" : "reconnecting");
+      if (activeView === undefined) {
+        ui?.setStatus(
+          STATUS_KEY,
+          connected ? "Broker 已连接" : "Broker 未连接",
+        );
+      }
     }
 
     function handleBrokerMessage(message: BrokerEnvelope): void {
@@ -85,21 +100,27 @@ export function createCommsExtension(
           return;
         case "groups.changed":
           availableGroups = message.payload.groups;
+          activeView?.setGroups(availableGroups);
           return;
         case "presence.changed":
           if (message.payload.groupId === currentGroup?.groupId) {
-            if (message.payload.online) {
-              members.set(message.payload.memberId, message.payload);
-            } else {
-              members.delete(message.payload.memberId);
-            }
+            members.set(message.payload.memberId, message.payload);
+            activeView?.updatePresence(message.payload);
           }
           return;
+        case "presence.removed":
+          for (const memberId of message.payload.memberIds) members.delete(memberId);
+          activeView?.removeMembers(message.payload.memberIds);
+          return;
         case "chat.message":
-          ui?.notify(
-            `[${message.payload.senderName}] ${message.payload.text}`,
-            "info",
-          );
+          activeView?.receiveMessage({
+            ...message.payload,
+            messageId: message.id,
+            timestamp: message.timestamp,
+          });
+          if (activeView === undefined) {
+            ui?.notify(`[${message.payload.senderName}] ${message.payload.text}`, "info");
+          }
           return;
         case "agent.deliver":
           handleAgentDelivery(message.payload);
@@ -108,13 +129,12 @@ export function createCommsExtension(
           handleResultAck(message.payload);
           return;
         case "send.failed":
-          ui?.notify(
-            `请求失败：${failureMessage(message.payload.reason)}`,
-            "error",
-          );
+          activeView?.receiveFailure(message.payload);
+          if (activeView === undefined) ui?.notify(`请求失败：${failureMessage(message.payload.reason)}`, "error");
           return;
         case "error":
-          ui?.notify(`Broker 错误：${message.payload.message}`, "error");
+          activeView?.receiveError(message.payload);
+          if (activeView === undefined) ui?.notify(`Broker 错误：${message.payload.message}`, "error");
           return;
       }
     }
@@ -125,7 +145,9 @@ export function createCommsExtension(
         brokerInstanceId !== snapshot.brokerInstanceId;
       if (brokerRestarted) {
         clearRemoteWork();
-        ui?.notify("Broker 已重启，旧远程请求已中止，正在恢复群组", "warning");
+        if (activeView === undefined) {
+          ui?.notify("Broker 已重启，旧远程请求已中止，正在恢复群组", "warning");
+        }
       }
 
       const previousGroupId = currentGroup?.groupId;
@@ -137,6 +159,7 @@ export function createCommsExtension(
       members = new Map(
         snapshot.members.map((member) => [member.memberId, member]),
       );
+      activeView?.applySnapshot(snapshot);
       if (snapshot.group !== undefined) {
         const ownMembers = snapshot.members.filter(
           (member) => member.clientId === snapshot.clientId,
@@ -156,26 +179,27 @@ export function createCommsExtension(
         snapshot.group !== undefined &&
         previousGroupId !== snapshot.group.groupId
       ) {
-        ui?.notify(
-          `已加入群组：${snapshot.group.groupName}\nGroup ID: ${snapshot.group.groupId}`,
-          "info",
-        );
-        if (history.length > 0) {
-          ui?.notify(`已加载 ${history.length} 条历史消息`, "info");
+        if (activeView === undefined) {
+          ui?.notify(
+            `已加入群组：${snapshot.group.groupName}\nGroup ID: ${snapshot.group.groupId}`,
+            "info",
+          );
+          if (history.length > 0) {
+            ui?.notify(`已加载 ${history.length} 条历史消息`, "info");
+          }
         }
       } else if (
         snapshot.group === undefined &&
         previousGroupId !== undefined &&
         !brokerRestarted
       ) {
-        ui?.notify("已离开群组", "info");
+        if (activeView === undefined) ui?.notify("已离开群组", "info");
         desiredMembership = undefined;
         history = [];
       } else if (previousGroupId === undefined && !brokerRestarted) {
-        ui?.notify(
-          `Broker 已连接\nSession: ${sessionId}\nClient: ${clientId}`,
-          "info",
-        );
+        if (activeView === undefined) {
+          ui?.notify(`Broker 已连接\nSession: ${sessionId}\nClient: ${clientId}`, "info");
+        }
       }
       flushPendingResults();
       tryStartNext();
@@ -203,12 +227,16 @@ export function createCommsExtension(
         remoteQueue.activeRequest !== undefined ||
         context?.isIdle() !== true
       ) {
+        publishAgentStatus();
         return;
       }
       const request = remoteQueue.startNext();
       if (request === undefined) {
+        publishAgentStatus();
         return;
       }
+      publishAgentStatus();
+      activeView?.setOwnAgentBusy(true);
       lastAssistantText = undefined;
       try {
         pi.sendUserMessage(formatAgentRequest(request));
@@ -226,6 +254,7 @@ export function createCommsExtension(
       lastAssistantText = undefined;
       flushPendingResults();
       tryStartNext();
+      publishAgentStatus();
     }
 
     function flushPendingResults(): void {
@@ -247,27 +276,49 @@ export function createCommsExtension(
       }
       remoteQueue.clear();
       lastAssistantText = undefined;
+      activeView?.setOwnAgentBusy(false);
+      publishAgentStatus();
+    }
+
+    function publishAgentStatus(): void {
+      const busy = remoteQueue.hasWork || context?.isIdle() === false;
+      brokerClient.send("agent.status", { status: busy ? "busy" : "idle" });
+      activeView?.setOwnAgentBusy(busy);
+    }
+
+    async function connectOrStartBroker(): Promise<boolean> {
+      if (brokerClient.connected) return true;
+      if (brokerStartTask !== undefined) return brokerStartTask;
+      brokerStartTask = (async () => {
+        if (sessionId === undefined) return false;
+        if (await brokerClient.start(sessionId)) return true;
+        await startBroker();
+        const deadline = Date.now() + DEFAULT_BROKER_START_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+          await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+          if (await brokerClient.connect()) return true;
+        }
+        return false;
+      })();
+      try {
+        return await brokerStartTask;
+      } finally {
+        brokerStartTask = undefined;
+      }
     }
 
     async function ensureConnected(ctx: ExtensionContext): Promise<boolean> {
       updateContext(ctx);
-      if (brokerClient.connected || (await brokerClient.connect())) {
+      if (await connectOrStartBroker()) {
         return true;
       }
-      ctx.ui.notify("无法连接 Broker，后台仍会自动重试", "error");
+      ctx.ui.notify("无法启动或连接 Broker", "error");
       return false;
     }
 
-    pi.on("session_start", async (_event, ctx) => {
+    pi.on("session_start", (_event, ctx) => {
       shuttingDown = false;
       updateContext(ctx);
-      resultRetryTimer ??= setInterval(
-        flushPendingResults,
-        resultRetryIntervalMs,
-      );
-      if (!(await brokerClient.start(sessionId!))) {
-        ctx.ui.notify("Broker 未连接，正在等待 npm run broker 启动", "warning");
-      }
     });
 
     pi.on("session_shutdown", async (_event, ctx) => {
@@ -285,6 +336,8 @@ export function createCommsExtension(
       history = [];
       availableGroups = [];
       members.clear();
+      commsOpen = false;
+      activeView = undefined;
       ctx.ui.setStatus(STATUS_KEY, undefined);
     });
 
@@ -310,6 +363,11 @@ export function createCommsExtension(
       }
     });
 
+    pi.on("agent_start", (_event, ctx) => {
+      updateContext(ctx);
+      publishAgentStatus();
+    });
+
     pi.on("agent_settled", (_event, ctx) => {
       updateContext(ctx);
       const activeRequest = remoteQueue.activeRequest;
@@ -330,101 +388,92 @@ export function createCommsExtension(
               text: lastAssistantText,
             },
       );
+      publishAgentStatus();
     });
 
-    pi.registerCommand("comms-create", {
-      description: "创建并加入群组：<群名> <用户名> <Agent名>",
-      handler: async (args, ctx) => {
-        if (!(await ensureConnected(ctx))) return;
-        const values = parseCommandArgs(args, 3);
-        if (values === undefined) {
-          ctx.ui.notify("用法：/comms-create <群名> <用户名> <Agent名>", "error");
-          return;
-        }
-        brokerClient.send("group.create", {
-          groupName: values[0],
-          userName: values[1],
-          agentName: values[2],
-        });
-      },
-    });
-
-    pi.registerCommand("comms-join", {
-      description: "加入群组：<groupId> <用户名> <Agent名>",
-      handler: async (args, ctx) => {
-        if (!(await ensureConnected(ctx))) return;
-        const values = parseCommandArgs(args, 3);
-        if (values === undefined) {
-          ctx.ui.notify("用法：/comms-join <groupId> <用户名> <Agent名>", "error");
-          return;
-        }
-        brokerClient.send("group.join", {
-          groupId: values[0],
-          userName: values[1],
-          agentName: values[2],
-        });
-        desiredMembership = {
-          groupId: values[0],
-          userName: values[1],
-          agentName: values[2],
-        };
-      },
-    });
-
-    pi.registerCommand("comms-members", {
-      description: "显示群组和在线成员",
+    pi.registerCommand("comms", {
+      description: "打开 Pi Comms 群聊",
       handler: async (_args, ctx) => {
         updateContext(ctx);
-        if (currentGroup === undefined) {
-          const list = availableGroups.length
-            ? availableGroups
-                .map(
-                  (group) =>
-                    `${group.groupName} (${group.groupId}) ${group.onlineSessionCount} 个 Session`,
-                )
-                .join("\n")
-            : "暂无群组";
-          ctx.ui.notify(list, "info");
+        if (ctx.mode !== "tui") {
+          ctx.ui.notify("/comms 只能在 Pi 交互式 TUI 中使用", "error");
           return;
         }
-        const list = [...members.values()]
-          .map(
-            (member) =>
-              `${member.displayName} (${member.type === "user" ? "用户" : "Agent"})`,
-          )
-          .join("\n");
-        ctx.ui.notify(`群组：${currentGroup.groupName}\n${list}`, "info");
+        if (commsOpen) return;
+        commsOpen = true;
+        shuttingDown = false;
+        resultRetryTimer ??= setInterval(flushPendingResults, resultRetryIntervalMs);
+
+        const connection = connectOrStartBroker();
+        try {
+          await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
+            const view = new ChatView({
+              tui,
+              theme,
+              keybindings,
+              done,
+              initialUserName: cachedUserName,
+              initialAgentName: cachedAgentName,
+              actions: {
+                createGroup: (groupName, userName, agentName) =>
+                  brokerClient.send("group.create", { groupName, userName, agentName }),
+                joinGroup: (groupId, userName, agentName) => {
+                  desiredMembership = { groupId, userName, agentName };
+                  return brokerClient.send("group.join", { groupId, userName, agentName });
+                },
+                sendMessage: (text) => brokerClient.send("chat.send", { text }),
+                close: clearRemoteWork,
+              },
+            });
+            activeView = view;
+            ctx.ui.setStatus(STATUS_KEY, undefined);
+            view.setGroups(availableGroups);
+            view.setConnection(brokerClient.connected ? "connected" : "connecting");
+            if (currentGroup !== undefined && clientId !== undefined) {
+              view.applySnapshot({
+                brokerInstanceId: brokerInstanceId ?? "",
+                clientId,
+                groups: availableGroups,
+                group: currentGroup,
+                members: [...members.values()],
+                messages: history,
+              });
+            }
+            return view;
+          });
+        } finally {
+          await connection;
+          if (activeView !== undefined) {
+            cachedUserName = activeView.userName;
+            cachedAgentName = activeView.agentName;
+          }
+          activeView = undefined;
+          commsOpen = false;
+          clearRemoteWork();
+          desiredMembership = undefined;
+          await brokerClient.stop();
+          clientId = undefined;
+          currentGroup = undefined;
+          history = [];
+          members.clear();
+          if (resultRetryTimer !== undefined) {
+            clearInterval(resultRetryTimer);
+            resultRetryTimer = undefined;
+          }
+          ctx.ui.setStatus(STATUS_KEY, undefined);
+        }
       },
     });
 
-    pi.registerCommand("comms-leave", {
-      description: "离开当前群组",
-      handler: async (_args, ctx) => {
-        if (!(await ensureConnected(ctx))) return;
-        if (currentGroup === undefined) {
-          ctx.ui.notify("当前未加入群组", "warning");
-          return;
-        }
-        clearRemoteWork();
-        desiredMembership = undefined;
-        history = [];
-        brokerClient.send("group.leave", {});
-      },
-    });
-
-    pi.registerCommand("comms-test", {
-      description: "通过 Local Broker 发送群聊测试消息",
-      handler: async (args, ctx) => {
-        if (!(await ensureConnected(ctx))) return;
-        if (currentGroup === undefined) {
-          ctx.ui.notify("请先创建或加入群组", "error");
-          return;
-        }
-        brokerClient.send("chat.send", {
-          text: args.trim() || DEFAULT_TEST_MESSAGE,
-        });
-      },
-    });
+    if (options.registerTestCommands) {
+      registerTestCommands(pi, ensureConnected, brokerClient, () => ({
+        currentGroup,
+        availableGroups,
+        members,
+      }), (membership) => {
+        desiredMembership = membership;
+      }, clearRemoteWork);
+    }
   };
 }
 
@@ -449,6 +498,100 @@ export function formatAgentRequest(request: AgentRequestPayload): string {
     "",
     `你的回答会作为公开消息发送到群组「${request.groupName}」，用于回应 ${request.senderName}。请直接回答。`,
   ].join("\n");
+}
+
+function registerTestCommands(
+  pi: ExtensionAPI,
+  ensureConnected: (ctx: ExtensionContext) => Promise<boolean>,
+  brokerClient: BrokerClient,
+  getState: () => {
+    currentGroup: Group | undefined;
+    availableGroups: GroupSummary[];
+    members: Map<string, Member>;
+  },
+  setDesiredMembership: (
+    membership: { groupId: string; userName: string; agentName: string },
+  ) => void,
+  clearRemoteWork: () => void,
+): void {
+  pi.registerCommand("comms-create", {
+    description: "测试：创建群组",
+    handler: async (args, ctx) => {
+      if (!(await ensureConnected(ctx))) return;
+      const values = parseCommandArgs(args, 3);
+      if (values === undefined) return;
+      brokerClient.send("group.create", {
+        groupName: values[0],
+        userName: values[1],
+        agentName: values[2],
+      });
+    },
+  });
+  pi.registerCommand("comms-join", {
+    description: "测试：加入群组",
+    handler: async (args, ctx) => {
+      if (!(await ensureConnected(ctx))) return;
+      const values = parseCommandArgs(args, 3);
+      if (values === undefined) return;
+      setDesiredMembership({ groupId: values[0], userName: values[1], agentName: values[2] });
+      brokerClient.send("group.join", {
+        groupId: values[0],
+        userName: values[1],
+        agentName: values[2],
+      });
+    },
+  });
+  pi.registerCommand("comms-members", {
+    description: "测试：显示成员",
+    handler: async (_args, ctx) => {
+      if (!(await ensureConnected(ctx))) return;
+      const state = getState();
+      if (state.currentGroup === undefined) {
+        ctx.ui.notify(
+          state.availableGroups.length
+            ? state.availableGroups.map((group) => `${group.groupName} ${group.onlineSessionCount} 人在线`).join("\n")
+            : "暂无群组",
+          "info",
+        );
+        return;
+      }
+      ctx.ui.notify(
+        `群组：${state.currentGroup.groupName}\n${[...state.members.values()]
+          .map((member) => `${member.displayName} (${member.type === "user" ? "用户" : "Agent"})`)
+          .join("\n")}`,
+        "info",
+      );
+    },
+  });
+  pi.registerCommand("comms-leave", {
+    description: "测试：离开群组",
+    handler: async (_args, ctx) => {
+      if (!(await ensureConnected(ctx))) return;
+      clearRemoteWork();
+      brokerClient.send("group.leave", {});
+    },
+  });
+  pi.registerCommand("comms-test", {
+    description: "测试：发送消息",
+    handler: async (args, ctx) => {
+      if (!(await ensureConnected(ctx))) return;
+      if (getState().currentGroup === undefined) {
+        ctx.ui.notify("请先创建或加入群组", "error");
+        return;
+      }
+      brokerClient.send("chat.send", { text: args.trim() || "测试消息" });
+    },
+  });
+}
+
+async function startLocalBroker(): Promise<void> {
+  const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+  const child = spawn("npm", ["run", "broker"], {
+    cwd: projectRoot,
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
 }
 
 function parseCommandArgs(args: string, count: number): string[] | undefined {
