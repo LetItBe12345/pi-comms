@@ -144,6 +144,12 @@ describe("客户端消息校验", () => {
     expect(
       parseClientEnvelope(createEnvelope("request.approve", { requestId: "request-a" })).ok,
     ).toBe(true);
+    expect(
+      parseClientEnvelope(createEnvelope("chain.continue", { chainId: "chain-a" })).ok,
+    ).toBe(true);
+    expect(
+      parseClientEnvelope(createEnvelope("chain.end", { chainId: "chain-a" })).ok,
+    ).toBe(true);
   });
 
   it("接受创建、加入和离开群组", () => {

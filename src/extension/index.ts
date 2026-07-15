@@ -13,6 +13,7 @@ import type {
   AgentResultPayload,
   BrokerEnvelope,
   HistoryMessage,
+  PausedChainPayload,
   SnapshotPayload,
 } from "../protocol.js";
 import type { AgentPermission, Group, GroupSummary, Member } from "../types.js";
@@ -65,6 +66,7 @@ export function createCommsExtension(
     let brokerStartTask: Promise<boolean> | undefined;
     let permission: AgentPermission = "auto";
     const pendingApprovals = new Map<string, AgentRequestPayload>();
+    const pausedChains = new Map<string, PausedChainPayload>();
 
     const brokerClient = new BrokerClient({
       socketPath,
@@ -117,17 +119,34 @@ export function createCommsExtension(
           return;
         case "chat.message":
           if (
+            message.payload.routeRequestId !== undefined &&
+            message.payload.routeStatus !== "waiting_approval"
+          ) {
+            pendingApprovals.delete(message.payload.routeRequestId);
+          }
+          if (
             message.payload.requestId !== undefined &&
             message.payload.status !== "waiting_approval"
           ) {
             pendingApprovals.delete(message.payload.requestId);
-            activeView?.setPendingRequests([...pendingApprovals.values()]);
           }
-          activeView?.receiveMessage({
-            ...message.payload,
-            messageId: message.id,
-            timestamp: message.timestamp,
-          });
+          activeView?.setPendingRequests([...pendingApprovals.values()]);
+          {
+            const receivedMessage: HistoryMessage = {
+              ...message.payload,
+              messageId: message.id,
+              timestamp: message.timestamp,
+            };
+            const historyIndex = history.findIndex(
+              (item) => item.messageId === receivedMessage.messageId,
+            );
+            if (historyIndex === -1) {
+              history.push(receivedMessage);
+            } else {
+              history[historyIndex] = receivedMessage;
+            }
+            activeView?.receiveMessage(receivedMessage);
+          }
           if (activeView === undefined) {
             ui?.notify(`[${message.payload.senderName}] ${message.payload.text}`, "info");
           }
@@ -138,6 +157,19 @@ export function createCommsExtension(
         case "request.pending":
           pendingApprovals.set(message.payload.requestId, message.payload);
           activeView?.setPendingRequests([...pendingApprovals.values()]);
+          return;
+        case "chain.paused":
+          pausedChains.set(message.payload.chainId, message.payload);
+          activeView?.setPausedChains([...pausedChains.values()]);
+          ui?.notify(
+            `自动对话已达到第 ${message.payload.roundLimit} 轮，请在 Ctrl+P 中决定`,
+            "warning",
+          );
+          return;
+        case "chain.resolved":
+          pausedChains.delete(message.payload.chainId);
+          activeView?.setPausedChains([...pausedChains.values()]);
+          activeView?.receiveChainResolved(message.payload);
           return;
         case "agent.result.ack":
           handleResultAck(message.payload);
@@ -172,10 +204,13 @@ export function createCommsExtension(
       availableGroups = snapshot.groups;
       currentGroup = snapshot.group;
       history = snapshot.messages;
+      pausedChains.clear();
+      for (const chain of snapshot.pausedChains ?? []) pausedChains.set(chain.chainId, chain);
       members = new Map(
         snapshot.members.map((member) => [member.memberId, member]),
       );
       activeView?.applySnapshot(snapshot);
+      activeView?.setPausedChains([...pausedChains.values()]);
       if (snapshot.group !== undefined) {
         const ownMembers = snapshot.members.filter(
           (member) => member.clientId === snapshot.clientId,
@@ -357,6 +392,7 @@ export function createCommsExtension(
       availableGroups = [];
       members.clear();
       pendingApprovals.clear();
+      pausedChains.clear();
       commsOpen = false;
       activeView = undefined;
       ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -437,6 +473,7 @@ export function createCommsExtension(
               initialAgentName: cachedAgentName,
               initialPermission: permission,
               initialPendingRequests: [...pendingApprovals.values()],
+              initialPausedChains: [...pausedChains.values()],
               actions: {
                 createGroup: (groupName, userName, agentName) =>
                   brokerClient.send("group.create", { groupName, userName, agentName }),
@@ -459,6 +496,12 @@ export function createCommsExtension(
                 rejectRequest: (requestId) => {
                   return brokerClient.send("request.reject", { requestId });
                 },
+                continueChain: (chainId) => {
+                  return brokerClient.send("chain.continue", { chainId });
+                },
+                endChain: (chainId) => {
+                  return brokerClient.send("chain.end", { chainId });
+                },
                 close: clearRemoteWork,
               },
             });
@@ -474,6 +517,7 @@ export function createCommsExtension(
                 group: currentGroup,
                 members: [...members.values()],
                 messages: history,
+                pausedChains: [...pausedChains.values()],
               });
             }
             return view;
@@ -494,6 +538,7 @@ export function createCommsExtension(
           history = [];
           members.clear();
           pendingApprovals.clear();
+          pausedChains.clear();
           if (resultRetryTimer !== undefined) {
             clearInterval(resultRetryTimer);
             resultRetryTimer = undefined;
@@ -528,7 +573,11 @@ export function formatAgentRequest(request: AgentRequestPayload): string {
     "[Pi Comms 群聊请求]",
     `你是：${request.targetAgentName}（Agent）`,
     `所属用户：${request.ownerUserName}`,
-    `来自：${request.senderName}  群组：${request.groupName}`,
+    `来自：${request.senderName}${request.senderType === "agent" ? "（Agent）" : "（用户）"}`,
+    ...(request.senderType === "agent" && request.senderOwnerUserName
+      ? [`${request.senderName} 所属用户：${request.senderOwnerUserName}`]
+      : []),
+    `群组：${request.groupName}`,
     `在线：${online}`,
     ...(request.round > 1 ? [`这是第 ${request.round} 轮自动对话。`] : []),
     "",

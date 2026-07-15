@@ -529,6 +529,142 @@ describe("Local Broker 群组与成员", () => {
     ).toHaveLength(1);
   });
 
+  it("Agent 回答可沿同一通信链路由到多个 Agent", async () => {
+    const a = await connect("session-a");
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect("session-b");
+    await joinGroup(b, groupId);
+    const c = await connect("session-c");
+    await joinGroup(c, groupId, "Carol", "Carol-Pi");
+
+    a.send("chat.send", { text: "@Bob-Pi 开始检查" }, "chain-one");
+    const first = await b.waitFor("agent.deliver", (item) => item.payload.requestId === "chain-one");
+    b.sendResult({ requestId: first.payload.requestId, ok: true, text: "  \n@Carol-Pi 请检查测试" });
+    const second = await c.waitFor("agent.deliver", (item) => item.payload.round === 2);
+    expect(second.payload).toMatchObject({
+      chainId: "chain-one",
+      senderName: "Bob-Pi",
+      senderType: "agent",
+      senderOwnerUserName: "Bob",
+      targetAgentName: "Carol-Pi",
+      text: "请检查测试",
+      round: 2,
+    });
+
+    c.sendResult({ requestId: second.payload.requestId, ok: true, text: "@Alice-Pi 请汇总" });
+    const third = await a.waitFor("agent.deliver", (item) => item.payload.round === 3);
+    expect(third.payload).toMatchObject({
+      chainId: "chain-one",
+      senderName: "Carol-Pi",
+      senderOwnerUserName: "Carol",
+      targetAgentName: "Alice-Pi",
+      round: 3,
+    });
+    const publicAnswer = await a.waitFor(
+      "chat.message",
+      (item) => item.payload.senderName === "Bob-Pi" && item.payload.round === 1,
+    );
+    expect(publicAnswer.payload).toMatchObject({
+      routeStatus: "queued",
+      routeTargetName: "Carol-Pi",
+      nextRound: 2,
+    });
+  });
+
+  it("Agent 自动路由拒绝自身和空任务，并遵守目标审批权限", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect();
+    await joinGroup(b, groupId);
+    const c = await connect();
+    await joinGroup(c, groupId, "Carol", "Carol-Pi");
+
+    a.send("chat.send", { text: "@Bob-Pi 自测" }, "self-chain");
+    await b.waitFor("agent.deliver", (item) => item.payload.requestId === "self-chain");
+    b.sendResult({ requestId: "self-chain", ok: true, text: "@Bob-Pi 不应注入自己" });
+    expect(
+      (await a.waitFor("chat.message", (item) => item.payload.requestId === "self-chain" && item.payload.kind === "agent"))
+        .payload,
+    ).toMatchObject({ routeStatus: "failed", routeFailureReason: "target_self" });
+
+    a.send("chat.send", { text: "@Bob-Pi 空任务" }, "empty-chain");
+    await b.waitFor("agent.deliver", (item) => item.payload.requestId === "empty-chain");
+    b.sendResult({ requestId: "empty-chain", ok: true, text: "@Carol-Pi" });
+    expect(
+      (await a.waitFor("chat.message", (item) => item.payload.requestId === "empty-chain" && item.payload.kind === "agent"))
+        .payload,
+    ).toMatchObject({ routeStatus: "failed", routeFailureReason: "empty_mention" });
+
+    c.send("permission.update", { permission: "approval" });
+    await a.waitFor("presence.changed", (item) => item.payload.displayName === "Carol-Pi" && item.payload.agentPermission === "approval");
+    a.send("chat.send", { text: "@Bob-Pi 转交" }, "approval-chain");
+    await b.waitFor("agent.deliver", (item) => item.payload.requestId === "approval-chain");
+    b.sendResult({ requestId: "approval-chain", ok: true, text: "@Carol-Pi 请批准" });
+    const pending = await c.waitFor("request.pending", (item) => item.payload.round === 2);
+    expect(pending.payload.chainId).toBe("approval-chain");
+    expect(
+      (await a.waitFor("chat.message", (item) => item.payload.routeRequestId === pending.payload.requestId))
+        .payload.routeStatus,
+    ).toBe("waiting_approval");
+    c.send("request.approve", { requestId: pending.payload.requestId });
+    expect((await c.waitFor("agent.deliver", (item) => item.payload.requestId === pending.payload.requestId)).payload.round)
+      .toBe(2);
+  });
+
+  it("第 10 轮后暂停，只有发起 Session 可继续下一个 10 轮", async () => {
+    const a = await connect("session-owner");
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect("session-b");
+    await joinGroup(b, groupId);
+    const c = await connect("session-c");
+    await joinGroup(c, groupId, "Carol", "Carol-Pi");
+
+    a.send("chat.send", { text: "@Bob-Pi 第 1 轮" }, "limited-chain");
+    let currentClient = b;
+    let delivery = await b.waitFor("agent.deliver", (item) => item.payload.requestId === "limited-chain");
+    for (let round = 1; round <= 9; round += 1) {
+      const nextClient = currentClient === b ? c : b;
+      const nextName = currentClient === b ? "Carol-Pi" : "Bob-Pi";
+      currentClient.sendResult({
+        requestId: delivery.payload.requestId,
+        ok: true,
+        text: `@${nextName} 继续第 ${round + 1} 轮`,
+      });
+      delivery = await nextClient.waitFor("agent.deliver", (item) => item.payload.round === round + 1);
+      currentClient = nextClient;
+    }
+    currentClient.sendResult({
+      requestId: delivery.payload.requestId,
+      ok: true,
+      text: "@Bob-Pi 请进入第 11 轮",
+    });
+    const paused = await a.waitFor("chain.paused", (item) => item.payload.chainId === "limited-chain");
+    expect(paused.payload).toMatchObject({
+      nextRound: 11,
+      roundLimit: 10,
+      sourceAgentName: "Carol-Pi",
+      targetAgentName: "Bob-Pi",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(
+      b.messages.some((item) => item.type === "agent.deliver" && item.payload.round === 11),
+    ).toBe(false);
+
+    b.send("chain.continue", { chainId: "limited-chain" });
+    expect((await b.waitFor("error", (item) => item.payload.requestId === "limited-chain")).payload.code)
+      .toBe("request_invalid");
+    a.send("chain.continue", { chainId: "limited-chain" });
+    const resumed = await b.waitFor("agent.deliver", (item) => item.payload.round === 11);
+    expect(resumed.payload.chainId).toBe("limited-chain");
+    expect(
+      (await a.waitFor("chain.resolved", (item) => item.payload.chainId === "limited-chain"))
+        .payload,
+    ).toMatchObject({ action: "continued", roundLimit: 20 });
+  });
+
   it("超过恢复期移除两个成员并让待处理请求失败", async () => {
     const a = await connect();
     const created = await createGroup(a);

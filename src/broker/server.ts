@@ -18,10 +18,16 @@ import {
   type Envelope,
   type ErrorPayload,
   type HistoryMessage,
+  type PausedChainPayload,
   type SendFailedPayload,
 } from "../protocol.js";
 import type { AgentPermission, Member } from "../types.js";
-import { BrokerDatabase, historyMessage } from "./database.js";
+import {
+  BrokerDatabase,
+  historyMessage,
+  type AgentChainContext,
+  type StoredPausedChain,
+} from "./database.js";
 import { GroupState, GroupStateError } from "./group-state.js";
 
 export const DEFAULT_SOCKET_PATH = join(
@@ -68,6 +74,7 @@ interface PendingRequest {
   message: HistoryMessage;
   state: "awaiting_approval" | "delivering";
   deliveryAcknowledged: boolean;
+  context: AgentChainContext;
 }
 
 export function createBrokerServer(
@@ -291,6 +298,14 @@ export function createBrokerServer(
     }
     if (envelope.type === "request.reject") {
       handleRequestDecision(clientId, socket, envelope.payload.requestId, false);
+      return;
+    }
+    if (envelope.type === "chain.continue") {
+      handleChainDecision(clientId, socket, envelope.payload.chainId, true);
+      return;
+    }
+    if (envelope.type === "chain.end") {
+      handleChainDecision(clientId, socket, envelope.payload.chainId, false);
       return;
     }
     if (envelope.type === "group.create") {
@@ -553,6 +568,7 @@ export function createBrokerServer(
       groupName: group.groupName,
       senderId: membership.user.memberId,
       senderName: membership.user.displayName,
+      senderType: "user",
       targetAgentId: target.memberId,
       targetAgentName: target.displayName,
       ownerUserName: targetMembership.user.displayName,
@@ -567,6 +583,12 @@ export function createBrokerServer(
       chainId: requestId,
       round: 1,
       createdAt: Date.now(),
+    };
+    const context: AgentChainContext = {
+      initiatorSessionId: sessionIdForClient(clientId) ?? clientId,
+      initiatorName: membership.user.displayName,
+      participants: [target.displayName],
+      roundLimit: 10,
     };
     const awaitingApproval = permission === "approval";
     const message = createEnvelope(
@@ -586,7 +608,7 @@ export function createBrokerServer(
       message.payload.status,
     );
     try {
-      db().insertAgentRequest(storedMessage, request, awaitingApproval);
+      db().insertAgentRequest(storedMessage, request, awaitingApproval, context);
     } catch (error) {
       sendGroupError(socket, requestId, error);
       return;
@@ -600,6 +622,7 @@ export function createBrokerServer(
       message: storedMessage,
       state: awaitingApproval ? "awaiting_approval" : "delivering",
       deliveryAcknowledged: false,
+      context,
     });
     broadcastToGroup(group.groupId, message as BrokerEnvelope);
     if (awaitingApproval) {
@@ -680,7 +703,8 @@ export function createBrokerServer(
         return;
       }
       pending.state = "delivering";
-      pending.message.status = "queued";
+      if (pending.message.kind === "agent") pending.message.routeStatus = "queued";
+      else pending.message.status = "queued";
       updatePendingApprovalCount(clientId);
       broadcastToGroup(pending.groupId, {
         id: pending.message.messageId,
@@ -710,13 +734,19 @@ export function createBrokerServer(
     resolvedApprovalRequests.set(requestId, clientId);
     closedRequestIds.add(requestId);
     updatePendingApprovalCount(clientId);
-    broadcastFailure({
-      requestId,
-      groupId: pending.groupId,
-      targetName: pending.targetName,
-      targetAgentId: pending.targetAgentId,
-      reason: "request_rejected",
-    });
+    if (pending.message.kind === "agent") {
+      pending.message.routeStatus = "failed";
+      pending.message.routeFailureReason = "request_rejected";
+      broadcastToGroup(pending.groupId, messageEnvelope(pending.message));
+    } else {
+      broadcastFailure({
+        requestId,
+        groupId: pending.groupId,
+        targetName: pending.targetName,
+        targetAgentId: pending.targetAgentId,
+        reason: "request_rejected",
+      });
+    }
   }
 
   function updatePendingApprovalCount(clientId: string): void {
@@ -748,28 +778,122 @@ export function createBrokerServer(
     }
 
     if (result.ok) {
-      const answer = createEnvelope("chat.message", {
+      const sourceMembership = groups.membershipForClient(clientId);
+      const mention = parseMention(result.text.trimStart());
+      const target = mention === undefined
+        ? undefined
+        : groups.findMemberByName(pending.groupId, mention.name);
+      const nextRound = pending.request.round + 1;
+      const nextRequestId = randomUUID();
+      const participants = target?.type === "agent"
+        ? [...new Set([...pending.context.participants, target.displayName])]
+        : pending.context.participants;
+      const answerPayload: ChatMessagePayload = {
         groupId: pending.groupId,
         senderId: pending.request.targetAgentId,
         senderName: pending.request.targetAgentName,
-        senderType: "agent" as const,
+        senderType: "agent",
         text: result.text,
-        mentionIds: [pending.request.senderId],
+        mentionIds: target === undefined ? [pending.request.senderId] : [target.memberId],
         requestId: result.requestId,
-        kind: "agent" as const,
-        status: "sent" as const,
-      });
-      try {
-        db().completeRequest(result.requestId, {
-          ...historyMessage(
-            answer.id,
-            answer.timestamp,
-            answer.payload,
-            "sent",
-          ),
+        kind: "agent",
+        status: "sent",
+        chainId: pending.request.chainId,
+        round: pending.request.round,
+      };
+      let next:
+        | { request: AgentRequestPayload; awaitingApproval: boolean; context: AgentChainContext }
+        | { paused: StoredPausedChain }
+        | undefined;
+      let nextTargetClientId: string | undefined;
+
+      const failRoute = (reason: ChatMessagePayload["routeFailureReason"], name: string): void => {
+        answerPayload.routeStatus = "failed";
+        answerPayload.routeFailureReason = reason;
+        answerPayload.routeTargetName = name;
+        answerPayload.nextRound = nextRound;
+      };
+
+      if (mention !== undefined) {
+        if (target === undefined) {
+          failRoute("target_not_found", mention.name);
+        } else if (target.type === "agent" && target.memberId === pending.request.targetAgentId) {
+          failRoute("target_self", target.displayName);
+        } else if (target.type === "agent" && (mention.text === undefined || !mention.text.trim())) {
+          failRoute("empty_mention", target.displayName);
+        } else if (target.type === "agent") {
+          answerPayload.routeTargetName = target.displayName;
+          answerPayload.nextRound = nextRound;
+          if (nextRound > pending.context.roundLimit) {
+            answerPayload.routeStatus = "paused";
+          } else if (!target.online) {
+            failRoute("target_offline", target.displayName);
+          } else {
+            const targetSocket = clients.get(target.clientId);
+            const targetMembership = groups.membershipForClient(target.clientId);
+            const permission = permissions.get(target.clientId) ?? "auto";
+            if (targetSocket === undefined || targetMembership === undefined) {
+              failRoute("target_offline", target.displayName);
+            } else if (permission === "blocked") {
+              failRoute("target_blocked", target.displayName);
+            } else {
+              const awaitingApproval = permission === "approval";
+              answerPayload.routeRequestId = nextRequestId;
+              answerPayload.routeStatus = awaitingApproval ? "waiting_approval" : "queued";
+              const request: AgentRequestPayload = {
+                requestId: nextRequestId,
+                groupId: pending.groupId,
+                groupName: pending.request.groupName,
+                senderId: pending.request.targetAgentId,
+                senderName: pending.request.targetAgentName,
+                senderType: "agent",
+                ...(sourceMembership === undefined ? {} : {
+                  senderOwnerUserName: sourceMembership.user.displayName,
+                }),
+                targetAgentId: target.memberId,
+                targetAgentName: target.displayName,
+                ownerUserName: targetMembership.user.displayName,
+                onlineMembers: groups.onlineMembers(pending.groupId)
+                  .filter((member) => member.memberId !== target.memberId)
+                  .map((member) => ({ displayName: member.displayName, type: member.type })),
+                text: mention.text!,
+                chainId: pending.request.chainId,
+                round: nextRound,
+                createdAt: Date.now(),
+              };
+              next = {
+                request,
+                awaitingApproval,
+                context: { ...pending.context, participants },
+              };
+              nextTargetClientId = target.clientId;
+            }
+          }
+        }
+      }
+
+      const answer = createEnvelope("chat.message", answerPayload);
+      const storedAnswer = historyMessage(answer.id, answer.timestamp, answer.payload, "sent");
+      if (answerPayload.routeStatus === "paused" && target?.type === "agent") {
+        next = { paused: {
           chainId: pending.request.chainId,
-          round: pending.request.round,
-        });
+          groupId: pending.groupId,
+          messageId: answer.id,
+          initiatorSessionId: pending.context.initiatorSessionId,
+          initiatorName: pending.context.initiatorName,
+          sourceAgentName: pending.request.targetAgentName,
+          sourceOwnerUserName: sourceMembership?.user.displayName ?? "",
+          targetAgentId: target.memberId,
+          targetAgentName: target.displayName,
+          text: mention!.text!,
+          nextRound,
+          roundLimit: pending.context.roundLimit,
+          participants,
+          pausedAt: answer.timestamp,
+        } };
+      }
+      try {
+        db().completeAndRoute(result.requestId, storedAnswer, next);
       } catch {
         sendResultAck(socket, result.requestId, false);
         return;
@@ -777,6 +901,31 @@ export function createBrokerServer(
       pendingRequests.delete(result.requestId);
       completedRequests.set(result.requestId, clientId);
       broadcastToGroup(pending.groupId, answer as BrokerEnvelope);
+
+      if (next !== undefined && "request" in next && nextTargetClientId !== undefined) {
+        const nextPending: PendingRequest = {
+          targetClientId: nextTargetClientId,
+          targetAgentId: next.request.targetAgentId,
+          targetName: next.request.targetAgentName,
+          groupId: next.request.groupId,
+          request: next.request,
+          message: storedAnswer,
+          state: next.awaitingApproval ? "awaiting_approval" : "delivering",
+          deliveryAcknowledged: false,
+          context: next.context,
+        };
+        pendingRequests.set(next.request.requestId, nextPending);
+        const targetSocket = clients.get(nextTargetClientId);
+        if (targetSocket !== undefined) {
+          send(targetSocket, createEnvelope(
+            next.awaitingApproval ? "request.pending" : "agent.deliver",
+            next.request,
+          ) as BrokerEnvelope);
+        }
+        if (next.awaitingApproval) updatePendingApprovalCount(nextTargetClientId);
+      } else if (next !== undefined && "paused" in next) {
+        sendPausedChain(next.paused);
+      }
     } else {
       try {
         if (!db().failRequest(result.requestId, result.reason)) {
@@ -789,13 +938,19 @@ export function createBrokerServer(
       }
       pendingRequests.delete(result.requestId);
       completedRequests.set(result.requestId, clientId);
-      broadcastFailure({
-        requestId: result.requestId,
-        groupId: pending.groupId,
-        targetName: pending.targetName,
-        targetAgentId: pending.targetAgentId,
-        reason: result.reason,
-      });
+      if (pending.message.kind === "agent") {
+        pending.message.routeStatus = "failed";
+        pending.message.routeFailureReason = result.reason;
+        broadcastToGroup(pending.groupId, messageEnvelope(pending.message));
+      } else {
+        broadcastFailure({
+          requestId: result.requestId,
+          groupId: pending.groupId,
+          targetName: pending.targetName,
+          targetAgentId: pending.targetAgentId,
+          reason: result.reason,
+        });
+      }
     }
     sendResultAck(socket, result.requestId, true);
   }
@@ -830,19 +985,184 @@ export function createBrokerServer(
       if (!db().failRequest(requestId, failureReason)) {
         continue;
       }
-      broadcastFailure({
-        requestId,
-        groupId: pending.groupId,
-        targetName: pending.targetName,
-        targetAgentId: pending.targetAgentId,
-        reason: failureReason,
-      });
+      if (pending.message.kind === "agent") {
+        pending.message.routeStatus = "failed";
+        pending.message.routeFailureReason = failureReason;
+        broadcastToGroup(pending.groupId, messageEnvelope(pending.message));
+      } else {
+        broadcastFailure({
+          requestId,
+          groupId: pending.groupId,
+          targetName: pending.targetName,
+          targetAgentId: pending.targetAgentId,
+          reason: failureReason,
+        });
+      }
     }
     updatePendingApprovalCount(targetClientId);
   }
 
+  function handleChainDecision(
+    clientId: string,
+    socket: Socket,
+    chainId: string,
+    resume: boolean,
+  ): void {
+    const paused = db().pausedChain(chainId);
+    const sessionId = sessionIdForClient(clientId);
+    const group = groups.groupForClient(clientId);
+    if (
+      paused === undefined ||
+      sessionId === undefined ||
+      paused.initiatorSessionId !== sessionId ||
+      group?.groupId !== paused.groupId
+    ) {
+      sendError(socket, {
+        code: "request_invalid",
+        message: "不能处理其他 Session 或群组的自动对话",
+        requestId: chainId,
+      });
+      return;
+    }
+    const message = db().message(paused.messageId);
+    if (message === undefined) {
+      sendError(socket, { code: "request_invalid", message: "通信链消息不存在", requestId: chainId });
+      return;
+    }
+
+    if (!resume) {
+      const ended = { ...message, routeStatus: "ended" as const };
+      if (!db().resolvePausedChain(chainId, ended)) return;
+      broadcastToGroup(paused.groupId, messageEnvelope(ended));
+      broadcastChainResolved(paused, "ended");
+      return;
+    }
+
+    const target = groups.findMemberByName(paused.groupId, paused.targetAgentName);
+    const targetMembership = target?.type === "agent"
+      ? groups.membershipForClient(target.clientId)
+      : undefined;
+    const permission = target?.type === "agent"
+      ? permissions.get(target.clientId) ?? "auto"
+      : "blocked";
+    const failure =
+      target === undefined || target.type !== "agent" ? "target_not_found" as const :
+      !target.online || clients.get(target.clientId) === undefined || targetMembership === undefined
+        ? "target_offline" as const :
+      permission === "blocked" ? "target_blocked" as const : undefined;
+    if (failure !== undefined) {
+      const failed = { ...message, routeStatus: "failed" as const, routeFailureReason: failure };
+      if (!db().resolvePausedChain(chainId, failed)) return;
+      broadcastToGroup(paused.groupId, messageEnvelope(failed));
+      broadcastChainResolved(paused, "failed");
+      return;
+    }
+    if (target === undefined || target.type !== "agent" || targetMembership === undefined) {
+      return;
+    }
+
+    const requestId = randomUUID();
+    const request: AgentRequestPayload = {
+      requestId,
+      groupId: paused.groupId,
+      groupName: group.groupName,
+      senderId: message.senderId,
+      senderName: paused.sourceAgentName,
+      senderType: "agent",
+      senderOwnerUserName: paused.sourceOwnerUserName,
+      targetAgentId: target.memberId,
+      targetAgentName: target.displayName,
+      ownerUserName: targetMembership.user.displayName,
+      onlineMembers: groups.onlineMembers(paused.groupId)
+        .filter((member) => member.memberId !== target.memberId)
+        .map((member) => ({ displayName: member.displayName, type: member.type })),
+      text: paused.text,
+      chainId,
+      round: paused.nextRound,
+      createdAt: Date.now(),
+    };
+    const awaitingApproval = permission === "approval";
+    const roundLimit = paused.roundLimit + 10;
+    const context: AgentChainContext = {
+      initiatorSessionId: paused.initiatorSessionId,
+      initiatorName: paused.initiatorName,
+      participants: paused.participants,
+      roundLimit,
+    };
+    const updated: HistoryMessage = {
+      ...message,
+      routeRequestId: requestId,
+      routeStatus: awaitingApproval ? "waiting_approval" : "queued",
+      routeFailureReason: undefined,
+    };
+    try {
+      db().resumePausedChain(paused, request, awaitingApproval, context, updated);
+    } catch (error) {
+      sendGroupError(socket, chainId, error);
+      return;
+    }
+    pendingRequests.set(requestId, {
+      targetClientId: target.clientId,
+      targetAgentId: target.memberId,
+      targetName: target.displayName,
+      groupId: paused.groupId,
+      request,
+      message: updated,
+      state: awaitingApproval ? "awaiting_approval" : "delivering",
+      deliveryAcknowledged: false,
+      context,
+    });
+    broadcastToGroup(paused.groupId, messageEnvelope(updated));
+    broadcastChainResolved({ ...paused, roundLimit }, "continued");
+    const targetSocket = clients.get(target.clientId);
+    if (targetSocket !== undefined) {
+      send(targetSocket, createEnvelope(
+        awaitingApproval ? "request.pending" : "agent.deliver",
+        request,
+      ) as BrokerEnvelope);
+    }
+    if (awaitingApproval) updatePendingApprovalCount(target.clientId);
+  }
+
+  function broadcastChainResolved(
+    paused: StoredPausedChain,
+    action: "continued" | "ended" | "failed",
+  ): void {
+    broadcastToGroup(paused.groupId, createEnvelope("chain.resolved", {
+      chainId: paused.chainId,
+      action,
+      initiatorName: paused.initiatorName,
+      roundLimit: paused.roundLimit,
+    }) as BrokerEnvelope);
+  }
+
+  function sendPausedChain(paused: StoredPausedChain): void {
+    const ownerSocket = sessions.get(paused.initiatorSessionId)?.socket;
+    if (ownerSocket === undefined) return;
+    const { messageId: _messageId, initiatorSessionId: _sessionId,
+      targetAgentId: _targetAgentId, ...payload } = paused;
+    send(ownerSocket, createEnvelope("chain.paused", payload) as BrokerEnvelope);
+  }
+
+  function sessionIdForClient(clientId: string): string | undefined {
+    for (const [sessionId, session] of sessions) {
+      if (session.clientId === clientId) return sessionId;
+    }
+    return undefined;
+  }
+
+  function messageEnvelope(message: HistoryMessage): BrokerEnvelope {
+    return {
+      id: message.messageId,
+      type: "chat.message",
+      timestamp: message.timestamp,
+      payload: message,
+    } as BrokerEnvelope;
+  }
+
   function sendSnapshot(clientId: string, socket: Socket): void {
     const group = groups.groupForClient(clientId);
+    const sessionId = sessionIdForClient(clientId);
     send(
       socket,
       createEnvelope("snapshot", {
@@ -853,6 +1173,14 @@ export function createBrokerServer(
         members: group === undefined ? [] : groups.members(group.groupId),
         messages:
           group === undefined ? [] : db().recentMessages(group.groupId),
+        pausedChains:
+          group === undefined || sessionId === undefined
+            ? []
+            : db().pausedChains(sessionId, group.groupId).map((paused) => {
+                const { messageId: _messageId, initiatorSessionId: _owner,
+                  targetAgentId: _target, ...payload } = paused;
+                return payload;
+              }),
       }) as BrokerEnvelope,
     );
   }

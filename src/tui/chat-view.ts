@@ -19,7 +19,9 @@ import {
 import type {
   ErrorPayload,
   AgentRequestPayload,
+  ChainResolvedPayload,
   HistoryMessage,
+  PausedChainPayload,
   SendFailedPayload,
   SnapshotPayload,
 } from "../protocol.js";
@@ -35,6 +37,8 @@ export interface ChatViewActions {
   updatePermission(permission: AgentPermission): boolean;
   approveRequest(requestId: string): string | undefined;
   rejectRequest(requestId: string): string | undefined;
+  continueChain?(chainId: string): string | undefined;
+  endChain?(chainId: string): string | undefined;
   close(): void;
 }
 
@@ -48,6 +52,7 @@ export interface ChatViewOptions {
   initialAgentName?: string;
   initialPermission?: AgentPermission;
   initialPendingRequests?: AgentRequestPayload[];
+  initialPausedChains?: PausedChainPayload[];
 }
 
 interface PendingSetup {
@@ -84,10 +89,14 @@ export class ChatView implements Component, Focusable {
   #permissionList: SelectList;
   #pendingList: SelectList;
   #decisionList: SelectList;
-  #panel: "permission" | "pending" | "decision" | undefined;
+  #chainList: SelectList;
+  #chainDecisionList: SelectList;
+  #panel: "permission" | "pending" | "decision" | "chains" | "chain-decision" | undefined;
   #permission: AgentPermission;
   #pendingRequests: AgentRequestPayload[];
   #selectedRequest: AgentRequestPayload | undefined;
+  #pausedChains: PausedChainPayload[];
+  #selectedChain: PausedChainPayload | undefined;
   #pendingSetup: PendingSetup | undefined;
   #pendingMessage: { id: string; text: string } | undefined;
   #error: string | undefined;
@@ -105,6 +114,7 @@ export class ChatView implements Component, Focusable {
     this.#agentInput.setValue(options.initialAgentName ?? "");
     this.#permission = options.initialPermission ?? "auto";
     this.#pendingRequests = sortPendingRequests(options.initialPendingRequests ?? []);
+    this.#pausedChains = sortPausedChains(options.initialPausedChains ?? []);
 
     this.#actionList = this.#createSelectList([
       { value: "create", label: "创建群组", description: "创建并进入新群组" },
@@ -121,6 +131,8 @@ export class ChatView implements Component, Focusable {
     this.#permissionList = this.#createPermissionList();
     this.#pendingList = this.#createPendingList();
     this.#decisionList = this.#createDecisionList();
+    this.#chainList = this.#createChainList();
+    this.#chainDecisionList = this.#createChainDecisionList();
 
     this.#editor = new Editor(this.#tui, {
       borderColor: (text) => this.#theme.fg("borderAccent", text),
@@ -238,8 +250,11 @@ export class ChatView implements Component, Focusable {
     else this.#messages[existing] = message;
 
     if (message.requestId !== undefined && message.senderType === "agent") {
-      const request = this.#messages.find((item) => item.messageId === message.requestId);
-      if (request !== undefined) request.status = "completed";
+      const request = this.#messages.find(
+        (item) => item.messageId === message.requestId || item.routeRequestId === message.requestId,
+      );
+      if (request?.routeRequestId === message.requestId) request.routeStatus = "completed";
+      else if (request !== undefined) request.status = "completed";
     }
     if (this.#pendingMessage?.id === message.messageId && message.status !== "failed") {
       const sentText = this.#pendingMessage.text;
@@ -254,10 +269,17 @@ export class ChatView implements Component, Focusable {
   }
 
   receiveFailure(failure: SendFailedPayload): void {
-    const message = this.#messages.find((item) => item.messageId === failure.requestId);
+    const message = this.#messages.find(
+      (item) => item.messageId === failure.requestId || item.routeRequestId === failure.requestId,
+    );
     if (message !== undefined) {
-      message.status = "failed";
-      message.failureReason = failure.reason;
+      if (message.routeRequestId === failure.requestId) {
+        message.routeStatus = "failed";
+        message.routeFailureReason = failure.reason;
+      } else {
+        message.status = "failed";
+        message.failureReason = failure.reason;
+      }
     }
     if (this.#pendingMessage?.id === failure.requestId) {
       this.#pendingMessage = undefined;
@@ -317,6 +339,32 @@ export class ChatView implements Component, Focusable {
     this.#tui.requestRender();
   }
 
+  setPausedChains(chains: PausedChainPayload[]): void {
+    this.#pausedChains = sortPausedChains(chains);
+    this.#chainList = this.#createChainList();
+    if (
+      this.#selectedChain !== undefined &&
+      !this.#pausedChains.some((chain) => chain.chainId === this.#selectedChain?.chainId)
+    ) {
+      this.#selectedChain = undefined;
+      if (this.#panel === "chain-decision") this.#panel = "chains";
+    }
+    this.#permissionList = this.#createPermissionList();
+    this.#syncFocus();
+    this.#tui.requestRender();
+  }
+
+  receiveChainResolved(result: ChainResolvedPayload): void {
+    const text =
+      result.action === "continued"
+        ? `${result.initiatorName} 已允许自动对话继续至第 ${result.roundLimit} 轮`
+        : result.action === "ended"
+          ? `${result.initiatorName} 已结束自动对话`
+          : "自动对话继续失败，目标当前不可用";
+    this.#addNotice(text);
+    this.#tui.requestRender();
+  }
+
   handleInput(data: string): void {
     if (this.#exitList !== undefined) {
       this.#exitList.handleInput(data);
@@ -366,6 +414,8 @@ export class ChatView implements Component, Focusable {
     this.#permissionList.invalidate();
     this.#pendingList.invalidate();
     this.#decisionList.invalidate();
+    this.#chainList.invalidate();
+    this.#chainDecisionList.invalidate();
   }
 
   render(width: number): string[] {
@@ -507,7 +557,7 @@ export class ChatView implements Component, Focusable {
     const header = this.#renderHeader(width);
     const editor = this.#editor.render(width);
     const hint = truncateToWidth(
-      this.#theme.fg("dim", "Enter 发送 · Shift+Enter 换行 · Ctrl+P 权限 · Ctrl+PageUp/PageDown 滚动 · Esc 退出"),
+      this.#theme.fg("dim", "Enter 发送 · Shift+Enter 换行 · Ctrl+P 控制 · Ctrl+PageUp/PageDown 滚动 · Esc 退出"),
       width,
     );
     const status = this.#error === undefined ? [] : [truncateToWidth(this.#theme.fg("warning", this.#error), width)];
@@ -532,8 +582,11 @@ export class ChatView implements Component, Focusable {
     const pending = this.#pendingRequests.length > 0
       ? ` · 待批准：${this.#pendingRequests.length}`
       : "";
+    const chains = this.#pausedChains.length > 0
+      ? ` · 待决定：${this.#pausedChains.length}`
+      : "";
     const first = truncateToWidth(
-      `${this.#theme.bold(`群组：${group}`)}  ${state}  接收：${permission}${pending}`,
+      `${this.#theme.bold(`群组：${group}`)}  ${state}  接收：${permission}${pending}${chains}`,
       width,
     );
     const online = [...this.#members.values()].filter((member) => member.online);
@@ -571,12 +624,16 @@ export class ChatView implements Component, Focusable {
   #renderMessage(message: HistoryMessage, width: number): string[] {
     const own = message.senderId === this.#ownMember("user")?.memberId;
     const blockWidth = Math.max(12, Math.min(width, Math.floor(width * (width < 60 ? 0.95 : 0.7))));
-    const role = message.senderType === "agent" ? " [Agent]" : "";
+    const role = message.senderType === "agent"
+      ? ` [Agent${message.round === undefined ? "" : ` · 第 ${message.round} 轮`}]`
+      : "";
     const label = `${message.senderName}${role}  ${formatTime(message.timestamp)}`;
     const body = message.text.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", blockWidth));
     const state = messageState(message);
+    const route = routeState(message);
     const lines = [this.#theme.fg(message.senderType === "agent" ? "accent" : "muted", label), ...body];
     if (state !== undefined) lines.push(this.#theme.fg(message.status === "failed" ? "error" : "warning", state));
+    if (route !== undefined) lines.push(this.#theme.fg(message.routeStatus === "failed" ? "error" : "warning", route));
     return lines.map((line) => own ? truncateToWidth(line, width) : alignRight(line, width));
   }
 
@@ -593,11 +650,15 @@ export class ChatView implements Component, Focusable {
 
   #renderPanel(width: number): string[] {
     const title =
-      this.#panel === "permission" ? "Agent 接收权限" :
-      this.#panel === "pending" ? "待批准请求" : "处理请求";
+      this.#panel === "permission" ? "Agent 控制" :
+      this.#panel === "pending" ? "待批准请求" :
+      this.#panel === "decision" ? "处理请求" :
+      this.#panel === "chains" ? "待决定自动对话" : "处理自动对话";
     const lines = [this.#theme.bold(title), ""];
     if (this.#panel === "pending" && this.#pendingRequests.length === 0) {
       lines.push(this.#theme.fg("muted", "暂无待批准请求"));
+    } else if (this.#panel === "chains" && this.#pausedChains.length === 0) {
+      lines.push(this.#theme.fg("muted", "暂无待决定自动对话"));
     } else if (this.#panel === "decision" && this.#selectedRequest !== undefined) {
       const request = this.#selectedRequest;
       lines.push(
@@ -608,6 +669,15 @@ export class ChatView implements Component, Focusable {
         ...request.text.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", width)),
         "",
         ...this.#decisionList.render(width),
+      );
+    } else if (this.#panel === "chain-decision" && this.#selectedChain !== undefined) {
+      const chain = this.#selectedChain;
+      lines.push(
+        this.#theme.fg("muted", `待发送：${chain.sourceAgentName} → ${chain.targetAgentName} · 下一轮 ${chain.nextRound}`),
+        this.#theme.fg("muted", `参与 Agent：${chain.participants.join("、")}`),
+        ...chain.text.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", width)),
+        "",
+        ...this.#chainDecisionList.render(width),
       );
     } else {
       lines.push(...(this.#activePanel()?.render(width) ?? []));
@@ -623,12 +693,16 @@ export class ChatView implements Component, Focusable {
     if (this.#panel === "permission") return this.#permissionList;
     if (this.#panel === "pending") return this.#pendingList;
     if (this.#panel === "decision") return this.#decisionList;
+    if (this.#panel === "chains") return this.#chainList;
+    if (this.#panel === "chain-decision") return this.#chainDecisionList;
     return undefined;
   }
 
   #closePanel(): void {
     if (this.#panel === "decision") this.#panel = "pending";
+    else if (this.#panel === "chain-decision") this.#panel = "chains";
     else if (this.#panel === "pending") this.#panel = "permission";
+    else if (this.#panel === "chains") this.#panel = "permission";
     else this.#panel = undefined;
     this.#error = undefined;
     this.#syncFocus();
@@ -645,6 +719,11 @@ export class ChatView implements Component, Focusable {
         value: "pending",
         label: `待批准请求（${this.#pendingRequests.length}）`,
         description: "逐条查看、批准或拒绝",
+      },
+      {
+        value: "chains",
+        label: `待决定自动对话（${this.#pausedChains.length}）`,
+        description: "每 10 轮选择继续或结束",
       },
       {
         value: "auto",
@@ -665,6 +744,8 @@ export class ChatView implements Component, Focusable {
     list.onSelect = (item) => {
       if (item.value === "pending") {
         this.#panel = "pending";
+      } else if (item.value === "chains") {
+        this.#panel = "chains";
       } else {
         const permission = item.value as AgentPermission;
         this.#permission = permission;
@@ -722,6 +803,55 @@ export class ChatView implements Component, Focusable {
       }
       this.#selectedRequest = undefined;
       this.#panel = "pending";
+      this.#error = undefined;
+      this.#syncFocus();
+      this.#tui.requestRender();
+    };
+    list.onCancel = () => this.#closePanel();
+    return list;
+  }
+
+  #createChainList(): SelectList {
+    const list = this.#createSelectList(
+      this.#pausedChains.map((chain) => ({
+        value: chain.chainId,
+        label: `${chain.sourceAgentName} → ${chain.targetAgentName} · 下一轮 ${chain.nextRound}`,
+        description: `${chain.text.replace(/\s+/g, " ")} · ${chain.participants.length} 个 Agent · ${formatTime(chain.pausedAt)}`,
+      })),
+    );
+    list.onSelect = (item) => {
+      this.#selectedChain = this.#pausedChains.find((chain) => chain.chainId === item.value);
+      if (this.#selectedChain !== undefined) this.#panel = "chain-decision";
+      this.#syncFocus();
+      this.#tui.requestRender();
+    };
+    list.onCancel = () => this.#closePanel();
+    return list;
+  }
+
+  #createChainDecisionList(): SelectList {
+    const list = this.#createSelectList([
+      { value: "continue", label: "继续 10 轮", description: "沿用通信链和轮数" },
+      { value: "end", label: "结束对话", description: "不再发送下一轮请求" },
+      { value: "back", label: "返回", description: "暂不处理" },
+    ]);
+    list.onSelect = (item) => {
+      if (item.value === "back") {
+        this.#closePanel();
+        return;
+      }
+      const chain = this.#selectedChain;
+      if (chain === undefined) return;
+      const id = item.value === "continue"
+        ? this.#actions.continueChain?.(chain.chainId)
+        : this.#actions.endChain?.(chain.chainId);
+      if (id === undefined) {
+        this.#error = "Broker 未连接，操作尚未发送";
+        this.#tui.requestRender();
+        return;
+      }
+      this.#selectedChain = undefined;
+      this.#panel = "chains";
       this.#error = undefined;
       this.#syncFocus();
       this.#tui.requestRender();
@@ -817,6 +947,10 @@ function sortPendingRequests(requests: AgentRequestPayload[]): AgentRequestPaylo
   );
 }
 
+function sortPausedChains(chains: PausedChainPayload[]): PausedChainPayload[] {
+  return [...chains].sort((a, b) => b.pausedAt - a.pausedAt);
+}
+
 function sortedMembers(members: Member[], clientId?: string): Member[] {
   return [...members].sort((a, b) => {
     const own = Number(b.clientId === clientId) - Number(a.clientId === clientId);
@@ -883,6 +1017,21 @@ function messageState(message: HistoryMessage): string | undefined {
   return undefined;
 }
 
+function routeState(message: HistoryMessage): string | undefined {
+  const target = message.routeTargetName ?? "目标 Agent";
+  const round = message.nextRound === undefined ? "" : ` · 下一轮：${message.nextRound}`;
+  switch (message.routeStatus) {
+    case "waiting_approval": return `等待 ${target} 所属用户批准${round}`;
+    case "queued":
+    case "processing": return `已进入 ${target} 队列${round}`;
+    case "completed": return `${target} 已回答${round}`;
+    case "failed": return `自动对话未继续：${failureText(message.routeFailureReason)}`;
+    case "paused": return `已达到第 ${message.round ?? 0} 轮，等待原发起者决定`;
+    case "ended": return `原发起者已结束自动对话（停在第 ${message.round ?? 0} 轮）`;
+    default: return undefined;
+  }
+}
+
 function failureText(reason?: string): string {
   switch (reason) {
     case "target_not_found": return "找不到目标";
@@ -894,6 +1043,8 @@ function failureText(reason?: string): string {
     case "agent_busy": return "目标 Agent 正忙";
     case "no_text": return "Agent 未产生文本回答";
     case "broker_restarted": return "Broker 已重启";
+    case "target_self": return "Agent 不能 @ 自己";
+    case "empty_mention": return "@Agent 后缺少内容";
     default: return "请求处理失败";
   }
 }

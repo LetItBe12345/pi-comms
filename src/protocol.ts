@@ -24,6 +24,7 @@ export interface SnapshotPayload {
   group?: Group;
   members: Member[];
   messages: HistoryMessage[];
+  pausedChains?: PausedChainPayload[];
 }
 
 export interface ClientHelloPayload {
@@ -67,6 +68,10 @@ export interface RequestDecisionPayload {
   requestId: string;
 }
 
+export interface ChainDecisionPayload {
+  chainId: string;
+}
+
 export interface GroupsChangedPayload {
   groups: GroupSummary[];
 }
@@ -86,7 +91,23 @@ export interface ChatMessagePayload {
   kind?: "agent";
   status: MessageStatus;
   failureReason?: MessageFailureReason;
+  chainId?: string;
+  round?: number;
+  routeRequestId?: string;
+  routeStatus?: AgentRouteStatus;
+  routeFailureReason?: MessageFailureReason;
+  routeTargetName?: string;
+  nextRound?: number;
 }
+
+export type AgentRouteStatus =
+  | "waiting_approval"
+  | "queued"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "paused"
+  | "ended";
 
 export type MessageStatus =
   | "sent"
@@ -107,7 +128,9 @@ export type MessageFailureReason =
   | "agent_busy"
   | "delivery_failed"
   | "no_text"
-  | "broker_restarted";
+  | "broker_restarted"
+  | "target_self"
+  | "empty_mention";
 
 export interface HistoryMessage extends ChatMessagePayload {
   messageId: string;
@@ -122,6 +145,8 @@ export interface AgentRequestPayload {
   groupName: string;
   senderId: string;
   senderName: string;
+  senderType?: MemberType;
+  senderOwnerUserName?: string;
   targetAgentId: string;
   targetAgentName: string;
   ownerUserName: string;
@@ -130,6 +155,27 @@ export interface AgentRequestPayload {
   chainId: string;
   round: number;
   createdAt?: number;
+}
+
+export interface PausedChainPayload {
+  chainId: string;
+  groupId: string;
+  initiatorName: string;
+  sourceAgentName: string;
+  sourceOwnerUserName: string;
+  targetAgentName: string;
+  text: string;
+  nextRound: number;
+  roundLimit: number;
+  participants: string[];
+  pausedAt: number;
+}
+
+export interface ChainResolvedPayload {
+  chainId: string;
+  action: "continued" | "ended" | "failed";
+  initiatorName: string;
+  roundLimit: number;
 }
 
 export interface AgentDeliverAckPayload {
@@ -209,6 +255,12 @@ export type RequestApproveEnvelope = Envelope<RequestDecisionPayload> & {
 export type RequestRejectEnvelope = Envelope<RequestDecisionPayload> & {
   type: "request.reject";
 };
+export type ChainContinueEnvelope = Envelope<ChainDecisionPayload> & {
+  type: "chain.continue";
+};
+export type ChainEndEnvelope = Envelope<ChainDecisionPayload> & {
+  type: "chain.end";
+};
 export type AgentDeliverAckEnvelope = Envelope<AgentDeliverAckPayload> & {
   type: "agent.deliver.ack";
 };
@@ -227,6 +279,8 @@ export type ClientEnvelope =
   | PermissionUpdateEnvelope
   | RequestApproveEnvelope
   | RequestRejectEnvelope
+  | ChainContinueEnvelope
+  | ChainEndEnvelope
   | AgentDeliverAckEnvelope
   | AgentResultEnvelope;
 
@@ -238,6 +292,8 @@ export type BrokerEnvelope =
   | (Envelope<ChatMessagePayload> & { type: "chat.message" })
   | (Envelope<AgentRequestPayload> & { type: "agent.deliver" })
   | (Envelope<AgentRequestPayload> & { type: "request.pending" })
+  | (Envelope<PausedChainPayload> & { type: "chain.paused" })
+  | (Envelope<ChainResolvedPayload> & { type: "chain.resolved" })
   | (Envelope<AgentResultAckPayload> & { type: "agent.result.ack" })
   | (Envelope<SendFailedPayload> & { type: "send.failed" })
   | (Envelope<ErrorPayload> & { type: "error" });
@@ -359,6 +415,9 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
     case "request.approve":
     case "request.reject":
       return requireStrings(value, requestId, ["requestId"]);
+    case "chain.continue":
+    case "chain.end":
+      return requireStrings(value, requestId, ["chainId"]);
     case "agent.deliver.ack":
       return requireStrings(value, requestId, ["requestId"]);
     case "agent.result":
