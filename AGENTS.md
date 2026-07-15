@@ -10,6 +10,7 @@
 - [TODO 总览](./TODO/README.md)：列出实施阶段、执行顺序、依赖关系和当前状态。
 - [进行中的 TODO](./TODO/in-progress/README.md)：存放尚未完成或正在实施的任务。
 - [已完成的 TODO](./TODO/done/README.md)：存放已经满足完成条件的任务，作为实施记录。
+- [发布](./RELEASE.md)：说明 Pi Package 的发布路线、安装命令和 `package.json` 发布要求。
 - [旧 TODO 入口](./TODO(1).md)：仅用于兼容旧链接，并导航到 Specification 和 TODO 总览；不要在这里新增任务。
 
 ### TODO 状态规则
@@ -41,3 +42,83 @@
 - 不写防御性代码。
 - 不过度考虑安全问题。
 - 不考虑几乎碰不到的边界条件。
+
+## 5. Pi Extension 开发参考速查
+
+完整 API 与示例见 [extensions_for_pi.md](./extensions_for_pi.md)。开发 Extension 前先检索该文档对应章节，本节只作速查。
+
+### 放置与热加载
+
+- 全局：`~/.pi/agent/extensions/`；项目级：`.pi/extensions/`。
+- 这两处可被 `/reload` 热加载；`pi -e ./path.ts` 仅用于快速测试。
+
+### 核心能力
+
+- 自定义工具：`pi.registerTool()`，LLM 可调用。
+- 事件拦截：拦截或改写工具调用、注入上下文、自定义压缩。
+- 用户交互：`ctx.ui`（select/confirm/input/notify）。
+- 自定义 UI：`ctx.ui.custom()` 做带键盘输入的 TUI 组件。
+- 自定义命令：`pi.registerCommand()` 注册 `/mycommand`。
+- 会话持久化：`pi.appendEntry()` 存可跨重启的状态。
+- 自定义渲染：控制工具调用/结果和消息在 TUI 中的显示。
+
+### 章节索引
+
+- Quick Start / Extension Locations / Available Imports
+- Writing an Extension（含 Extension Styles）
+- Events：Lifecycle Overview、Resource/Session/Agent/Model/Tool Events
+- ExtensionContext / ExtensionCommandContext
+- ExtensionAPI Methods
+- State Management
+- Custom Tools（含 Dynamic Tool Loading）
+- Custom UI
+- Error Handling / Mode Behavior / Examples Reference
+
+## 6. 项目结构
+
+- `src/extension/index.ts` 是 Pi 唯一直接加载的 Extension 入口，负责注册命令、生命周期和组装模块，不承载全部实现。
+- `package.json` 通过 `pi.extensions` 只声明该入口。其他模块由 `index.ts` 正常导入，不需要被 Pi 单独发现。
+- TUI 放在 `src/tui/`，必须由 Extension 入口导入，并通过 `ctx.ui.custom()` 启动。目录位置不影响它作为 Extension 功能运行。
+- Extension 的 Broker 客户端、Agent 桥接和 Session 状态放在 `src/extension/`；Broker 服务端放在 `src/broker/`。
+- 公共协议放在 `src/protocol.ts`，测试放在 `tests/`。
+- 新增项目文档统一放入 `docs/`；已有根目录文档只在专门的迁移任务中移动，并同步更新全部链接。
+- 文档迁移完成后，根目录只保留 `README.md`、`AGENTS.md` 和工程配置文件。
+- 新文件必须放入对应模块，不在根目录随意创建。
+- 按职责拆分，避免循环依赖；TUI 不反向导入 `extension/index.ts`。
+- 以下是目标结构，文件在对应阶段需要时再创建：
+
+```text
+pi-comms/
+├── README.md
+├── AGENTS.md
+├── package.json
+├── tsconfig.json
+├── docs/
+│   ├── PRD.md
+│   ├── SPECIFICATION.md
+│   ├── extensions_for_pi.md
+│   └── development-and-release.md
+├── TODO/
+│   ├── README.md
+│   ├── in-progress/
+│   └── done/
+├── src/
+│   ├── protocol.ts
+│   ├── types.ts
+│   ├── extension/
+│   │   ├── index.ts
+│   │   ├── broker-client.ts
+│   │   ├── agent-bridge.ts
+│   │   ├── remote-queue.ts
+│   │   └── session-state.ts
+│   ├── broker/
+│   │   ├── server.ts
+│   │   ├── group-state.ts
+│   │   ├── router.ts
+│   │   ├── store.ts
+│   │   └── database.ts
+│   └── tui/
+│       ├── chat-view.ts
+│       └── components/
+└── tests/
+```

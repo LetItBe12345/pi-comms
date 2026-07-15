@@ -43,4 +43,5 @@ npm run broker
 - [产品需求](./PRD.md)
 - [技术规格](./SPECIFICATION.md)
 - [开发流程](./DEVELOPMENT.md)
+- [发布](./RELEASE.md)
 - [任务总览](./TODO/README.md)
