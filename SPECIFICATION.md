@@ -204,6 +204,8 @@ interface AgentRequest {
   groupName: string;
   senderId: string;
   senderName: string;
+  senderType: "user" | "agent";
+  senderOwnerUserName?: string;
   targetAgentId: string;
   targetAgentName: string;
   ownerUserName: string;
@@ -232,6 +234,8 @@ interface AgentRequest {
 - `permission.update`
 - `request.approve`
 - `request.reject`
+- `chain.continue`
+- `chain.end`
 
 ### 9.2 Broker → Client
 
@@ -242,6 +246,8 @@ interface AgentRequest {
 - `agent.deliver`
 - `agent.result.ack`
 - `request.pending`
+- `chain.paused`
+- `chain.resolved`
 - `send.failed`
 - `error`
 
@@ -313,7 +319,7 @@ interface Envelope<T = unknown> {
 - 待批准请求不自动超时；短暂断线 3 秒内保留，离群、退出、超时断线或 Broker 重启后失效。
 - 批准后请求进入现有串行队列，不抢占当前任务；重复批准或拒绝不得重复注入或广播。
 - 群成员可看到 Agent 权限、待批准数量及请求状态，但只有所属 Session 可以修改权限和处理审批。
-- TUI 通过 `Ctrl+P` 打开权限和待批准列表，复用 Pi 的选择列表与 `Enter`、`Esc` 操作。
+- TUI 通过 `Ctrl+P` 打开 Agent 控制面板，包括权限、待批准请求和待决定自动对话。
 - 禁止、拒绝和失效直接更新原公开消息状态，不额外发布系统消息。
 
 ### 11.3 队列和最终回答
@@ -341,11 +347,17 @@ seenRequestIds: Set<string>;
 
 ### 11.4 Agent 对 Agent
 
-- Agent 回答中的 `@Agent名称` 可以触发下一次请求，消息仍公开显示。
-- Broker 必须检查目标在线状态和接收权限。
-- 自动通信共用一个 `chainId`，每次路由时增加轮数。
-- 同一 `chainId` 最多自动通信 10 轮。
-- 达到上限后停止自动注入，并在群聊中显示原因，等待用户决定。
+- 只解析 Agent 最终回答开头的一个 `@名称`；允许前置空格和空行，不解析 Markdown 包裹或正文中间的 `@`。
+- `@Agent` 后必须有正文；`@` 自己、空正文和不存在的目标只公开回答并显示原因，不增加轮数。
+- `@用户` 只公开提醒并结束自动通信；`@Agent` 触发下一次请求，原回答始终完整公开。
+- 发送者是作出回答的 Agent；注入内容同时注明目标 Agent 和发送方 Agent 各自的所属用户。
+- 新的人类 `@Agent` 请求生成新 `chainId` 并计为第 1 轮；后续请求沿用 `chainId`，每次成功创建路由时增加轮数。
+- 通信链可以经过任意数量 Agent；每个目标继续使用现有 FIFO 串行队列。
+- 每次自动路由都重新检查目标在线状态和接收权限；离线、禁止、拒绝或执行失败时停止且不重试。
+- 初始额度为 10 轮；第 10 轮回答仍公开，但其中准备触发的第 11 轮请求暂停。
+- 只有最初发起请求的 Pi Session 可以通过 `Ctrl+P` 继续或结束；继续时沿用 `chainId` 和轮数，每次增加 10 轮额度并再次检查目标状态与权限。
+- 暂停决定写入 SQLite，不自动过期；只在原群组显示，Broker 重启后恢复。
+- TUI 显示轮数、下一目标和路由状态，不直接显示完整 `chainId`；继续和结束决定公开显示。
 
 ## 12. Session 生命周期
 
@@ -412,8 +424,10 @@ seenRequestIds: Set<string>;
 - 消息写入成功后才能广播。
 - `@Agent` 公开消息与请求记录必须在同一事务中写入。
 - Agent 回答、请求完成状态和原消息状态必须在同一事务中写入。
+- Agent 回答和由它触发的下一请求或暂停状态必须在同一事务中写入。
 - SQLite 保留全部公开消息；加入群组时按时间正序返回最近 100 条。
 - Broker 重启时，`pending` 和 `delivered` 请求改为 `interrupted`，不自动重试。
+- 达到轮数上限的暂停链保留；重启后仍只允许原发起 Pi Session 继续或结束。
 - 仍在运行的 Extension 使用原 `clientId` 和名称自动重新加入；Pi 重启后需要手动加入。
 - 数据库无法打开或迁移失败时，Broker 启动失败，不自动重建数据库。
 

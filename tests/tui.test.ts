@@ -110,6 +110,8 @@ function createView(overrides: Partial<ChatViewActions> = {}) {
     updatePermission: vi.fn(() => true),
     approveRequest: vi.fn(() => "approve-1"),
     rejectRequest: vi.fn(() => "reject-1"),
+    continueChain: vi.fn(() => "continue-1"),
+    endChain: vi.fn(() => "end-1"),
     close: vi.fn(),
     ...overrides,
   };
@@ -227,7 +229,8 @@ describe("最小群聊 TUI", () => {
     view.setConnection("connected");
 
     view.handleInput("\x10");
-    expect(view.render(80).join("\n")).toContain("Agent 接收权限");
+    expect(view.render(80).join("\n")).toContain("Agent 控制");
+    view.handleInput("\x1b[B");
     view.handleInput("\x1b[B");
     view.handleInput("\x1b[B");
     view.handleInput("\r");
@@ -255,5 +258,53 @@ describe("最小群聊 TUI", () => {
     expect(view.render(80).join("\n")).toContain("请检查测试");
     view.handleInput("\r");
     expect(approveRequest).toHaveBeenCalledWith("request-1");
+  });
+
+  it("显示自动路由轮数，并通过 Ctrl+P 继续暂停链", () => {
+    const continueChain = vi.fn(() => "continue-1");
+    const { view } = createView({ continueChain });
+    view.applySnapshot(snapshot([
+      message({
+        messageId: "answer-10",
+        senderId: "agent:client-b",
+        senderName: "Bob-Pi",
+        senderType: "agent",
+        text: "@Alice-Pi 请继续",
+        kind: "agent",
+        chainId: "chain-1",
+        round: 10,
+        routeStatus: "paused",
+        routeTargetName: "Alice-Pi",
+        nextRound: 11,
+      }),
+    ]));
+    view.setConnection("connected");
+    view.setPausedChains([{
+      chainId: "chain-1",
+      groupId: "group-a",
+      initiatorName: "Alice",
+      sourceAgentName: "Bob-Pi",
+      sourceOwnerUserName: "Bob",
+      targetAgentName: "Alice-Pi",
+      text: "请继续",
+      nextRound: 11,
+      roundLimit: 10,
+      participants: ["Alice-Pi", "Bob-Pi", "Carol-Pi"],
+      pausedAt: new Date("2026-07-15T09:35:00+08:00").getTime(),
+    }]);
+
+    const chat = view.render(80).join("\n");
+    expect(chat).toContain("Bob-Pi [Agent · 第 10 轮]");
+    expect(chat).toContain("已达到第 10 轮，等待原发起者决定");
+    expect(chat).toContain("待决定：1");
+
+    view.handleInput("\x10");
+    view.handleInput("\x1b[B");
+    view.handleInput("\r");
+    expect(view.render(80).join("\n")).toContain("Bob-Pi → Alice-Pi · 下一轮 11");
+    view.handleInput("\r");
+    expect(view.render(80).join("\n")).toContain("参与 Agent：Alice-Pi、Bob-Pi、Carol-Pi");
+    view.handleInput("\r");
+    expect(continueChain).toHaveBeenCalledWith("chain-1");
   });
 });

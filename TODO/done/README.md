@@ -13,3 +13,4 @@
 - [阶段 6：SQLite 持久化](./06-sqlite.md)
 - [阶段 7：最小 TUI](./07-tui.md)
 - [阶段 8：权限系统](./08-permissions.md)
+- [阶段 9：Agent 对 Agent](./09-agent-to-agent.md)

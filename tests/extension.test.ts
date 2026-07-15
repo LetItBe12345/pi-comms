@@ -250,7 +250,8 @@ describe("Pi Extension 群组接入", () => {
         "[Pi Comms 群聊请求]",
         "你是：Bob-Pi（Agent）",
         "所属用户：Bob",
-        "来自：Alice  群组：开发组",
+        "来自：Alice（用户）",
+        "群组：开发组",
         "在线：Alice(用户)、Alice-Pi(Agent)、Bob(用户)、Carol(用户)、Carol-Pi(Agent)",
         "",
         "只回复 OK",
@@ -419,6 +420,8 @@ describe("Agent 注入格式", () => {
       groupName: "开发组",
       senderId: "agent:a",
       senderName: "Alice-Pi",
+      senderType: "agent",
+      senderOwnerUserName: "Alice",
       targetAgentId: "agent:b",
       targetAgentName: "Bob-Pi",
       ownerUserName: "Bob",
@@ -428,6 +431,8 @@ describe("Agent 注入格式", () => {
       round: 2,
     });
     expect(text).toContain("这是第 2 轮自动对话。");
+    expect(text).toContain("来自：Alice-Pi（Agent）");
+    expect(text).toContain("Alice-Pi 所属用户：Alice");
     expect(text).toContain("在线：无其他在线成员");
     expect(text).not.toContain("目标：");
   });

@@ -22,7 +22,7 @@ describe("Broker SQLite", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  it("初始化 v2 Schema、WAL 和 FULL，并恢复群组", () => {
+  it("初始化 v3 Schema、WAL 和 FULL，并恢复群组", () => {
     const store = new BrokerDatabase(dbPath);
     expect(store.configuration()).toEqual({
       journalMode: "wal",
@@ -32,7 +32,7 @@ describe("Broker SQLite", () => {
     store.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(2);
+    expect(raw.pragma("user_version", { simple: true })).toBe(3);
     expect(raw.pragma("journal_mode", { simple: true })).toBe("wal");
     const tables = raw
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -41,6 +41,7 @@ describe("Broker SQLite", () => {
       "agent_requests",
       "groups",
       "messages",
+      "paused_chains",
     ]);
     raw.close();
 
@@ -205,6 +206,92 @@ describe("Broker SQLite", () => {
     expect(reopened.recentMessages("g")[0]).toMatchObject({
       status: "failed",
       failureReason: "request_invalid",
+    });
+    reopened.close();
+  });
+
+  it("Broker 重启后保留达到轮数上限的待决定通信链", () => {
+    const store = new BrokerDatabase(dbPath);
+    store.insertGroup({ groupId: "g", groupName: "开发组" });
+    const request: AgentRequestPayload = {
+      requestId: "round-10",
+      groupId: "g",
+      groupName: "开发组",
+      senderId: "agent:b",
+      senderName: "Bob-Pi",
+      senderType: "agent",
+      senderOwnerUserName: "Bob",
+      targetAgentId: "agent:c",
+      targetAgentName: "Carol-Pi",
+      ownerUserName: "Carol",
+      onlineMembers: [],
+      text: "第十轮",
+      chainId: "chain",
+      round: 10,
+    };
+    const source = historyMessage("source", 1, {
+      groupId: "g",
+      senderId: "agent:b",
+      senderName: "Bob-Pi",
+      senderType: "agent",
+      text: "@Carol-Pi 第十轮",
+      mentionIds: ["agent:c"],
+      routeRequestId: "round-10",
+      routeStatus: "queued",
+      status: "sent",
+      kind: "agent",
+      chainId: "chain",
+      round: 9,
+    }, "sent");
+    store.insertAgentRequest(source, request, false, {
+      initiatorSessionId: "session-a",
+      initiatorName: "Alice",
+      participants: ["Bob-Pi", "Carol-Pi"],
+      roundLimit: 10,
+    });
+    store.markDelivered("round-10");
+    const answer = historyMessage("answer", 2, {
+      groupId: "g",
+      senderId: "agent:c",
+      senderName: "Carol-Pi",
+      senderType: "agent",
+      text: "@Bob-Pi 第十一轮",
+      mentionIds: ["agent:b"],
+      requestId: "round-10",
+      kind: "agent",
+      status: "sent",
+      chainId: "chain",
+      round: 10,
+      routeStatus: "paused",
+      routeTargetName: "Bob-Pi",
+      nextRound: 11,
+    }, "sent");
+    store.completeAndRoute("round-10", answer, { paused: {
+      chainId: "chain",
+      groupId: "g",
+      messageId: "answer",
+      initiatorSessionId: "session-a",
+      initiatorName: "Alice",
+      sourceAgentName: "Carol-Pi",
+      sourceOwnerUserName: "Carol",
+      targetAgentId: "agent:b",
+      targetAgentName: "Bob-Pi",
+      text: "第十一轮",
+      nextRound: 11,
+      roundLimit: 10,
+      participants: ["Bob-Pi", "Carol-Pi"],
+      pausedAt: 2,
+    } });
+    store.close();
+
+    const reopened = new BrokerDatabase(dbPath);
+    expect(reopened.pausedChains("session-a", "g")).toEqual([
+      expect.objectContaining({ chainId: "chain", nextRound: 11, roundLimit: 10 }),
+    ]);
+    expect(reopened.recentMessages("g").at(-1)).toMatchObject({
+      messageId: "answer",
+      routeStatus: "paused",
+      round: 10,
     });
     reopened.close();
   });

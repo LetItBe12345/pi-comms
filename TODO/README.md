@@ -22,7 +22,7 @@
 | 6 | [SQLite 持久化](./done/06-sqlite.md) | 固定持久化边界 | done | 阶段 5 |
 | 7 | [最小 TUI](./done/07-tui.md) | 提供可用的群聊界面 | done | 阶段 6 |
 | 8 | [权限系统](./done/08-permissions.md) | 支持三种 Agent 接收权限 | done | 阶段 7 |
-| 9 | [Agent 对 Agent](./in-progress/09-agent-to-agent.md) | 支持最多 10 轮自动通信 | in-progress | 阶段 8 |
+| 9 | [Agent 对 Agent](./done/09-agent-to-agent.md) | 支持每 10 轮由用户决定是否继续 | done | 阶段 8 |
 | 10 | [测试与验收](./in-progress/10-testing-acceptance.md) | 满足 MVP 完成定义 | in-progress | 阶段 9 |
 
 ## 当前最小里程碑
