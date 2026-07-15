@@ -101,4 +101,38 @@ describe("客户端消息校验", () => {
       requestId: "unknown",
     });
   });
+
+  it("接受成功和失败的 agent.result", () => {
+    const success = createEnvelope("agent.result", {
+      requestId: "request-1",
+      ok: true,
+      text: "最终回答",
+    });
+    const failure = createEnvelope("agent.result", {
+      requestId: "request-2",
+      ok: false,
+      reason: "agent_busy",
+    });
+
+    expect(parseClientEnvelope(success).ok).toBe(true);
+    expect(parseClientEnvelope(failure).ok).toBe(true);
+  });
+
+  it("接受连接握手、正常关闭和投递确认", () => {
+    expect(
+      parseClientEnvelope(
+        createEnvelope("client.hello", { sessionId: "session-a" }),
+      ).ok,
+    ).toBe(true);
+    expect(
+      parseClientEnvelope(
+        createEnvelope("client.goodbye", { sessionId: "session-a" }),
+      ).ok,
+    ).toBe(true);
+    expect(
+      parseClientEnvelope(
+        createEnvelope("agent.deliver.ack", { requestId: "request-a" }),
+      ).ok,
+    ).toBe(true);
+  });
 });

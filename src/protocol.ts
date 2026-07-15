@@ -9,8 +9,17 @@ export interface Envelope<T = unknown> {
 }
 
 export interface SnapshotPayload {
+  brokerInstanceId: string;
   clientId: string;
   clients: string[];
+}
+
+export interface ClientHelloPayload {
+  sessionId: string;
+}
+
+export interface ClientGoodbyePayload {
+  sessionId: string;
 }
 
 export interface PresenceChangedPayload {
@@ -25,12 +34,47 @@ export interface ChatSendPayload {
 
 export interface ChatMessagePayload extends ChatSendPayload {
   senderClientId: string;
+  requestId?: string;
+  kind?: "agent";
+}
+
+export interface AgentRequestPayload {
+  requestId: string;
+  groupId: string;
+  senderId: string;
+  senderName: string;
+  targetAgentId: string;
+  text: string;
+  chainId: string;
+  round: number;
+}
+
+export interface AgentDeliverAckPayload {
+  requestId: string;
+}
+
+export type AgentFailureReason =
+  | "agent_busy"
+  | "delivery_failed"
+  | "no_text";
+
+export type AgentResultPayload =
+  | { requestId: string; ok: true; text: string }
+  | { requestId: string; ok: false; reason: AgentFailureReason };
+
+export interface AgentResultAckPayload {
+  requestId: string;
+  accepted: boolean;
+  reason?: "unknown_request";
 }
 
 export interface SendFailedPayload {
   requestId: string;
   targetClientId: string;
-  reason: "target_offline";
+  reason:
+    | "target_offline"
+    | "target_disconnected"
+    | AgentFailureReason;
 }
 
 export type ProtocolErrorCode =
@@ -49,10 +93,28 @@ export type ChatSendEnvelope = Envelope<ChatSendPayload> & {
   type: "chat.send";
 };
 
+export type ClientHelloEnvelope = Envelope<ClientHelloPayload> & {
+  type: "client.hello";
+};
+
+export type ClientGoodbyeEnvelope = Envelope<ClientGoodbyePayload> & {
+  type: "client.goodbye";
+};
+
+export type AgentDeliverAckEnvelope = Envelope<AgentDeliverAckPayload> & {
+  type: "agent.deliver.ack";
+};
+
+export type AgentResultEnvelope = Envelope<AgentResultPayload> & {
+  type: "agent.result";
+};
+
 export type BrokerEnvelope =
   | (Envelope<SnapshotPayload> & { type: "snapshot" })
   | (Envelope<PresenceChangedPayload> & { type: "presence.changed" })
   | (Envelope<ChatMessagePayload> & { type: "chat.message" })
+  | (Envelope<AgentRequestPayload> & { type: "agent.deliver" })
+  | (Envelope<AgentResultAckPayload> & { type: "agent.result.ack" })
   | (Envelope<SendFailedPayload> & { type: "send.failed" })
   | (Envelope<ErrorPayload> & { type: "error" });
 
@@ -61,7 +123,15 @@ export type JsonlDecodeResult =
   | { ok: false; error: string };
 
 export type ParseClientEnvelopeResult =
-  | { ok: true; envelope: ChatSendEnvelope }
+  | {
+      ok: true;
+      envelope:
+        | ClientHelloEnvelope
+        | ClientGoodbyeEnvelope
+        | ChatSendEnvelope
+        | AgentDeliverAckEnvelope
+        | AgentResultEnvelope;
+    }
   | {
       ok: false;
       code: Exclude<ProtocolErrorCode, "invalid_json">;
@@ -137,7 +207,13 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
     return invalid("invalid_envelope", "消息信封字段无效", requestId);
   }
 
-  if (value.type !== "chat.send") {
+  if (
+    value.type !== "client.hello" &&
+    value.type !== "client.goodbye" &&
+    value.type !== "chat.send" &&
+    value.type !== "agent.deliver.ack" &&
+    value.type !== "agent.result"
+  ) {
     return invalid(
       "unsupported_type",
       `不支持的消息类型：${value.type}`,
@@ -146,7 +222,45 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
   }
 
   if (!isRecord(value.payload)) {
-    return invalid("invalid_payload", "chat.send payload 必须是对象", requestId);
+    return invalid("invalid_payload", `${value.type} payload 必须是对象`, requestId);
+  }
+
+  if (value.type === "client.hello" || value.type === "client.goodbye") {
+    if (
+      typeof value.payload.sessionId !== "string" ||
+      value.payload.sessionId.length === 0
+    ) {
+      return invalid(
+        "invalid_payload",
+        `${value.type} sessionId 无效`,
+        requestId,
+      );
+    }
+    return {
+      ok: true,
+      envelope: value as unknown as ClientHelloEnvelope | ClientGoodbyeEnvelope,
+    };
+  }
+
+  if (value.type === "agent.deliver.ack") {
+    if (
+      typeof value.payload.requestId !== "string" ||
+      value.payload.requestId.length === 0
+    ) {
+      return invalid(
+        "invalid_payload",
+        "agent.deliver.ack requestId 无效",
+        requestId,
+      );
+    }
+    return {
+      ok: true,
+      envelope: value as unknown as AgentDeliverAckEnvelope,
+    };
+  }
+
+  if (value.type === "agent.result") {
+    return parseAgentResult(value, requestId);
   }
 
   const { text, targetClientId } = value.payload;
@@ -170,6 +284,37 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
     ok: true,
     envelope: value as unknown as ChatSendEnvelope,
   };
+}
+
+function parseAgentResult(
+  value: Record<string, unknown>,
+  envelopeId?: string,
+): ParseClientEnvelopeResult {
+  const payload = value.payload as Record<string, unknown>;
+  const { requestId, ok } = payload;
+
+  if (typeof requestId !== "string" || requestId.length === 0) {
+    return invalid("invalid_payload", "agent.result requestId 无效", envelopeId);
+  }
+  if (ok === true && typeof payload.text === "string" && payload.text.trim()) {
+    return {
+      ok: true,
+      envelope: value as unknown as AgentResultEnvelope,
+    };
+  }
+  if (
+    ok === false &&
+    (payload.reason === "agent_busy" ||
+      payload.reason === "delivery_failed" ||
+      payload.reason === "no_text")
+  ) {
+    return {
+      ok: true,
+      envelope: value as unknown as AgentResultEnvelope,
+    };
+  }
+
+  return invalid("invalid_payload", "agent.result payload 无效", envelopeId);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

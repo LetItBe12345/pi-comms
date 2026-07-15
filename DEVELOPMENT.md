@@ -39,6 +39,8 @@ CI 通过 → 人工验收 → 创建版本标签 → 创建 GitHub Release
 
 MVP 阶段手动发布。安装方式稳定后，再自动生成和发布 npm 包。
 
+发布细节见 [RELEASE.md](./RELEASE.md)。
+
 ## 日常流程
 
 ```text

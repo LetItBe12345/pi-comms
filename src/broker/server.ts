@@ -1,21 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, unlink } from "node:fs/promises";
+import { createConnection, createServer, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import {
-  createConnection,
-  createServer,
-  type Socket,
-} from "node:net";
 import {
   createEnvelope,
   encodeEnvelope,
   JsonlDecoder,
   parseClientEnvelope,
+  type AgentRequestPayload,
+  type AgentResultPayload,
   type BrokerEnvelope,
+  type ClientHelloEnvelope,
   type Envelope,
   type ErrorPayload,
+  type SendFailedPayload,
 } from "../protocol.js";
 
 export const DEFAULT_SOCKET_PATH = join(
@@ -25,43 +25,52 @@ export const DEFAULT_SOCKET_PATH = join(
   "broker.sock",
 );
 
+const DEFAULT_DISCONNECT_GRACE_MS = 3_000;
+
 export interface BrokerServerOptions {
   socketPath?: string;
+  disconnectGraceMs?: number;
 }
 
 export interface BrokerServer {
   readonly socketPath: string;
+  readonly instanceId: string;
   start(): Promise<void>;
   close(): Promise<void>;
+}
+
+interface ClientSession {
+  clientId: string;
+  socket?: Socket;
+  disconnectTimer?: ReturnType<typeof setTimeout>;
+}
+
+interface PendingRequest {
+  targetClientId: string;
+  request: AgentRequestPayload;
+  deliveryAcknowledged: boolean;
 }
 
 export function createBrokerServer(
   options: BrokerServerOptions = {},
 ): BrokerServer {
   const socketPath = options.socketPath ?? DEFAULT_SOCKET_PATH;
+  const disconnectGraceMs =
+    options.disconnectGraceMs ?? DEFAULT_DISCONNECT_GRACE_MS;
+  const instanceId = randomUUID();
   const clients = new Map<string, Socket>();
+  const sessions = new Map<string, ClientSession>();
+  const pendingRequests = new Map<string, PendingRequest>();
+  const completedRequests = new Map<string, string>();
+  const closedRequestIds = new Set<string>();
   const server = createServer(handleConnection);
   let started = false;
   let closing = false;
 
   function handleConnection(socket: Socket): void {
-    const clientId = randomUUID();
     const decoder = new JsonlDecoder();
-    clients.set(clientId, socket);
-
-    send(
-      socket,
-      createEnvelope("snapshot", {
-        clientId,
-        clients: [...clients.keys()],
-      }) as BrokerEnvelope,
-    );
-    broadcast(
-      createEnvelope("presence.changed", {
-        clientId,
-        online: true,
-      }) as BrokerEnvelope,
-    );
+    let sessionId: string | undefined;
+    let clientId: string | undefined;
 
     socket.on("data", (chunk) => {
       for (const result of decoder.push(chunk)) {
@@ -73,7 +82,55 @@ export function createBrokerServer(
           continue;
         }
 
-        handleMessage(clientId, socket, result.value);
+        const parsed = parseClientEnvelope(result.value);
+        if (!parsed.ok) {
+          sendError(socket, {
+            code: parsed.code,
+            message: parsed.message,
+            requestId: parsed.requestId,
+          });
+          continue;
+        }
+
+        if (parsed.envelope.type === "client.hello") {
+          if (clientId !== undefined) {
+            sendError(socket, {
+              code: "invalid_payload",
+              message: "连接已经完成 client.hello",
+              requestId: parsed.envelope.id,
+            });
+            continue;
+          }
+          const identity = registerClient(socket, parsed.envelope);
+          sessionId = identity.sessionId;
+          clientId = identity.clientId;
+          continue;
+        }
+
+        if (clientId === undefined || sessionId === undefined) {
+          sendError(socket, {
+            code: "invalid_payload",
+            message: "发送消息前必须先发送 client.hello",
+            requestId: parsed.envelope.id,
+          });
+          continue;
+        }
+
+        if (parsed.envelope.type === "client.goodbye") {
+          if (parsed.envelope.payload.sessionId !== sessionId) {
+            sendError(socket, {
+              code: "invalid_payload",
+              message: "client.goodbye sessionId 不匹配",
+              requestId: parsed.envelope.id,
+            });
+            continue;
+          }
+          removeClientSession(sessionId, clientId, socket);
+          socket.end();
+          continue;
+        }
+
+        handleClientMessage(clientId, socket, parsed.envelope);
       }
     });
 
@@ -82,38 +139,141 @@ export function createBrokerServer(
     });
 
     socket.once("close", () => {
-      if (clients.get(clientId) !== socket) {
+      if (clientId === undefined || sessionId === undefined) {
         return;
       }
-
-      clients.delete(clientId);
-      if (!closing) {
-        broadcast(
-          createEnvelope("presence.changed", {
-            clientId,
-            online: false,
-          }) as BrokerEnvelope,
-        );
-      }
+      handleUnexpectedDisconnect(sessionId, clientId, socket);
     });
   }
 
-  function handleMessage(
-    senderClientId: string,
-    senderSocket: Socket,
-    value: unknown,
+  function registerClient(
+    socket: Socket,
+    hello: ClientHelloEnvelope,
+  ): { sessionId: string; clientId: string } {
+    const sessionId = hello.payload.sessionId;
+    let session = sessions.get(sessionId);
+    if (session === undefined) {
+      session = { clientId: randomUUID() };
+      sessions.set(sessionId, session);
+    }
+
+    if (session.disconnectTimer !== undefined) {
+      clearTimeout(session.disconnectTimer);
+      session.disconnectTimer = undefined;
+    }
+    if (session.socket !== undefined && session.socket !== socket) {
+      session.socket.destroy();
+    }
+
+    const clientId = session.clientId;
+    session.socket = socket;
+    clients.set(clientId, socket);
+
+    send(
+      socket,
+      createEnvelope("snapshot", {
+        brokerInstanceId: instanceId,
+        clientId,
+        clients: [...clients.keys()],
+      }) as BrokerEnvelope,
+    );
+    broadcast(
+      createEnvelope("presence.changed", {
+        clientId,
+        online: true,
+      }) as BrokerEnvelope,
+    );
+    resendUnacknowledgedDeliveries(clientId, socket);
+    return { sessionId, clientId };
+  }
+
+  function handleUnexpectedDisconnect(
+    sessionId: string,
+    clientId: string,
+    socket: Socket,
   ): void {
-    const parsed = parseClientEnvelope(value);
-    if (!parsed.ok) {
-      sendError(senderSocket, {
-        code: parsed.code,
-        message: parsed.message,
-        requestId: parsed.requestId,
-      });
+    if (clients.get(clientId) !== socket) {
       return;
     }
 
-    const { id, payload } = parsed.envelope;
+    clients.delete(clientId);
+    const session = sessions.get(sessionId);
+    if (session !== undefined && session.socket === socket) {
+      session.socket = undefined;
+    }
+    if (closing) {
+      return;
+    }
+
+    broadcast(
+      createEnvelope("presence.changed", {
+        clientId,
+        online: false,
+      }) as BrokerEnvelope,
+    );
+    if (session !== undefined) {
+      session.disconnectTimer = setTimeout(() => {
+        session.disconnectTimer = undefined;
+        if (!clients.has(clientId)) {
+          failRequestsForDisconnectedTarget(clientId);
+        }
+      }, disconnectGraceMs);
+    }
+  }
+
+  function removeClientSession(
+    sessionId: string,
+    clientId: string,
+    socket: Socket,
+  ): void {
+    const session = sessions.get(sessionId);
+    if (session?.disconnectTimer !== undefined) {
+      clearTimeout(session.disconnectTimer);
+    }
+    sessions.delete(sessionId);
+    if (clients.get(clientId) === socket) {
+      clients.delete(clientId);
+      broadcast(
+        createEnvelope("presence.changed", {
+          clientId,
+          online: false,
+        }) as BrokerEnvelope,
+      );
+      failRequestsForDisconnectedTarget(clientId);
+    }
+  }
+
+  function handleClientMessage(
+    senderClientId: string,
+    senderSocket: Socket,
+    envelope: Exclude<
+      ReturnType<typeof parseClientEnvelope>,
+      { ok: false }
+    >["envelope"],
+  ): void {
+    if (envelope.type === "agent.deliver.ack") {
+      const pending = pendingRequests.get(envelope.payload.requestId);
+      if (pending?.targetClientId === senderClientId) {
+        pending.deliveryAcknowledged = true;
+      }
+      return;
+    }
+
+    if (envelope.type === "agent.result") {
+      handleAgentResult(senderClientId, senderSocket, envelope.payload);
+      return;
+    }
+
+    if (envelope.type !== "chat.send") {
+      return;
+    }
+
+    const { id, payload } = envelope;
+    if (payload.targetClientId === undefined && payload.text.startsWith("@")) {
+      handleAgentRequest(senderClientId, senderSocket, id, payload.text);
+      return;
+    }
+
     const message = createEnvelope(
       "chat.message",
       {
@@ -143,8 +303,170 @@ export function createBrokerServer(
       );
       return;
     }
-
     send(target, message);
+  }
+
+  function handleAgentRequest(
+    senderClientId: string,
+    senderSocket: Socket,
+    requestId: string,
+    rawText: string,
+  ): void {
+    const existing = pendingRequests.get(requestId);
+    if (existing !== undefined) {
+      const target = clients.get(existing.targetClientId);
+      if (
+        !existing.deliveryAcknowledged &&
+        target !== undefined &&
+        !target.destroyed
+      ) {
+        sendAgentDelivery(target, existing.request);
+      }
+      return;
+    }
+    if (completedRequests.has(requestId) || closedRequestIds.has(requestId)) {
+      return;
+    }
+
+    const mention = parseAgentMention(rawText);
+    if (mention === undefined) {
+      sendError(senderSocket, {
+        code: "invalid_payload",
+        message: "@Agent 格式应为：@完整clientId 消息正文",
+        requestId,
+      });
+      return;
+    }
+
+    broadcast(
+      createEnvelope(
+        "chat.message",
+        {
+          senderClientId,
+          targetClientId: mention.targetClientId,
+          text: rawText,
+          requestId,
+        },
+        { id: requestId },
+      ) as BrokerEnvelope,
+    );
+
+    const target = clients.get(mention.targetClientId);
+    if (target === undefined || target.destroyed) {
+      closedRequestIds.add(requestId);
+      broadcastFailure({
+        requestId,
+        targetClientId: mention.targetClientId,
+        reason: "target_offline",
+      });
+      return;
+    }
+
+    const request: AgentRequestPayload = {
+      requestId,
+      groupId: "default",
+      senderId: senderClientId,
+      senderName: `Client-${senderClientId.slice(0, 8)}`,
+      targetAgentId: mention.targetClientId,
+      text: mention.text,
+      chainId: requestId,
+      round: 1,
+    };
+    pendingRequests.set(requestId, {
+      targetClientId: mention.targetClientId,
+      request,
+      deliveryAcknowledged: false,
+    });
+    sendAgentDelivery(target, request);
+  }
+
+  function sendAgentDelivery(socket: Socket, request: AgentRequestPayload): void {
+    send(socket, createEnvelope("agent.deliver", request) as BrokerEnvelope);
+  }
+
+  function resendUnacknowledgedDeliveries(
+    targetClientId: string,
+    socket: Socket,
+  ): void {
+    for (const pending of pendingRequests.values()) {
+      if (
+        pending.targetClientId === targetClientId &&
+        !pending.deliveryAcknowledged
+      ) {
+        sendAgentDelivery(socket, pending.request);
+      }
+    }
+  }
+
+  function handleAgentResult(
+    senderClientId: string,
+    senderSocket: Socket,
+    result: AgentResultPayload,
+  ): void {
+    if (completedRequests.get(result.requestId) === senderClientId) {
+      sendResultAck(senderSocket, result.requestId, true);
+      return;
+    }
+
+    const pending = pendingRequests.get(result.requestId);
+    if (pending === undefined || pending.targetClientId !== senderClientId) {
+      sendResultAck(senderSocket, result.requestId, false);
+      return;
+    }
+
+    pendingRequests.delete(result.requestId);
+    completedRequests.set(result.requestId, senderClientId);
+    if (result.ok) {
+      broadcast(
+        createEnvelope("chat.message", {
+          senderClientId,
+          text: result.text,
+          requestId: result.requestId,
+          kind: "agent" as const,
+        }) as BrokerEnvelope,
+      );
+    } else {
+      broadcastFailure({
+        requestId: result.requestId,
+        targetClientId: senderClientId,
+        reason: result.reason,
+      });
+    }
+    sendResultAck(senderSocket, result.requestId, true);
+  }
+
+  function sendResultAck(
+    socket: Socket,
+    requestId: string,
+    accepted: boolean,
+  ): void {
+    send(
+      socket,
+      createEnvelope("agent.result.ack", {
+        requestId,
+        accepted,
+        ...(accepted ? {} : { reason: "unknown_request" as const }),
+      }) as BrokerEnvelope,
+    );
+  }
+
+  function failRequestsForDisconnectedTarget(targetClientId: string): void {
+    for (const [requestId, pending] of pendingRequests) {
+      if (pending.targetClientId !== targetClientId) {
+        continue;
+      }
+      pendingRequests.delete(requestId);
+      closedRequestIds.add(requestId);
+      broadcastFailure({
+        requestId,
+        targetClientId,
+        reason: "target_disconnected",
+      });
+    }
+  }
+
+  function broadcastFailure(payload: SendFailedPayload): void {
+    broadcast(createEnvelope("send.failed", payload) as BrokerEnvelope);
   }
 
   function sendError(socket: Socket, payload: ErrorPayload): void {
@@ -161,7 +483,6 @@ export function createBrokerServer(
     if (started) {
       return;
     }
-
     await mkdir(dirname(socketPath), { recursive: true });
     if (await canConnect(socketPath)) {
       throw new Error(`Broker 已经在运行：${socketPath}`);
@@ -177,12 +498,10 @@ export function createBrokerServer(
         server.off("error", onError);
         resolveStart();
       };
-
       server.once("error", onError);
       server.once("listening", onListening);
       server.listen(socketPath);
     });
-
     started = true;
     closing = false;
   }
@@ -191,12 +510,16 @@ export function createBrokerServer(
     if (!started) {
       return;
     }
-
     closing = true;
-    for (const socket of clients.values()) {
-      socket.destroy();
+    for (const session of sessions.values()) {
+      if (session.disconnectTimer !== undefined) {
+        clearTimeout(session.disconnectTimer);
+      }
+      session.socket?.destroy();
     }
     clients.clear();
+    sessions.clear();
+    pendingRequests.clear();
 
     await new Promise<void>((resolveClose, rejectClose) => {
       server.close((error) => {
@@ -207,11 +530,21 @@ export function createBrokerServer(
         }
       });
     });
-
     started = false;
   }
 
-  return { socketPath, start, close };
+  return { socketPath, instanceId, start, close };
+}
+
+function parseAgentMention(
+  text: string,
+): { targetClientId: string; text: string } | undefined {
+  const match = text.match(
+    /^@([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\s+([\s\S]*\S)$/i,
+  );
+  return match === null
+    ? undefined
+    : { targetClientId: match[1], text: match[2] };
 }
 
 function send(socket: Socket, envelope: Envelope): void {
@@ -223,7 +556,6 @@ function send(socket: Socket, envelope: Envelope): void {
 async function canConnect(socketPath: string): Promise<boolean> {
   return new Promise<boolean>((resolveConnection, rejectConnection) => {
     const socket = createConnection(socketPath);
-
     socket.once("connect", () => {
       socket.destroy();
       resolveConnection(true);
@@ -253,7 +585,6 @@ async function runBroker(): Promise<void> {
   const broker = createBrokerServer();
   await broker.start();
   console.log(`Pi Comms Broker 正在监听 ${broker.socketPath}`);
-
   const shutdown = async () => {
     await broker.close();
   };
