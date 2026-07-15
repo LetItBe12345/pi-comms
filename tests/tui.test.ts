@@ -107,6 +107,9 @@ function createView(overrides: Partial<ChatViewActions> = {}) {
     createGroup: vi.fn(() => "create-1"),
     joinGroup: vi.fn(() => "join-1"),
     sendMessage: vi.fn(() => "message-new"),
+    updatePermission: vi.fn(() => true),
+    approveRequest: vi.fn(() => "approve-1"),
+    rejectRequest: vi.fn(() => "reject-1"),
     close: vi.fn(),
     ...overrides,
   };
@@ -214,5 +217,43 @@ describe("最小群聊 TUI", () => {
     expect(screen).toContain("2 人在线");
     expect(screen).toContain("窄屏消息");
     expect(screen).toContain("Enter 发送");
+  });
+
+  it("通过 Ctrl+P 切换权限并批准待处理请求", () => {
+    const updatePermission = vi.fn(() => true);
+    const approveRequest = vi.fn(() => "approve-1");
+    const { view } = createView({ updatePermission, approveRequest });
+    view.applySnapshot(snapshot());
+    view.setConnection("connected");
+
+    view.handleInput("\x10");
+    expect(view.render(80).join("\n")).toContain("Agent 接收权限");
+    view.handleInput("\x1b[B");
+    view.handleInput("\x1b[B");
+    view.handleInput("\r");
+    expect(updatePermission).toHaveBeenCalledWith("approval");
+    expect(view.render(80).join("\n")).toContain("接收：需批准");
+
+    view.setPendingRequests([{
+      requestId: "request-1",
+      groupId: "group-a",
+      groupName: "开发组",
+      senderId: "user:client-b",
+      senderName: "Bob",
+      targetAgentId: "agent:client-a",
+      targetAgentName: "Alice-Pi",
+      ownerUserName: "Alice",
+      onlineMembers: [],
+      text: "请检查测试",
+      chainId: "request-1",
+      round: 1,
+      createdAt: new Date("2026-07-15T09:31:00+08:00").getTime(),
+    }]);
+    view.handleInput("\x10");
+    view.handleInput("\r");
+    view.handleInput("\r");
+    expect(view.render(80).join("\n")).toContain("请检查测试");
+    view.handleInput("\r");
+    expect(approveRequest).toHaveBeenCalledWith("request-1");
   });
 });

@@ -7,6 +7,7 @@ import type {
   MemberType,
   OnlineMember,
   AgentActivityStatus,
+  AgentPermission,
 } from "./types.js";
 
 export interface Envelope<T = unknown> {
@@ -28,6 +29,7 @@ export interface SnapshotPayload {
 export interface ClientHelloPayload {
   sessionId: string;
   clientId?: string;
+  permission: AgentPermission;
 }
 
 export interface ClientGoodbyePayload {
@@ -57,6 +59,14 @@ export interface AgentStatusPayload {
   status: AgentActivityStatus;
 }
 
+export interface PermissionUpdatePayload {
+  permission: AgentPermission;
+}
+
+export interface RequestDecisionPayload {
+  requestId: string;
+}
+
 export interface GroupsChangedPayload {
   groups: GroupSummary[];
 }
@@ -80,6 +90,8 @@ export interface ChatMessagePayload {
 
 export type MessageStatus =
   | "sent"
+  | "waiting_approval"
+  | "queued"
   | "processing"
   | "completed"
   | "failed"
@@ -89,6 +101,9 @@ export type MessageFailureReason =
   | "target_not_found"
   | "target_offline"
   | "target_disconnected"
+  | "target_blocked"
+  | "request_rejected"
+  | "request_invalid"
   | "agent_busy"
   | "delivery_failed"
   | "no_text"
@@ -114,6 +129,7 @@ export interface AgentRequestPayload {
   text: string;
   chainId: string;
   round: number;
+  createdAt?: number;
 }
 
 export interface AgentDeliverAckPayload {
@@ -154,6 +170,7 @@ export type ProtocolErrorCode =
   | "invalid_name"
   | "already_in_group"
   | "not_in_group"
+  | "request_invalid"
   | "database_error";
 
 export interface ErrorPayload {
@@ -183,6 +200,15 @@ export type ChatSendEnvelope = Envelope<ChatSendPayload> & {
 export type AgentStatusEnvelope = Envelope<AgentStatusPayload> & {
   type: "agent.status";
 };
+export type PermissionUpdateEnvelope = Envelope<PermissionUpdatePayload> & {
+  type: "permission.update";
+};
+export type RequestApproveEnvelope = Envelope<RequestDecisionPayload> & {
+  type: "request.approve";
+};
+export type RequestRejectEnvelope = Envelope<RequestDecisionPayload> & {
+  type: "request.reject";
+};
 export type AgentDeliverAckEnvelope = Envelope<AgentDeliverAckPayload> & {
   type: "agent.deliver.ack";
 };
@@ -198,6 +224,9 @@ export type ClientEnvelope =
   | GroupLeaveEnvelope
   | ChatSendEnvelope
   | AgentStatusEnvelope
+  | PermissionUpdateEnvelope
+  | RequestApproveEnvelope
+  | RequestRejectEnvelope
   | AgentDeliverAckEnvelope
   | AgentResultEnvelope;
 
@@ -208,6 +237,7 @@ export type BrokerEnvelope =
   | (Envelope<PresenceRemovedPayload> & { type: "presence.removed" })
   | (Envelope<ChatMessagePayload> & { type: "chat.message" })
   | (Envelope<AgentRequestPayload> & { type: "agent.deliver" })
+  | (Envelope<AgentRequestPayload> & { type: "request.pending" })
   | (Envelope<AgentResultAckPayload> & { type: "agent.result.ack" })
   | (Envelope<SendFailedPayload> & { type: "send.failed" })
   | (Envelope<ErrorPayload> & { type: "error" });
@@ -292,10 +322,13 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
     case "client.hello": {
       const result = requireStrings(value, requestId, ["sessionId"]);
       const clientId = value.payload.clientId;
-      return result.ok && clientId !== undefined &&
-        (typeof clientId !== "string" || !clientId.trim())
-        ? invalid("invalid_payload", "client.hello clientId 无效", requestId)
-        : result;
+      if (!result.ok) return result;
+      if (clientId !== undefined && (typeof clientId !== "string" || !clientId.trim())) {
+        return invalid("invalid_payload", "client.hello clientId 无效", requestId);
+      }
+      return isAgentPermission(value.payload.permission)
+        ? result
+        : invalid("invalid_payload", "client.hello permission 无效", requestId);
     }
     case "client.goodbye":
       return requireStrings(value, requestId, ["sessionId"]);
@@ -319,6 +352,13 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
       return value.payload.status === "idle" || value.payload.status === "busy"
         ? { ok: true, envelope: value as unknown as AgentStatusEnvelope }
         : invalid("invalid_payload", "agent.status status 无效", requestId);
+    case "permission.update":
+      return isAgentPermission(value.payload.permission)
+        ? { ok: true, envelope: value as unknown as PermissionUpdateEnvelope }
+        : invalid("invalid_payload", "permission.update permission 无效", requestId);
+    case "request.approve":
+    case "request.reject":
+      return requireStrings(value, requestId, ["requestId"]);
     case "agent.deliver.ack":
       return requireStrings(value, requestId, ["requestId"]);
     case "agent.result":
@@ -330,6 +370,10 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
         requestId,
       );
   }
+}
+
+function isAgentPermission(value: unknown): value is AgentPermission {
+  return value === "auto" || value === "approval" || value === "blocked";
 }
 
 function requireStrings(

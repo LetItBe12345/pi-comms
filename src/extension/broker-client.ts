@@ -5,6 +5,7 @@ import {
   JsonlDecoder,
   type BrokerEnvelope,
 } from "../protocol.js";
+import type { AgentPermission } from "../types.js";
 
 const DEFAULT_RECONNECT_INTERVAL_MS = 1_000;
 
@@ -27,6 +28,7 @@ export class BrokerClient {
   #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   #connected = false;
   #stopping = false;
+  #permission: AgentPermission = "auto";
 
   constructor(options: BrokerClientOptions) {
     this.#socketPath = options.socketPath;
@@ -40,10 +42,15 @@ export class BrokerClient {
     return this.#connected;
   }
 
-  async start(sessionId: string): Promise<boolean> {
+  async start(sessionId: string, permission: AgentPermission = "auto"): Promise<boolean> {
     this.#sessionId = sessionId;
+    this.#permission = permission;
     this.#stopping = false;
     return this.connect();
+  }
+
+  setPermission(permission: AgentPermission): void {
+    this.#permission = permission;
   }
 
   async connect(): Promise<boolean> {
@@ -119,6 +126,7 @@ export class BrokerClient {
           encodeEnvelope(
             createEnvelope("client.hello", {
               sessionId,
+              permission: this.#permission,
               ...(this.#clientId === undefined
                 ? {}
                 : { clientId: this.#clientId }),

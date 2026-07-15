@@ -15,12 +15,13 @@ import type {
   HistoryMessage,
   SnapshotPayload,
 } from "../protocol.js";
-import type { Group, GroupSummary, Member } from "../types.js";
+import type { AgentPermission, Group, GroupSummary, Member } from "../types.js";
 import { ChatView } from "../tui/chat-view.js";
 import { BrokerClient } from "./broker-client.js";
 import { RemoteQueue } from "./remote-queue.js";
 
 const STATUS_KEY = "pi-comms";
+const PERMISSION_ENTRY = "pi-comms-permission";
 const DEFAULT_RESULT_RETRY_INTERVAL_MS = 1_000;
 const DEFAULT_BROKER_START_TIMEOUT_MS = 2_000;
 
@@ -62,6 +63,8 @@ export function createCommsExtension(
     let cachedUserName = "";
     let cachedAgentName = "";
     let brokerStartTask: Promise<boolean> | undefined;
+    let permission: AgentPermission = "auto";
+    const pendingApprovals = new Map<string, AgentRequestPayload>();
 
     const brokerClient = new BrokerClient({
       socketPath,
@@ -113,6 +116,13 @@ export function createCommsExtension(
           activeView?.removeMembers(message.payload.memberIds);
           return;
         case "chat.message":
+          if (
+            message.payload.requestId !== undefined &&
+            message.payload.status !== "waiting_approval"
+          ) {
+            pendingApprovals.delete(message.payload.requestId);
+            activeView?.setPendingRequests([...pendingApprovals.values()]);
+          }
           activeView?.receiveMessage({
             ...message.payload,
             messageId: message.id,
@@ -125,10 +135,16 @@ export function createCommsExtension(
         case "agent.deliver":
           handleAgentDelivery(message.payload);
           return;
+        case "request.pending":
+          pendingApprovals.set(message.payload.requestId, message.payload);
+          activeView?.setPendingRequests([...pendingApprovals.values()]);
+          return;
         case "agent.result.ack":
           handleResultAck(message.payload);
           return;
         case "send.failed":
+          pendingApprovals.delete(message.payload.requestId);
+          activeView?.setPendingRequests([...pendingApprovals.values()]);
           activeView?.receiveFailure(message.payload);
           if (activeView === undefined) ui?.notify(`请求失败：${failureMessage(message.payload.reason)}`, "error");
           return;
@@ -213,6 +229,8 @@ export function createCommsExtension(
     }
 
     function handleAgentDelivery(request: AgentRequestPayload): void {
+      pendingApprovals.delete(request.requestId);
+      activeView?.setPendingRequests([...pendingApprovals.values()]);
       const added = remoteQueue.enqueue(request);
       brokerClient.send("agent.deliver.ack", {
         requestId: request.requestId,
@@ -291,7 +309,7 @@ export function createCommsExtension(
       if (brokerStartTask !== undefined) return brokerStartTask;
       brokerStartTask = (async () => {
         if (sessionId === undefined) return false;
-        if (await brokerClient.start(sessionId)) return true;
+        if (await brokerClient.start(sessionId, permission)) return true;
         await startBroker();
         const deadline = Date.now() + DEFAULT_BROKER_START_TIMEOUT_MS;
         while (Date.now() < deadline) {
@@ -319,6 +337,8 @@ export function createCommsExtension(
     pi.on("session_start", (_event, ctx) => {
       shuttingDown = false;
       updateContext(ctx);
+      permission = restorePermission(ctx);
+      brokerClient.setPermission(permission);
     });
 
     pi.on("session_shutdown", async (_event, ctx) => {
@@ -336,6 +356,7 @@ export function createCommsExtension(
       history = [];
       availableGroups = [];
       members.clear();
+      pendingApprovals.clear();
       commsOpen = false;
       activeView = undefined;
       ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -414,6 +435,8 @@ export function createCommsExtension(
               done,
               initialUserName: cachedUserName,
               initialAgentName: cachedAgentName,
+              initialPermission: permission,
+              initialPendingRequests: [...pendingApprovals.values()],
               actions: {
                 createGroup: (groupName, userName, agentName) =>
                   brokerClient.send("group.create", { groupName, userName, agentName }),
@@ -422,6 +445,20 @@ export function createCommsExtension(
                   return brokerClient.send("group.join", { groupId, userName, agentName });
                 },
                 sendMessage: (text) => brokerClient.send("chat.send", { text }),
+                updatePermission: (nextPermission) => {
+                  permission = nextPermission;
+                  brokerClient.setPermission(nextPermission);
+                  pi.appendEntry(PERMISSION_ENTRY, { permission: nextPermission });
+                  return brokerClient.send("permission.update", {
+                    permission: nextPermission,
+                  }) !== undefined;
+                },
+                approveRequest: (requestId) => {
+                  return brokerClient.send("request.approve", { requestId });
+                },
+                rejectRequest: (requestId) => {
+                  return brokerClient.send("request.reject", { requestId });
+                },
                 close: clearRemoteWork,
               },
             });
@@ -456,6 +493,7 @@ export function createCommsExtension(
           currentGroup = undefined;
           history = [];
           members.clear();
+          pendingApprovals.clear();
           if (resultRetryTimer !== undefined) {
             clearInterval(resultRetryTimer);
             resultRetryTimer = undefined;
@@ -498,6 +536,27 @@ export function formatAgentRequest(request: AgentRequestPayload): string {
     "",
     `你的回答会作为公开消息发送到群组「${request.groupName}」，用于回应 ${request.senderName}。请直接回答。`,
   ].join("\n");
+}
+
+function restorePermission(ctx: ExtensionContext): AgentPermission {
+  let permission: AgentPermission = "auto";
+  for (const entry of ctx.sessionManager.getBranch()) {
+    if (
+      entry.type === "custom" &&
+      entry.customType === PERMISSION_ENTRY &&
+      typeof entry.data === "object" &&
+      entry.data !== null &&
+      "permission" in entry.data &&
+      isAgentPermission(entry.data.permission)
+    ) {
+      permission = entry.data.permission;
+    }
+  }
+  return permission;
+}
+
+function isAgentPermission(value: unknown): value is AgentPermission {
+  return value === "auto" || value === "approval" || value === "blocked";
 }
 
 function registerTestCommands(
@@ -623,6 +682,12 @@ function failureMessage(reason: string): string {
     case "target_offline":
     case "target_disconnected":
       return "目标 Agent 不在线";
+    case "target_blocked":
+      return "目标 Agent 已禁止接收";
+    case "request_rejected":
+      return "目标 Agent 主人已拒绝";
+    case "request_invalid":
+      return "请求已失效";
     case "agent_busy":
       return "目标 Agent 正忙";
     case "no_text":

@@ -33,7 +33,7 @@ class TestClient {
     this.sessionId = sessionId;
     this.#socket = createConnection(socketPath);
     this.#socket.once("connect", () => {
-      this.send("client.hello", { sessionId });
+      this.send("client.hello", { sessionId, permission: "auto" });
     });
     this.#socket.on("data", (chunk) => {
       for (const result of this.#decoder.push(chunk)) {
@@ -350,6 +350,104 @@ describe("Local Broker 群组与成员", () => {
       type: "user",
     });
     expect(c.messages.some((message) => message.type === "agent.deliver")).toBe(false);
+  });
+
+  it("需要批准时不注入，批准后只投递一次", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const b = await connect();
+    await joinGroup(b, created.payload.group!.groupId);
+    b.send("permission.update", { permission: "approval" });
+    await a.waitFor(
+      "presence.changed",
+      (message) =>
+        message.payload.displayName === "Bob-Pi" &&
+        message.payload.agentPermission === "approval",
+    );
+
+    a.send("chat.send", { text: "@Bob-Pi 请审批" }, "approval-request");
+    const [message, pending] = await Promise.all([
+      a.waitFor("chat.message", (item) => item.id === "approval-request"),
+      b.waitFor("request.pending", (item) => item.payload.requestId === "approval-request"),
+    ]);
+    expect(message.payload.status).toBe("waiting_approval");
+    expect(pending.payload.text).toBe("请审批");
+    await a.waitFor(
+      "presence.changed",
+      (item) =>
+        item.payload.displayName === "Bob-Pi" &&
+        item.payload.pendingApprovalCount === 1,
+    );
+    expect(
+      b.messages.some(
+        (item) =>
+          item.type === "agent.deliver" &&
+          item.payload.requestId === "approval-request",
+      ),
+    ).toBe(false);
+
+    b.send("request.approve", { requestId: "approval-request" });
+    await b.waitFor(
+      "agent.deliver",
+      (item) => item.payload.requestId === "approval-request",
+    );
+    expect(
+      await a.waitFor(
+        "chat.message",
+        (item) => item.id === "approval-request" && item.payload.status === "queued",
+      ),
+    ).toBeDefined();
+    b.send("request.approve", { requestId: "approval-request" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(
+      b.messages.filter(
+        (item) =>
+          item.type === "agent.deliver" &&
+          item.payload.requestId === "approval-request",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("拒绝、禁止接收和失效请求返回公开原因", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const b = await connect();
+    await joinGroup(b, created.payload.group!.groupId);
+
+    b.send("permission.update", { permission: "approval" });
+    await a.waitFor(
+      "presence.changed",
+      (item) => item.payload.agentPermission === "approval",
+    );
+    a.send("chat.send", { text: "@Bob-Pi 拒绝我" }, "reject-request");
+    await b.waitFor("request.pending", (item) => item.payload.requestId === "reject-request");
+    b.send("request.reject", { requestId: "reject-request" });
+    expect(
+      await a.waitFor("send.failed", (item) => item.payload.requestId === "reject-request"),
+    ).toMatchObject({ payload: { reason: "request_rejected" } });
+    b.send("request.reject", { requestId: "reject-request" });
+
+    b.send("permission.update", { permission: "blocked" });
+    await a.waitFor(
+      "presence.changed",
+      (item) => item.payload.agentPermission === "blocked",
+    );
+    a.send("chat.send", { text: "@Bob-Pi 禁止请求" }, "blocked-request");
+    expect(
+      await a.waitFor("send.failed", (item) => item.payload.requestId === "blocked-request"),
+    ).toMatchObject({ payload: { reason: "target_blocked" } });
+
+    b.send("permission.update", { permission: "approval" });
+    await a.waitFor(
+      "presence.changed",
+      (item) => item.payload.agentPermission === "approval" && item.timestamp > 1,
+    );
+    a.send("chat.send", { text: "@Bob-Pi 等待后离线" }, "invalid-request");
+    await b.waitFor("request.pending", (item) => item.payload.requestId === "invalid-request");
+    await b.close();
+    expect(
+      await a.waitFor("send.failed", (item) => item.payload.requestId === "invalid-request"),
+    ).toMatchObject({ payload: { reason: "request_invalid" } });
   });
 
   it("@用户只公开提醒，不注入 Agent", async () => {

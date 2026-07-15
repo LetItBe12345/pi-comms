@@ -17,9 +17,10 @@ import {
   type ClientHelloEnvelope,
   type Envelope,
   type ErrorPayload,
+  type HistoryMessage,
   type SendFailedPayload,
 } from "../protocol.js";
-import type { Member } from "../types.js";
+import type { AgentPermission, Member } from "../types.js";
 import { BrokerDatabase, historyMessage } from "./database.js";
 import { GroupState, GroupStateError } from "./group-state.js";
 
@@ -64,6 +65,8 @@ interface PendingRequest {
   targetName: string;
   groupId: string;
   request: AgentRequestPayload;
+  message: HistoryMessage;
+  state: "awaiting_approval" | "delivering";
   deliveryAcknowledged: boolean;
 }
 
@@ -81,6 +84,8 @@ export function createBrokerServer(
   let groups = new GroupState();
   let database: BrokerDatabase | undefined;
   const pendingRequests = new Map<string, PendingRequest>();
+  const permissions = new Map<string, AgentPermission>();
+  const resolvedApprovalRequests = new Map<string, string>();
   const completedRequests = new Map<string, string>();
   const closedRequestIds = new Set<string>();
   const server = createServer(handleConnection);
@@ -178,8 +183,10 @@ export function createBrokerServer(
     }
 
     const clientId = session.clientId;
+    permissions.set(clientId, hello.payload.permission);
     session.socket = socket;
     clients.set(clientId, socket);
+    groups.setAgentPermission(clientId, hello.payload.permission);
     const reconnectedMembers = groups.setOnline(clientId, true);
     sendSnapshot(clientId, socket);
     if (reconnectedMembers.length > 0) {
@@ -187,6 +194,7 @@ export function createBrokerServer(
       broadcastGroupsChanged();
     }
     resendUnacknowledgedDeliveries(clientId, socket);
+    resendPendingApprovals(clientId, socket);
     return { sessionId, clientId };
   }
 
@@ -239,6 +247,7 @@ export function createBrokerServer(
       clearTimeout(session.disconnectTimer);
     }
     sessions.delete(sessionId);
+    permissions.delete(clientId);
     if (clients.get(clientId) !== socket) {
       return;
     }
@@ -268,6 +277,20 @@ export function createBrokerServer(
       if (agent !== undefined) {
         broadcastPresence([agent]);
       }
+      return;
+    }
+    if (envelope.type === "permission.update") {
+      permissions.set(clientId, envelope.payload.permission);
+      const agent = groups.setAgentPermission(clientId, envelope.payload.permission);
+      if (agent !== undefined) broadcastPresence([agent]);
+      return;
+    }
+    if (envelope.type === "request.approve") {
+      handleRequestDecision(clientId, socket, envelope.payload.requestId, true);
+      return;
+    }
+    if (envelope.type === "request.reject") {
+      handleRequestDecision(clientId, socket, envelope.payload.requestId, false);
       return;
     }
     if (envelope.type === "group.create") {
@@ -302,6 +325,7 @@ export function createBrokerServer(
         payload.agentName,
       );
       groupId = membership.groupId;
+      groups.setAgentPermission(clientId, permissions.get(clientId) ?? "auto");
       db().insertGroup({ groupId, groupName: payload.groupName });
       sendSnapshot(clientId, socket);
       broadcastGroupsChanged();
@@ -327,6 +351,7 @@ export function createBrokerServer(
         payload.userName,
         payload.agentName,
       );
+      groups.setAgentPermission(clientId, permissions.get(clientId) ?? "auto");
       sendSnapshot(clientId, socket);
       broadcastPresence([membership.user, membership.agent], clientId);
       broadcastGroupsChanged();
@@ -421,7 +446,11 @@ export function createBrokerServer(
     }
 
     const failMention = (
-      reason: "target_not_found" | "target_offline" | "delivery_failed",
+      reason:
+        | "target_not_found"
+        | "target_offline"
+        | "target_blocked"
+        | "delivery_failed",
     ): void => {
       const messagePayload: ChatMessagePayload = {
         ...basePayload,
@@ -513,6 +542,11 @@ export function createBrokerServer(
       failMention("target_offline");
       return;
     }
+    const permission = permissions.get(target.clientId) ?? "auto";
+    if (permission === "blocked") {
+      failMention("target_blocked");
+      return;
+    }
     const request: AgentRequestPayload = {
       requestId,
       groupId: group.groupId,
@@ -532,22 +566,27 @@ export function createBrokerServer(
       text: mention.text,
       chainId: requestId,
       round: 1,
+      createdAt: Date.now(),
     };
+    const awaitingApproval = permission === "approval";
     const message = createEnvelope(
       "chat.message",
-      { ...basePayload, status: "processing" as const },
+      {
+        ...basePayload,
+        status: awaitingApproval
+          ? "waiting_approval" as const
+          : "processing" as const,
+      },
       { id: requestId },
     );
+    const storedMessage = historyMessage(
+      message.id,
+      message.timestamp,
+      message.payload,
+      message.payload.status,
+    );
     try {
-      db().insertAgentRequest(
-        historyMessage(
-          message.id,
-          message.timestamp,
-          message.payload,
-          "processing",
-        ),
-        request,
-      );
+      db().insertAgentRequest(storedMessage, request, awaitingApproval);
     } catch (error) {
       sendGroupError(socket, requestId, error);
       return;
@@ -558,10 +597,17 @@ export function createBrokerServer(
       targetName: target.displayName,
       groupId: group.groupId,
       request,
+      message: storedMessage,
+      state: awaitingApproval ? "awaiting_approval" : "delivering",
       deliveryAcknowledged: false,
     });
     broadcastToGroup(group.groupId, message as BrokerEnvelope);
-    send(targetSocket, createEnvelope("agent.deliver", request) as BrokerEnvelope);
+    if (awaitingApproval) {
+      updatePendingApprovalCount(target.clientId);
+      send(targetSocket, createEnvelope("request.pending", request) as BrokerEnvelope);
+    } else {
+      send(targetSocket, createEnvelope("agent.deliver", request) as BrokerEnvelope);
+    }
   }
 
   function resendUnacknowledgedDeliveries(
@@ -571,6 +617,7 @@ export function createBrokerServer(
     for (const pending of pendingRequests.values()) {
       if (
         pending.targetClientId === targetClientId &&
+        pending.state === "delivering" &&
         !pending.deliveryAcknowledged
       ) {
         send(
@@ -579,6 +626,107 @@ export function createBrokerServer(
         );
       }
     }
+  }
+
+  function resendPendingApprovals(targetClientId: string, socket: Socket): void {
+    for (const pending of pendingRequests.values()) {
+      if (
+        pending.targetClientId === targetClientId &&
+        pending.state === "awaiting_approval"
+      ) {
+        send(socket, createEnvelope("request.pending", pending.request) as BrokerEnvelope);
+      }
+    }
+  }
+
+  function handleRequestDecision(
+    clientId: string,
+    socket: Socket,
+    requestId: string,
+    approve: boolean,
+  ): void {
+    const pending = pendingRequests.get(requestId);
+    if (pending?.targetClientId === clientId && pending.state === "delivering") {
+      return;
+    }
+    if (pending === undefined) {
+      if (resolvedApprovalRequests.get(requestId) === clientId) return;
+      sendError(socket, {
+        code: "request_invalid",
+        message: "请求已失效或不存在",
+        requestId,
+      });
+      return;
+    }
+    if (
+      pending.targetClientId !== clientId ||
+      pending.state !== "awaiting_approval"
+    ) {
+      sendError(socket, {
+        code: "request_invalid",
+        message: "不能处理其他 Agent 的请求",
+        requestId,
+      });
+      return;
+    }
+
+    if (approve) {
+      if (!db().approveRequest(requestId)) {
+        sendError(socket, {
+          code: "request_invalid",
+          message: "请求已失效",
+          requestId,
+        });
+        return;
+      }
+      pending.state = "delivering";
+      pending.message.status = "queued";
+      updatePendingApprovalCount(clientId);
+      broadcastToGroup(pending.groupId, {
+        id: pending.message.messageId,
+        type: "chat.message",
+        timestamp: pending.message.timestamp,
+        payload: pending.message,
+      });
+      const targetSocket = clients.get(clientId);
+      if (targetSocket !== undefined) {
+        send(
+          targetSocket,
+          createEnvelope("agent.deliver", pending.request) as BrokerEnvelope,
+        );
+      }
+      return;
+    }
+
+    if (!db().rejectRequest(requestId)) {
+      sendError(socket, {
+        code: "request_invalid",
+        message: "请求已失效",
+        requestId,
+      });
+      return;
+    }
+    pendingRequests.delete(requestId);
+    resolvedApprovalRequests.set(requestId, clientId);
+    closedRequestIds.add(requestId);
+    updatePendingApprovalCount(clientId);
+    broadcastFailure({
+      requestId,
+      groupId: pending.groupId,
+      targetName: pending.targetName,
+      targetAgentId: pending.targetAgentId,
+      reason: "request_rejected",
+    });
+  }
+
+  function updatePendingApprovalCount(clientId: string): void {
+    const count = [...pendingRequests.values()].filter(
+      (pending) =>
+        pending.targetClientId === clientId &&
+        pending.state === "awaiting_approval",
+    ).length;
+    const agent = groups.setPendingApprovalCount(clientId, count);
+    if (agent !== undefined) broadcastPresence([agent]);
   }
 
   function handleAgentResult(
@@ -677,7 +825,9 @@ export function createBrokerServer(
       }
       pendingRequests.delete(requestId);
       closedRequestIds.add(requestId);
-      if (!db().failRequest(requestId, reason)) {
+      const failureReason =
+        pending.state === "awaiting_approval" ? "request_invalid" : reason;
+      if (!db().failRequest(requestId, failureReason)) {
         continue;
       }
       broadcastFailure({
@@ -685,9 +835,10 @@ export function createBrokerServer(
         groupId: pending.groupId,
         targetName: pending.targetName,
         targetAgentId: pending.targetAgentId,
-        reason,
+        reason: failureReason,
       });
     }
+    updatePendingApprovalCount(targetClientId);
   }
 
   function sendSnapshot(clientId: string, socket: Socket): void {

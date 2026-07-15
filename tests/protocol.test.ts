@@ -116,7 +116,10 @@ describe("客户端消息校验", () => {
   it("接受连接握手、正常关闭和投递确认", () => {
     expect(
       parseClientEnvelope(
-        createEnvelope("client.hello", { sessionId: "session-a" }),
+        createEnvelope("client.hello", {
+          sessionId: "session-a",
+          permission: "auto",
+        }),
       ).ok,
     ).toBe(true);
     expect(
@@ -135,6 +138,12 @@ describe("客户端消息校验", () => {
     expect(
       parseClientEnvelope(createEnvelope("agent.status", { status: "unknown" })).ok,
     ).toBe(false);
+    expect(
+      parseClientEnvelope(createEnvelope("permission.update", { permission: "approval" })).ok,
+    ).toBe(true);
+    expect(
+      parseClientEnvelope(createEnvelope("request.approve", { requestId: "request-a" })).ok,
+    ).toBe(true);
   });
 
   it("接受创建、加入和离开群组", () => {

@@ -18,11 +18,12 @@ import {
 } from "@earendil-works/pi-tui";
 import type {
   ErrorPayload,
+  AgentRequestPayload,
   HistoryMessage,
   SendFailedPayload,
   SnapshotPayload,
 } from "../protocol.js";
-import type { GroupSummary, Member } from "../types.js";
+import type { AgentPermission, GroupSummary, Member } from "../types.js";
 
 type SetupStage = "user" | "agent" | "action" | "create" | "join" | "chat";
 type ConnectionState = "connecting" | "connected" | "reconnecting";
@@ -31,6 +32,9 @@ export interface ChatViewActions {
   createGroup(groupName: string, userName: string, agentName: string): string | undefined;
   joinGroup(groupId: string, userName: string, agentName: string): string | undefined;
   sendMessage(text: string): string | undefined;
+  updatePermission(permission: AgentPermission): boolean;
+  approveRequest(requestId: string): string | undefined;
+  rejectRequest(requestId: string): string | undefined;
   close(): void;
 }
 
@@ -42,6 +46,8 @@ export interface ChatViewOptions {
   actions: ChatViewActions;
   initialUserName?: string;
   initialAgentName?: string;
+  initialPermission?: AgentPermission;
+  initialPendingRequests?: AgentRequestPayload[];
 }
 
 interface PendingSetup {
@@ -75,6 +81,13 @@ export class ChatView implements Component, Focusable {
   #actionList: SelectList;
   #groupList: SelectList;
   #exitList: SelectList | undefined;
+  #permissionList: SelectList;
+  #pendingList: SelectList;
+  #decisionList: SelectList;
+  #panel: "permission" | "pending" | "decision" | undefined;
+  #permission: AgentPermission;
+  #pendingRequests: AgentRequestPayload[];
+  #selectedRequest: AgentRequestPayload | undefined;
   #pendingSetup: PendingSetup | undefined;
   #pendingMessage: { id: string; text: string } | undefined;
   #error: string | undefined;
@@ -90,6 +103,8 @@ export class ChatView implements Component, Focusable {
     this.#actions = options.actions;
     this.#userInput.setValue(options.initialUserName ?? "");
     this.#agentInput.setValue(options.initialAgentName ?? "");
+    this.#permission = options.initialPermission ?? "auto";
+    this.#pendingRequests = sortPendingRequests(options.initialPendingRequests ?? []);
 
     this.#actionList = this.#createSelectList([
       { value: "create", label: "创建群组", description: "创建并进入新群组" },
@@ -103,6 +118,9 @@ export class ChatView implements Component, Focusable {
     };
     this.#actionList.onCancel = () => this.#goBack();
     this.#groupList = this.#createGroupList();
+    this.#permissionList = this.#createPermissionList();
+    this.#pendingList = this.#createPendingList();
+    this.#decisionList = this.#createDecisionList();
 
     this.#editor = new Editor(this.#tui, {
       borderColor: (text) => this.#theme.fg("borderAccent", text),
@@ -276,9 +294,45 @@ export class ChatView implements Component, Focusable {
     }
   }
 
+  setPendingRequests(requests: AgentRequestPayload[]): void {
+    this.#pendingRequests = sortPendingRequests(requests);
+    this.#pendingList = this.#createPendingList();
+    if (
+      this.#selectedRequest !== undefined &&
+      !this.#pendingRequests.some(
+        (request) => request.requestId === this.#selectedRequest?.requestId,
+      )
+    ) {
+      this.#selectedRequest = undefined;
+      if (this.#panel === "decision") this.#panel = "pending";
+    }
+    this.#permissionList = this.#createPermissionList();
+    this.#syncFocus();
+    this.#tui.requestRender();
+  }
+
+  setPermission(permission: AgentPermission): void {
+    this.#permission = permission;
+    this.#permissionList = this.#createPermissionList();
+    this.#tui.requestRender();
+  }
+
   handleInput(data: string): void {
     if (this.#exitList !== undefined) {
       this.#exitList.handleInput(data);
+      this.#tui.requestRender();
+      return;
+    }
+    if (this.#panel !== undefined) {
+      if (matchesKey(data, Key.escape)) this.#closePanel();
+      else this.#activePanel()?.handleInput(data);
+      this.#tui.requestRender();
+      return;
+    }
+    if (this.#stage === "chat" && matchesKey(data, "ctrl+p")) {
+      this.#panel = "permission";
+      this.#permissionList = this.#createPermissionList();
+      this.#syncFocus();
       this.#tui.requestRender();
       return;
     }
@@ -309,10 +363,14 @@ export class ChatView implements Component, Focusable {
     this.#editor.invalidate();
     this.#actionList.invalidate();
     this.#groupList.invalidate();
+    this.#permissionList.invalidate();
+    this.#pendingList.invalidate();
+    this.#decisionList.invalidate();
   }
 
   render(width: number): string[] {
     if (this.#exitList !== undefined) return this.#renderExit(width);
+    if (this.#panel !== undefined) return this.#renderPanel(width);
     if (this.#stage !== "chat") return this.#renderSetup(width);
     return this.#renderChat(width);
   }
@@ -322,6 +380,7 @@ export class ChatView implements Component, Focusable {
   }
 
   #activeInput(): Component & Partial<Focusable> | undefined {
+    if (this.#panel !== undefined) return this.#activePanel();
     switch (this.#stage) {
       case "user": return this.#userInput;
       case "agent": return this.#agentInput;
@@ -333,7 +392,12 @@ export class ChatView implements Component, Focusable {
   }
 
   #syncFocus(): void {
-    for (const input of [this.#userInput, this.#agentInput, this.#groupInput, this.#editor]) {
+    for (const input of [
+      this.#userInput,
+      this.#agentInput,
+      this.#groupInput,
+      this.#editor,
+    ]) {
       input.focused = false;
     }
     const active = this.#activeInput();
@@ -443,7 +507,7 @@ export class ChatView implements Component, Focusable {
     const header = this.#renderHeader(width);
     const editor = this.#editor.render(width);
     const hint = truncateToWidth(
-      this.#theme.fg("dim", "Enter 发送 · Shift+Enter 换行 · Ctrl+PageUp/PageDown 滚动 · Esc 退出"),
+      this.#theme.fg("dim", "Enter 发送 · Shift+Enter 换行 · Ctrl+P 权限 · Ctrl+PageUp/PageDown 滚动 · Esc 退出"),
       width,
     );
     const status = this.#error === undefined ? [] : [truncateToWidth(this.#theme.fg("warning", this.#error), width)];
@@ -464,7 +528,14 @@ export class ChatView implements Component, Focusable {
       this.#connection === "connected" ? this.#theme.fg("success", "● 已连接") :
       this.#connection === "reconnecting" ? this.#theme.fg("warning", "● 正在重连") :
       this.#theme.fg("warning", "● 正在连接");
-    const first = truncateToWidth(`${this.#theme.bold(`群组：${group}`)}  ${state}`, width);
+    const permission = permissionLabel(this.#permission);
+    const pending = this.#pendingRequests.length > 0
+      ? ` · 待批准：${this.#pendingRequests.length}`
+      : "";
+    const first = truncateToWidth(
+      `${this.#theme.bold(`群组：${group}`)}  ${state}  接收：${permission}${pending}`,
+      width,
+    );
     const online = [...this.#members.values()].filter((member) => member.online);
     const busy = online.filter((member) => member.type === "agent" && member.agentStatus === "busy").length;
     if (width < 80) {
@@ -520,8 +591,143 @@ export class ChatView implements Component, Focusable {
     ].map((line) => truncateToWidth(line, width));
   }
 
+  #renderPanel(width: number): string[] {
+    const title =
+      this.#panel === "permission" ? "Agent 接收权限" :
+      this.#panel === "pending" ? "待批准请求" : "处理请求";
+    const lines = [this.#theme.bold(title), ""];
+    if (this.#panel === "pending" && this.#pendingRequests.length === 0) {
+      lines.push(this.#theme.fg("muted", "暂无待批准请求"));
+    } else if (this.#panel === "decision" && this.#selectedRequest !== undefined) {
+      const request = this.#selectedRequest;
+      lines.push(
+        this.#theme.fg(
+          "muted",
+          `来自：${request.senderName}  ${formatTime(request.createdAt ?? Date.now())}`,
+        ),
+        ...request.text.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", width)),
+        "",
+        ...this.#decisionList.render(width),
+      );
+    } else {
+      lines.push(...(this.#activePanel()?.render(width) ?? []));
+    }
+    if (this.#error !== undefined) {
+      lines.push("", this.#theme.fg("warning", this.#error));
+    }
+    lines.push("", this.#theme.fg("dim", "Enter 确认 · Esc 返回"));
+    return lines.map((line) => truncateToWidth(line, width));
+  }
+
+  #activePanel(): SelectList | undefined {
+    if (this.#panel === "permission") return this.#permissionList;
+    if (this.#panel === "pending") return this.#pendingList;
+    if (this.#panel === "decision") return this.#decisionList;
+    return undefined;
+  }
+
+  #closePanel(): void {
+    if (this.#panel === "decision") this.#panel = "pending";
+    else if (this.#panel === "pending") this.#panel = "permission";
+    else this.#panel = undefined;
+    this.#error = undefined;
+    this.#syncFocus();
+  }
+
   #createSelectList(items: SelectItem[]): SelectList {
     return new SelectList(items, 8, this.#selectTheme());
+  }
+
+  #createPermissionList(): SelectList {
+    const current = "（当前）";
+    const list = this.#createSelectList([
+      {
+        value: "pending",
+        label: `待批准请求（${this.#pendingRequests.length}）`,
+        description: "逐条查看、批准或拒绝",
+      },
+      {
+        value: "auto",
+        label: `自动接收${this.#permission === "auto" ? current : ""}`,
+        description: "@Agent 后立即进入队列",
+      },
+      {
+        value: "approval",
+        label: `需要批准${this.#permission === "approval" ? current : ""}`,
+        description: "批准后才进入队列",
+      },
+      {
+        value: "blocked",
+        label: `禁止接收${this.#permission === "blocked" ? current : ""}`,
+        description: "拒绝新的 @Agent 请求",
+      },
+    ]);
+    list.onSelect = (item) => {
+      if (item.value === "pending") {
+        this.#panel = "pending";
+      } else {
+        const permission = item.value as AgentPermission;
+        this.#permission = permission;
+        const synced = this.#actions.updatePermission(permission);
+        this.#panel = undefined;
+        this.#error = synced ? undefined : "权限已保存，等待同步";
+      }
+      this.#syncFocus();
+      this.#tui.requestRender();
+    };
+    list.onCancel = () => this.#closePanel();
+    return list;
+  }
+
+  #createPendingList(): SelectList {
+    const list = this.#createSelectList(
+      this.#pendingRequests.map((request) => ({
+        value: request.requestId,
+        label: `${request.senderName}  ${formatTime(request.createdAt ?? Date.now())}`,
+        description: request.text.replace(/\s+/g, " "),
+      })),
+    );
+    list.onSelect = (item) => {
+      this.#selectedRequest = this.#pendingRequests.find(
+        (request) => request.requestId === item.value,
+      );
+      if (this.#selectedRequest !== undefined) this.#panel = "decision";
+      this.#syncFocus();
+      this.#tui.requestRender();
+    };
+    list.onCancel = () => this.#closePanel();
+    return list;
+  }
+
+  #createDecisionList(): SelectList {
+    const list = this.#createSelectList([
+      { value: "approve", label: "批准", description: "进入 Agent 处理队列" },
+      { value: "reject", label: "拒绝", description: "公开显示已拒绝" },
+      { value: "back", label: "返回", description: "暂不处理" },
+    ]);
+    list.onSelect = (item) => {
+      if (item.value === "back") {
+        this.#closePanel();
+        return;
+      }
+      const request = this.#selectedRequest;
+      if (request === undefined) return;
+      const id = item.value === "approve"
+        ? this.#actions.approveRequest(request.requestId)
+        : this.#actions.rejectRequest(request.requestId);
+      if (id === undefined) {
+        this.#error = "Broker 未连接，操作尚未发送";
+        this.#tui.requestRender();
+        return;
+      }
+      this.#selectedRequest = undefined;
+      this.#panel = "pending";
+      this.#error = undefined;
+      this.#syncFocus();
+      this.#tui.requestRender();
+    };
+    list.onCancel = () => this.#closePanel();
+    return list;
   }
 
   #createGroupList(): SelectList {
@@ -605,6 +811,12 @@ function sortGroups(groups: GroupSummary[]): GroupSummary[] {
   );
 }
 
+function sortPendingRequests(requests: AgentRequestPayload[]): AgentRequestPayload[] {
+  return [...requests].sort(
+    (a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0),
+  );
+}
+
 function sortedMembers(members: Member[], clientId?: string): Member[] {
   return [...members].sort((a, b) => {
     const own = Number(b.clientId === clientId) - Number(a.clientId === clientId);
@@ -616,8 +828,25 @@ function sortedMembers(members: Member[], clientId?: string): Member[] {
 
 function memberLabel(member: Member, clientId?: string): string {
   const own = member.clientId === clientId && member.type === "user" ? "（我）" : "";
-  const agent = member.type === "agent" ? ` [Agent·${member.online ? member.agentStatus === "busy" ? "忙碌" : "空闲" : "离线"}]` : "";
+  const activity = member.online
+    ? member.agentStatus === "busy" ? "忙碌" : "空闲"
+    : "离线";
+  const permission = member.agentPermission === undefined
+    ? ""
+    : `·${permissionLabel(member.agentPermission)}`;
+  const pending = (member.pendingApprovalCount ?? 0) > 0
+    ? `·待批准 ${member.pendingApprovalCount}`
+    : "";
+  const agent = member.type === "agent"
+    ? ` [Agent·${activity}${permission}${pending}]`
+    : "";
   return `${member.displayName}${own}${agent}`;
+}
+
+function permissionLabel(permission: AgentPermission): string {
+  if (permission === "approval") return "需批准";
+  if (permission === "blocked") return "禁止接收";
+  return "自动";
 }
 
 function dedupeMessages(messages: HistoryMessage[]): HistoryMessage[] {
@@ -645,6 +874,8 @@ function formatTime(timestamp: number): string {
 }
 
 function messageState(message: HistoryMessage): string | undefined {
+  if (message.status === "waiting_approval") return "等待目标批准";
+  if (message.status === "queued") return "排队处理中…";
   if (message.status === "processing") return "处理中…";
   if (message.status === "completed") return "已完成";
   if (message.status === "interrupted") return "已中断";
@@ -657,6 +888,9 @@ function failureText(reason?: string): string {
     case "target_not_found": return "找不到目标";
     case "target_offline":
     case "target_disconnected": return "目标 Agent 不在线";
+    case "target_blocked": return "目标 Agent 已禁止接收";
+    case "request_rejected": return "目标 Agent 主人已拒绝";
+    case "request_invalid": return "请求已失效";
     case "agent_busy": return "目标 Agent 正忙";
     case "no_text": return "Agent 未产生文本回答";
     case "broker_restarted": return "Broker 已重启";

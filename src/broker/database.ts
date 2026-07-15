@@ -12,11 +12,15 @@ import type {
 import type { Group } from "../types.js";
 
 export type AgentRequestStatus =
+  | "awaiting_approval"
   | "pending"
   | "delivered"
   | "completed"
   | "failed"
-  | "interrupted";
+  | "interrupted"
+  | "rejected"
+  | "blocked"
+  | "invalid";
 
 export interface FailedAgentRequest {
   requestId: string;
@@ -109,6 +113,7 @@ export class BrokerDatabase {
   insertAgentRequest(
     message: HistoryMessage,
     request: AgentRequestPayload,
+    awaitingApproval = false,
   ): void {
     this.#db.transaction(() => {
       this.#insertMessage(message);
@@ -118,7 +123,7 @@ export class BrokerDatabase {
              request_id, group_id, message_id, sender_id, sender_name,
              target_agent_id, target_agent_name, owner_user_name,
              online_members, text, chain_id, round, status, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           request.requestId,
@@ -133,6 +138,7 @@ export class BrokerDatabase {
           request.text,
           request.chainId,
           request.round,
+          awaitingApproval ? "awaiting_approval" : "pending",
           message.timestamp,
           message.timestamp,
         );
@@ -143,6 +149,10 @@ export class BrokerDatabase {
     message: HistoryMessage,
     request: FailedAgentRequest,
   ): void {
+    const status =
+      request.failureReason === "target_blocked" ? "blocked" :
+      request.failureReason === "request_rejected" ? "rejected" :
+      request.failureReason === "request_invalid" ? "invalid" : "failed";
     this.#db.transaction(() => {
       this.#insertMessage(message);
       this.#db
@@ -152,7 +162,7 @@ export class BrokerDatabase {
              target_agent_id, target_agent_name, owner_user_name,
              online_members, text, chain_id, round, status, failure_reason,
              created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, 'failed', ?, ?, ?)`,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           request.requestId,
@@ -166,6 +176,7 @@ export class BrokerDatabase {
           request.text,
           request.chainId,
           request.round,
+          status,
           request.failureReason,
           message.timestamp,
           message.timestamp,
@@ -181,6 +192,32 @@ export class BrokerDatabase {
          WHERE request_id = ? AND status = 'pending'`,
       )
       .run(Date.now(), requestId);
+  }
+
+  approveRequest(requestId: string): boolean {
+    return this.#db.transaction(() => {
+      const changed = this.#db
+        .prepare(
+          `UPDATE agent_requests
+           SET status = 'pending', updated_at = ?
+           WHERE request_id = ? AND status = 'awaiting_approval'`,
+        )
+        .run(Date.now(), requestId);
+      if (changed.changes !== 1) return false;
+      this.#db
+        .prepare(
+          `UPDATE messages SET status = 'queued'
+           WHERE request_id = ? AND kind IS NULL`,
+        )
+        .run(requestId);
+      return true;
+    })();
+  }
+
+  rejectRequest(requestId: string): boolean {
+    return this.#finishRequest(requestId, "rejected", "request_rejected", [
+      "awaiting_approval",
+    ]);
   }
 
   completeRequest(requestId: string, answer: HistoryMessage): void {
@@ -208,17 +245,33 @@ export class BrokerDatabase {
     requestId: string,
     reason: MessageFailureReason | AgentFailureReason,
   ): boolean {
+    const status =
+      reason === "target_blocked" ? "blocked" :
+      reason === "request_rejected" ? "rejected" :
+      reason === "request_invalid" ? "invalid" : "failed";
+    return this.#finishRequest(requestId, status, reason, [
+      "awaiting_approval",
+      "pending",
+      "delivered",
+    ]);
+  }
+
+  #finishRequest(
+    requestId: string,
+    status: AgentRequestStatus,
+    reason: MessageFailureReason | AgentFailureReason,
+    from: AgentRequestStatus[],
+  ): boolean {
     return this.#db.transaction(() => {
+      const placeholders = from.map(() => "?").join(", ");
       const changed = this.#db
         .prepare(
           `UPDATE agent_requests
-           SET status = 'failed', failure_reason = ?, updated_at = ?
-           WHERE request_id = ? AND status IN ('pending', 'delivered')`,
+           SET status = ?, failure_reason = ?, updated_at = ?
+           WHERE request_id = ? AND status IN (${placeholders})`,
         )
-        .run(reason, Date.now(), requestId);
-      if (changed.changes !== 1) {
-        return false;
-      }
+        .run(status, reason, Date.now(), requestId, ...from);
+      if (changed.changes !== 1) return false;
       this.#db
         .prepare(
           `UPDATE messages
@@ -292,6 +345,23 @@ export class BrokerDatabase {
       this.#db
         .prepare(
           `UPDATE messages
+           SET status = 'failed', failure_reason = 'request_invalid'
+           WHERE request_id IN (
+             SELECT request_id FROM agent_requests
+             WHERE status = 'awaiting_approval'
+           ) AND kind IS NULL`,
+        )
+        .run();
+      this.#db
+        .prepare(
+          `UPDATE agent_requests
+           SET status = 'invalid', failure_reason = 'request_invalid', updated_at = ?
+           WHERE status = 'awaiting_approval'`,
+        )
+        .run(Date.now());
+      this.#db
+        .prepare(
+          `UPDATE messages
            SET status = 'interrupted', failure_reason = 'broker_restarted'
            WHERE request_id IN (
              SELECT request_id FROM agent_requests
@@ -311,10 +381,67 @@ export class BrokerDatabase {
 
   #migrate(): void {
     const version = this.#db.pragma("user_version", { simple: true }) as number;
-    if (version > 1) {
+    if (version > 2) {
       throw new Error(`数据库版本不受支持：${version}`);
     }
+    if (version === 2) {
+      return;
+    }
     if (version === 1) {
+      this.#db.pragma("foreign_keys = OFF");
+      this.#db.exec(`
+        BEGIN;
+        ALTER TABLE messages RENAME TO messages_v1;
+        ALTER TABLE agent_requests RENAME TO agent_requests_v1;
+
+        CREATE TABLE messages (
+          message_id TEXT PRIMARY KEY,
+          group_id TEXT NOT NULL REFERENCES groups(group_id),
+          sender_id TEXT NOT NULL,
+          sender_name TEXT NOT NULL,
+          sender_type TEXT NOT NULL CHECK (sender_type IN ('user', 'agent')),
+          text TEXT NOT NULL,
+          mention_ids TEXT NOT NULL,
+          timestamp INTEGER NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('sent', 'waiting_approval', 'queued', 'processing', 'completed', 'failed', 'interrupted')),
+          request_id TEXT,
+          chain_id TEXT,
+          round INTEGER,
+          failure_reason TEXT,
+          kind TEXT CHECK (kind IS NULL OR kind = 'agent')
+        );
+
+        CREATE TABLE agent_requests (
+          request_id TEXT PRIMARY KEY,
+          group_id TEXT NOT NULL REFERENCES groups(group_id),
+          message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id),
+          sender_id TEXT NOT NULL,
+          sender_name TEXT NOT NULL,
+          target_agent_id TEXT,
+          target_agent_name TEXT NOT NULL,
+          owner_user_name TEXT,
+          online_members TEXT NOT NULL,
+          text TEXT NOT NULL,
+          chain_id TEXT NOT NULL,
+          round INTEGER NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('awaiting_approval', 'pending', 'delivered', 'completed', 'failed', 'interrupted', 'rejected', 'blocked', 'invalid')),
+          result_text TEXT,
+          failure_reason TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+
+        INSERT INTO messages SELECT * FROM messages_v1;
+        INSERT INTO agent_requests SELECT * FROM agent_requests_v1;
+        DROP TABLE agent_requests_v1;
+        DROP TABLE messages_v1;
+        CREATE INDEX messages_group_time_idx ON messages(group_id, timestamp DESC);
+        CREATE INDEX agent_requests_group_status_idx ON agent_requests(group_id, status, updated_at DESC);
+        CREATE INDEX agent_requests_chain_round_idx ON agent_requests(chain_id, round);
+        PRAGMA user_version = 2;
+        COMMIT;
+      `);
+      this.#db.pragma("foreign_keys = ON");
       return;
     }
     this.#db.exec(`
@@ -335,7 +462,7 @@ export class BrokerDatabase {
         text TEXT NOT NULL,
         mention_ids TEXT NOT NULL,
         timestamp INTEGER NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('sent', 'processing', 'completed', 'failed', 'interrupted')),
+        status TEXT NOT NULL CHECK (status IN ('sent', 'waiting_approval', 'queued', 'processing', 'completed', 'failed', 'interrupted')),
         request_id TEXT,
         chain_id TEXT,
         round INTEGER,
@@ -356,7 +483,7 @@ export class BrokerDatabase {
         text TEXT NOT NULL,
         chain_id TEXT NOT NULL,
         round INTEGER NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'completed', 'failed', 'interrupted')),
+        status TEXT NOT NULL CHECK (status IN ('awaiting_approval', 'pending', 'delivered', 'completed', 'failed', 'interrupted', 'rejected', 'blocked', 'invalid')),
         result_text TEXT,
         failure_reason TEXT,
         created_at INTEGER NOT NULL,
@@ -369,7 +496,7 @@ export class BrokerDatabase {
         ON agent_requests(group_id, status, updated_at DESC);
       CREATE INDEX agent_requests_chain_round_idx
         ON agent_requests(chain_id, round);
-      PRAGMA user_version = 1;
+      PRAGMA user_version = 2;
       COMMIT;
     `);
   }
