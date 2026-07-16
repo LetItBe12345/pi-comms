@@ -101,7 +101,6 @@ export class ChatView implements Component, Focusable {
   #pendingMessage: { id: string; text: string } | undefined;
   #error: string | undefined;
   #focused = false;
-  #scrollFromBottom = 0;
   #noticeCounter = 0;
 
   constructor(options: ChatViewOptions) {
@@ -212,7 +211,6 @@ export class ChatView implements Component, Focusable {
       this.#stage = "chat";
       this.#pendingSetup = undefined;
       this.#error = undefined;
-      this.#scrollFromBottom = 0;
       this.#editor.setAutocompleteProvider(this.#memberAutocomplete());
     }
     this.#syncFocus();
@@ -264,7 +262,6 @@ export class ChatView implements Component, Focusable {
       this.#editor.disableSubmit = this.#connection !== "connected";
       this.#error = undefined;
     }
-    if (this.#scrollFromBottom === 0) this.#scrollFromBottom = 0;
     this.#tui.requestRender();
   }
 
@@ -381,18 +378,6 @@ export class ChatView implements Component, Focusable {
       this.#panel = "permission";
       this.#permissionList = this.#createPermissionList();
       this.#syncFocus();
-      this.#tui.requestRender();
-      return;
-    }
-    if (
-      this.#stage === "chat" &&
-      (matchesKey(data, "ctrl+pageUp") || matchesKey(data, "ctrl+pageDown"))
-    ) {
-      const page = Math.max(3, Math.floor(this.#tui.terminal.rows / 2));
-      this.#scrollFromBottom = Math.max(
-        0,
-        this.#scrollFromBottom + (matchesKey(data, "ctrl+pageUp") ? page : -page),
-      );
       this.#tui.requestRender();
       return;
     }
@@ -555,47 +540,43 @@ export class ChatView implements Component, Focusable {
 
   #renderChat(width: number): string[] {
     const header = this.#renderHeader(width);
+    const timeline = this.#renderTimeline(width);
+    const status = this.#renderStatus(width);
     const editor = this.#editor.render(width);
     const hint = truncateToWidth(
-      this.#theme.fg("dim", "Enter 发送 · Shift+Enter 换行 · Ctrl+P 控制 · Ctrl+PageUp/PageDown 滚动 · Esc 退出"),
+      this.#theme.fg("dim", "Enter 发送 · Shift+Enter 换行 · Ctrl+P 控制 · Esc 退出"),
       width,
     );
-    const status = this.#error === undefined ? [] : [truncateToWidth(this.#theme.fg("warning", this.#error), width)];
-    const available = Math.max(1, this.#tui.terminal.rows - header.length - editor.length - status.length - 2);
-    const timeline = this.#renderTimeline(width);
-    const maxOffset = Math.max(0, timeline.length - available);
-    this.#scrollFromBottom = Math.min(this.#scrollFromBottom, maxOffset);
-    const end = timeline.length - this.#scrollFromBottom;
-    const start = Math.max(0, end - available);
-    const messages = timeline.slice(start, end);
-    while (messages.length < available) messages.unshift("");
-    return [...header, ...messages, ...status, ...editor, hint];
+    const error = this.#error === undefined
+      ? []
+      : [truncateToWidth(this.#theme.fg("warning", this.#error), width)];
+    return [...header, "", ...timeline, ...status, ...error, ...editor, hint];
   }
 
   #renderHeader(width: number): string[] {
     const group = this.#snapshot?.group?.groupName ?? "未加入群组";
+    return [truncateToWidth(this.#theme.bold(this.#theme.fg("accent", `Pi Comms · ${group}`)), width)];
+  }
+
+  #renderStatus(width: number): string[] {
     const state =
       this.#connection === "connected" ? this.#theme.fg("success", "● 已连接") :
       this.#connection === "reconnecting" ? this.#theme.fg("warning", "● 正在重连") :
       this.#theme.fg("warning", "● 正在连接");
-    const permission = permissionLabel(this.#permission);
-    const pending = this.#pendingRequests.length > 0
-      ? ` · 待批准：${this.#pendingRequests.length}`
-      : "";
-    const chains = this.#pausedChains.length > 0
-      ? ` · 待决定：${this.#pausedChains.length}`
-      : "";
-    const first = truncateToWidth(
-      `${this.#theme.bold(`群组：${group}`)}  ${state}  接收：${permission}${pending}${chains}`,
-      width,
-    );
     const online = [...this.#members.values()].filter((member) => member.online);
+    const sessions = new Set(online.map((member) => member.clientId)).size;
     const busy = online.filter((member) => member.type === "agent" && member.agentStatus === "busy").length;
-    if (width < 80) {
-      return [first, truncateToWidth(this.#theme.fg("muted", `${Math.floor(online.length / 2)} 人在线 · ${busy} 个 Agent 忙碌`), width)];
+    const pending = this.#pendingRequests.length > 0 ? ` · 待批准：${this.#pendingRequests.length}` : "";
+    const chains = this.#pausedChains.length > 0 ? ` · 待决定：${this.#pausedChains.length}` : "";
+    const first = `${state} · ${sessions} 人在线 · ${busy} 个 Agent 忙碌 · 接收：${permissionLabel(this.#permission)}${pending}${chains}`;
+    const lines = [truncateToWidth(this.#theme.fg("muted", first), width)];
+    if (width >= 80) {
+      const members = sortedMembers(online, this.#snapshot?.clientId)
+        .map((member) => memberLabel(member, this.#snapshot?.clientId))
+        .join("、");
+      lines.push(...wrapTextWithAnsi(this.#theme.fg("dim", `成员：${members || "暂无"}`), width));
     }
-    const members = sortedMembers(online, this.#snapshot?.clientId).map((member) => memberLabel(member, this.#snapshot?.clientId)).join("、");
-    return [first, ...wrapTextWithAnsi(this.#theme.fg("muted", `成员：${members || "暂无"}`), width)];
+    return ["", ...lines];
   }
 
   #renderTimeline(width: number): string[] {
@@ -605,36 +586,59 @@ export class ChatView implements Component, Focusable {
     ].sort((a, b) => a.timestamp - b.timestamp);
     const result: string[] = [];
     let currentDate = "";
+    let previousMessage: HistoryMessage | undefined;
     for (const entry of entries) {
       const date = formatDate(entry.timestamp);
       if (date !== currentDate) {
         currentDate = date;
+        previousMessage = undefined;
         result.push(centerLine(` ${date} `, width, "─", (text) => this.#theme.fg("dim", text)));
       }
       if (entry.entryType === "notice") {
         result.push(centerLine(` ${entry.text} `, width, " ", (text) => this.#theme.fg("dim", text)), "");
+        previousMessage = undefined;
         continue;
       }
-      result.push(...this.#renderMessage(entry, width), "");
+      const showHeader =
+        previousMessage === undefined ||
+        previousMessage.senderId !== entry.senderId ||
+        entry.timestamp - previousMessage.timestamp > 2 * 60 * 1000;
+      result.push(...this.#renderMessage(entry, width, showHeader), "");
+      previousMessage = entry;
     }
     if (result.length === 0) result.push(this.#theme.fg("dim", "还没有消息，发一条试试。"));
     return result;
   }
 
-  #renderMessage(message: HistoryMessage, width: number): string[] {
+  #renderMessage(message: HistoryMessage, width: number, showHeader: boolean): string[] {
     const own = message.senderId === this.#ownMember("user")?.memberId;
-    const blockWidth = Math.max(12, Math.min(width, Math.floor(width * (width < 60 ? 0.95 : 0.7))));
+    const blockWidth = messageBlockWidth(width, message.senderType);
     const role = message.senderType === "agent"
       ? ` [Agent${message.round === undefined ? "" : ` · 第 ${message.round} 轮`}]`
       : "";
-    const label = `${message.senderName}${role}  ${formatTime(message.timestamp)}`;
-    const body = message.text.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", blockWidth));
+    const sender = own ? "你" : message.senderName;
+    const label = `${sender}${role}  ${formatTime(message.timestamp)}`;
+    const lines: string[] = [];
+    if (showHeader) {
+      lines.push(this.#theme.fg(message.senderType === "agent" ? "accent" : "muted", label));
+    }
+    lines.push(...wrapTextWithAnsi(message.text, blockWidth));
     const state = messageState(message);
     const route = routeState(message);
-    const lines = [this.#theme.fg(message.senderType === "agent" ? "accent" : "muted", label), ...body];
-    if (state !== undefined) lines.push(this.#theme.fg(message.status === "failed" ? "error" : "warning", state));
-    if (route !== undefined) lines.push(this.#theme.fg(message.routeStatus === "failed" ? "error" : "warning", route));
-    return lines.map((line) => own ? truncateToWidth(line, width) : alignRight(line, width));
+    if (state !== undefined) {
+      lines.push(...wrapTextWithAnsi(
+        this.#theme.fg(message.status === "failed" ? "error" : "warning", state),
+        blockWidth,
+      ));
+    }
+    if (route !== undefined) {
+      lines.push(...wrapTextWithAnsi(
+        this.#theme.fg(message.routeStatus === "failed" ? "error" : "warning", route),
+        blockWidth,
+      ));
+    }
+    const clipped = lines.map((line) => truncateToWidth(line, blockWidth));
+    return own ? alignBlockRight(clipped, width) : clipped;
   }
 
   #renderExit(width: number): string[] {
@@ -987,9 +991,18 @@ function dedupeMessages(messages: HistoryMessage[]): HistoryMessage[] {
   return [...new Map(messages.map((message) => [message.messageId, { ...message }])).values()];
 }
 
-function alignRight(text: string, width: number): string {
-  const clipped = truncateToWidth(text, width);
-  return `${" ".repeat(Math.max(0, width - visibleWidth(clipped)))}${clipped}`;
+function messageBlockWidth(width: number, senderType: HistoryMessage["senderType"]): number {
+  const ratio = width < 60 ? 0.94 : senderType === "agent" ? 0.85 : 0.7;
+  return Math.min(width, Math.max(12, Math.floor(width * ratio)));
+}
+
+function alignBlockRight(lines: string[], width: number): string[] {
+  const contentWidth = Math.min(
+    width,
+    Math.max(1, ...lines.map((line) => visibleWidth(line))),
+  );
+  const indent = " ".repeat(Math.max(0, width - contentWidth));
+  return lines.map((line) => `${indent}${truncateToWidth(line, contentWidth)}`);
 }
 
 function centerLine(text: string, width: number, fill: string, style: (text: string) => string): string {
