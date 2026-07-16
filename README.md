@@ -90,3 +90,4 @@ npm run broker
 - [发布](./RELEASE.md)
 - [任务总览](./TODO/README.md)
 - [MVP 验收记录](./docs/mvp-acceptance.md)
+- [三 Session 视频 Demo](./docs/demo/README.md)
