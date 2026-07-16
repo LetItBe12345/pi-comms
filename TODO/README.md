@@ -25,10 +25,15 @@
 | 9 | [Agent 对 Agent](./done/09-agent-to-agent.md) | 支持每 10 轮由用户决定是否继续 | done | 阶段 8 |
 | 10 | [测试与验收](./done/10-testing-acceptance.md) | 满足 MVP 完成定义 | done | 阶段 9 |
 | 11 | [聊天时间线与消息布局](./done/11-chat-timeline-layout.md) | 使用完整追加式时间线和标准聊天布局 | done | 阶段 10 |
+| 12 | [跨平台 TCP 传输](./in-progress/12-cross-platform-tcp.md) | 统一三平台通信入口 | in-progress | 阶段 11 |
+| 13 | [跨设备身份与连接可靠性](./in-progress/13-device-identity-reliability.md) | 解决跨设备身份冲突和失联 | in-progress | 阶段 12 |
+| 14 | [局域网 Broker 生命周期与准入](./in-progress/14-lan-broker-lifecycle.md) | 保证单 Broker 并限制接入 | in-progress | 阶段 13 |
+| 15 | [mDNS 自动发现与 Broker 选择](./in-progress/15-mdns-discovery-tui.md) | 自动列出并选择局域网 Broker | in-progress | 阶段 14 |
+| 16 | [跨平台测试与局域网验收](./in-progress/16-cross-platform-acceptance.md) | 验证三平台和三设备链路 | in-progress | 阶段 15 |
 
 ## 当前里程碑
 
-阶段 0～11 已完成。
+阶段 0～11 已完成。阶段 12～16 待实施，当前先执行阶段 12。
 
 ## 维护规则
 
