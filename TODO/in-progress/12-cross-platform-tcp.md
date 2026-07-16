@@ -14,6 +14,20 @@
 - 不引入 HTTP、WebSocket、WebRTC 或新的消息中间件。
 - 测试默认使用系统分配的临时端口，避免固定端口冲突。
 
+## 实施决策
+
+- 正式本机端点固定为 `127.0.0.1:43127`；阶段 12 只正式支持 IPv4。
+- 使用 `broker.probe` / `broker.ready` 完成无副作用握手，只接受 `service: pi-comms` 且 `protocolVersion: 1`。
+- 单 Broker 约束绑定数据目录；使用 `open(..., "wx")` 数据库级原子锁。
+- 兼容 Broker 已存在时复用并正常退出；无关服务占用端口或协议不兼容时明确失败，不自动换端口。
+- TCP 建连、协议握手和首次启动总超时分别为 1 秒、1.5 秒和 8 秒；keepalive 初始延迟为 10 秒。
+- `BrokerClient` 提供 `setEndpoint()`，端点变化时清理旧连接和重连计时器，再连接新端点。
+- 旧 Unix Broker 通过 `npm run broker:migrate` 显式迁移；未迁移时禁止新旧 Broker 同时访问同一数据库。
+- 指定局域网 IP 或 `0.0.0.0` 仅作为开发测试能力，并提示当前没有局域网准入控制。
+- 不增加第三方运行时依赖；跨平台 CI 矩阵留到阶段 16。
+- 必须覆盖独立进程并发启动，并完成两个真实 Pi Session 的 TCP 联调。
+- 全部开发在 `agent/todo-12-cross-platform-tcp` 分支完成；通过验收前 Draft PR 不得合入 `main`。
+
 ## 任务
 
 ### 统一端点模型
