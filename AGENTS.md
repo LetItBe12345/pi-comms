@@ -43,7 +43,23 @@
 - 不过度考虑安全问题。
 - 不考虑几乎碰不到的边界条件。
 
-## 5. Pi Extension 开发参考速查
+## 5. CI/CD 与发布规则
+
+- 普通 PR、合并和推送只运行 CI，绝不自动创建 GitHub Release。
+- Release 使用单独的 `release.yml`，只允许通过 `workflow_dispatch` 手动触发。
+- 触发时必须提供版本号，并输入确认词 `RELEASE`；确认词不完全一致就停止。
+- 用户明确说出 `RELEASE vX.Y.Z`，才代表授权创建对应 Tag 和 GitHub Release。只说“提交”“推送”或“合并”不代表发布。
+- 发布前必须确认：当前代码来自 `main`、`package.json` 版本与输入版本一致、对应 Tag 和 Release 不存在、CI 与生产依赖安装测试通过。
+- 发布成功后创建 `vX.Y.Z` Tag 和同名 GitHub Release。已有 Tag 或 Release 不覆盖、不重建。
+- MVP 不发布 npm，不上传二进制包；用户通过固定 Git Tag 安装。
+
+示例：
+
+```bash
+gh workflow run release.yml -f version=0.1.0 -f confirm=RELEASE
+```
+
+## 6. Pi Extension 开发参考速查
 
 完整 API 与示例见 [extensions_for_pi.md](./extensions_for_pi.md)。开发 Extension 前先检索该文档对应章节，本节只作速查。
 
@@ -74,7 +90,7 @@
 - Custom UI
 - Error Handling / Mode Behavior / Examples Reference
 
-## 6. 项目结构
+## 7. 项目结构
 
 - `src/extension/index.ts` 是 Pi 唯一直接加载的 Extension 入口，负责注册命令、生命周期和组装模块，不承载全部实现。
 - `package.json` 通过 `pi.extensions` 只声明该入口。其他模块由 `index.ts` 正常导入，不需要被 Pi 单独发现。

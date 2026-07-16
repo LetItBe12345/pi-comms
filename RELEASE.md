@@ -28,12 +28,16 @@ pi install git:github.com/LetItBe12345/pi-comms@v0.1.0
 
 Pi 会克隆仓库，并自动执行 `npm install`。
 
-发布步骤：
+普通 PR、合并和推送只运行 CI，不创建 Release。发布必须从 GitHub Actions 手动触发，并输入确认词 `RELEASE`：
 
 ```bash
-git tag v0.1.0
-git push origin main --tags
+gh workflow run release.yml \
+  --ref main \
+  -f version=0.1.0 \
+  -f confirm=RELEASE
 ```
+
+工作流会检查版本、运行测试和生产安装验证，然后创建 `v0.1.0` Tag 与同名 GitHub Release。已有版本不会覆盖。
 
 ### 第二阶段：npm 发布
 
