@@ -23,19 +23,11 @@
 | 7 | [最小 TUI](./done/07-tui.md) | 提供可用的群聊界面 | done | 阶段 6 |
 | 8 | [权限系统](./done/08-permissions.md) | 支持三种 Agent 接收权限 | done | 阶段 7 |
 | 9 | [Agent 对 Agent](./done/09-agent-to-agent.md) | 支持每 10 轮由用户决定是否继续 | done | 阶段 8 |
-| 10 | [测试与验收](./in-progress/10-testing-acceptance.md) | 满足 MVP 完成定义 | in-progress | 阶段 9 |
+| 10 | [测试与验收](./done/10-testing-acceptance.md) | 满足 MVP 完成定义 | done | 阶段 9 |
 
-## 当前最小里程碑
+## 当前里程碑
 
-先完成阶段 0～3，只创建核心实现文件：
-
-```text
-src/protocol.ts
-src/broker/server.ts
-src/extension/index.ts
-```
-
-这个里程碑不做完整 TUI、多群组、权限系统、Agent 对 Agent、持久化和跨设备通信。
+阶段 0～10 已完成，MVP 已通过自动测试和双 Pi 验收。
 
 ## 维护规则
 
