@@ -1,8 +1,9 @@
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import {
   Editor,
   Input,
   Key,
+  Markdown,
   SelectList,
   matchesKey,
   truncateToWidth,
@@ -101,8 +102,8 @@ export class ChatView implements Component, Focusable {
   #pendingMessage: { id: string; text: string } | undefined;
   #error: string | undefined;
   #focused = false;
-  #scrollFromBottom = 0;
   #noticeCounter = 0;
+  readonly #historicalFinalStatusIds = new Set<string>();
 
   constructor(options: ChatViewOptions) {
     this.#tui = options.tui;
@@ -207,12 +208,15 @@ export class ChatView implements Component, Focusable {
     this.#snapshot = snapshot;
     this.setGroups(snapshot.groups);
     this.#messages = dedupeMessages(snapshot.messages);
+    this.#historicalFinalStatusIds.clear();
+    for (const message of this.#messages) {
+      if (hasFinalFailureState(message)) this.#historicalFinalStatusIds.add(message.messageId);
+    }
     this.#members = new Map(snapshot.members.map((member) => [member.memberId, member]));
     if (snapshot.group !== undefined) {
       this.#stage = "chat";
       this.#pendingSetup = undefined;
       this.#error = undefined;
-      this.#scrollFromBottom = 0;
       this.#editor.setAutocompleteProvider(this.#memberAutocomplete());
     }
     this.#syncFocus();
@@ -222,7 +226,11 @@ export class ChatView implements Component, Focusable {
   updatePresence(member: Member): void {
     const previous = this.#members.get(member.memberId);
     this.#members.set(member.memberId, member);
-    if (member.type === "agent" && previous?.online !== member.online) {
+    if (
+      member.type === "agent" &&
+      member.clientId !== this.#snapshot?.clientId &&
+      previous?.online !== member.online
+    ) {
       const owner = [...this.#members.values()].find(
         (item) => item.clientId === member.clientId && item.type === "user",
       );
@@ -246,8 +254,16 @@ export class ChatView implements Component, Focusable {
 
   receiveMessage(message: HistoryMessage): void {
     const existing = this.#messages.findIndex((item) => item.messageId === message.messageId);
+    const previous = existing === -1 ? undefined : this.#messages[existing];
+    const wasLatest = previous === undefined || this.#isLatestEntry(previous.messageId);
     if (existing === -1) this.#messages.push(message);
     else this.#messages[existing] = message;
+
+    if (previous !== undefined && !wasLatest && becameFinalFailure(previous, message)) {
+      this.#addNotice(failureNotice(message));
+    } else if (wasLatest && hasFinalFailureState(message)) {
+      this.#historicalFinalStatusIds.add(message.messageId);
+    }
 
     if (message.requestId !== undefined && message.senderType === "agent") {
       const request = this.#messages.find(
@@ -264,7 +280,6 @@ export class ChatView implements Component, Focusable {
       this.#editor.disableSubmit = this.#connection !== "connected";
       this.#error = undefined;
     }
-    if (this.#scrollFromBottom === 0) this.#scrollFromBottom = 0;
     this.#tui.requestRender();
   }
 
@@ -273,6 +288,7 @@ export class ChatView implements Component, Focusable {
       (item) => item.messageId === failure.requestId || item.routeRequestId === failure.requestId,
     );
     if (message !== undefined) {
+      const wasLatest = this.#isLatestEntry(message.messageId);
       if (message.routeRequestId === failure.requestId) {
         message.routeStatus = "failed";
         message.routeFailureReason = failure.reason;
@@ -280,6 +296,8 @@ export class ChatView implements Component, Focusable {
         message.status = "failed";
         message.failureReason = failure.reason;
       }
+      if (wasLatest) this.#historicalFinalStatusIds.add(message.messageId);
+      else this.#addNotice(failureNotice(message));
     }
     if (this.#pendingMessage?.id === failure.requestId) {
       this.#pendingMessage = undefined;
@@ -381,18 +399,6 @@ export class ChatView implements Component, Focusable {
       this.#panel = "permission";
       this.#permissionList = this.#createPermissionList();
       this.#syncFocus();
-      this.#tui.requestRender();
-      return;
-    }
-    if (
-      this.#stage === "chat" &&
-      (matchesKey(data, "ctrl+pageUp") || matchesKey(data, "ctrl+pageDown"))
-    ) {
-      const page = Math.max(3, Math.floor(this.#tui.terminal.rows / 2));
-      this.#scrollFromBottom = Math.max(
-        0,
-        this.#scrollFromBottom + (matchesKey(data, "ctrl+pageUp") ? page : -page),
-      );
       this.#tui.requestRender();
       return;
     }
@@ -555,47 +561,38 @@ export class ChatView implements Component, Focusable {
 
   #renderChat(width: number): string[] {
     const header = this.#renderHeader(width);
+    const timeline = this.#renderTimeline(width);
     const editor = this.#editor.render(width);
     const hint = truncateToWidth(
-      this.#theme.fg("dim", "Enter 发送 · Shift+Enter 换行 · Ctrl+P 控制 · Ctrl+PageUp/PageDown 滚动 · Esc 退出"),
+      this.#theme.fg("dim", "Enter 发送 · Shift+Enter 换行 · Ctrl+P 控制 · Esc 退出"),
       width,
     );
-    const status = this.#error === undefined ? [] : [truncateToWidth(this.#theme.fg("warning", this.#error), width)];
-    const available = Math.max(1, this.#tui.terminal.rows - header.length - editor.length - status.length - 2);
-    const timeline = this.#renderTimeline(width);
-    const maxOffset = Math.max(0, timeline.length - available);
-    this.#scrollFromBottom = Math.min(this.#scrollFromBottom, maxOffset);
-    const end = timeline.length - this.#scrollFromBottom;
-    const start = Math.max(0, end - available);
-    const messages = timeline.slice(start, end);
-    while (messages.length < available) messages.unshift("");
-    return [...header, ...messages, ...status, ...editor, hint];
+    const error = this.#error === undefined
+      ? []
+      : [truncateToWidth(this.#theme.fg("warning", this.#error), width)];
+    return [...header, ...timeline, ...error, ...editor, ...this.#renderFooter(width), hint];
   }
 
   #renderHeader(width: number): string[] {
     const group = this.#snapshot?.group?.groupName ?? "未加入群组";
+    return [truncateToWidth(this.#theme.bold(`Pi Comms · ${group}`), width)];
+  }
+
+  #renderFooter(width: number): string[] {
     const state =
       this.#connection === "connected" ? this.#theme.fg("success", "● 已连接") :
       this.#connection === "reconnecting" ? this.#theme.fg("warning", "● 正在重连") :
       this.#theme.fg("warning", "● 正在连接");
-    const permission = permissionLabel(this.#permission);
-    const pending = this.#pendingRequests.length > 0
-      ? ` · 待批准：${this.#pendingRequests.length}`
-      : "";
-    const chains = this.#pausedChains.length > 0
-      ? ` · 待决定：${this.#pausedChains.length}`
-      : "";
-    const first = truncateToWidth(
-      `${this.#theme.bold(`群组：${group}`)}  ${state}  接收：${permission}${pending}${chains}`,
-      width,
-    );
     const online = [...this.#members.values()].filter((member) => member.online);
+    const onlineUsers = online.filter((member) => member.type === "user").length;
     const busy = online.filter((member) => member.type === "agent" && member.agentStatus === "busy").length;
-    if (width < 80) {
-      return [first, truncateToWidth(this.#theme.fg("muted", `${Math.floor(online.length / 2)} 人在线 · ${busy} 个 Agent 忙碌`), width)];
+    const pending = this.#pendingRequests.length + this.#pausedChains.length;
+    const first = `${state} · 在线 ${onlineUsers} · Agent 忙碌 ${busy}`;
+    const second = `接收 ${permissionLabel(this.#permission)} · 待处理 ${pending}`;
+    if (width < 60) {
+      return [first, second].map((line) => truncateToWidth(this.#theme.fg("muted", line), width));
     }
-    const members = sortedMembers(online, this.#snapshot?.clientId).map((member) => memberLabel(member, this.#snapshot?.clientId)).join("、");
-    return [first, ...wrapTextWithAnsi(this.#theme.fg("muted", `成员：${members || "暂无"}`), width)];
+    return [truncateToWidth(this.#theme.fg("muted", `${first} · ${second}`), width)];
   }
 
   #renderTimeline(width: number): string[] {
@@ -605,36 +602,51 @@ export class ChatView implements Component, Focusable {
     ].sort((a, b) => a.timestamp - b.timestamp);
     const result: string[] = [];
     let currentDate = "";
+    let previousMessage: HistoryMessage | undefined;
     for (const entry of entries) {
       const date = formatDate(entry.timestamp);
       if (date !== currentDate) {
         currentDate = date;
         result.push(centerLine(` ${date} `, width, "─", (text) => this.#theme.fg("dim", text)));
+        previousMessage = undefined;
       }
       if (entry.entryType === "notice") {
         result.push(centerLine(` ${entry.text} `, width, " ", (text) => this.#theme.fg("dim", text)), "");
+        previousMessage = undefined;
         continue;
       }
-      result.push(...this.#renderMessage(entry, width), "");
+      const grouped = previousMessage !== undefined && isContinuousMessage(previousMessage, entry);
+      const showDynamicState = this.#isLatestEntry(entry.messageId);
+      const showFinalState = this.#historicalFinalStatusIds.has(entry.messageId);
+      result.push(...this.#renderMessage(entry, width, !grouped, showDynamicState || showFinalState), "");
+      previousMessage = entry;
     }
     if (result.length === 0) result.push(this.#theme.fg("dim", "还没有消息，发一条试试。"));
     return result;
   }
 
-  #renderMessage(message: HistoryMessage, width: number): string[] {
+  #renderMessage(message: HistoryMessage, width: number, showHeader: boolean, showState: boolean): string[] {
     const own = message.senderId === this.#ownMember("user")?.memberId;
-    const blockWidth = Math.max(12, Math.min(width, Math.floor(width * (width < 60 ? 0.95 : 0.7))));
+    const ratio = width < 60 ? 0.94 : message.senderType === "agent" ? 0.85 : 0.7;
+    const blockWidth = Math.min(width, Math.max(12, Math.floor(width * ratio)));
     const role = message.senderType === "agent"
       ? ` [Agent${message.round === undefined ? "" : ` · 第 ${message.round} 轮`}]`
       : "";
     const label = `${message.senderName}${role}  ${formatTime(message.timestamp)}`;
-    const body = message.text.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", blockWidth));
-    const state = messageState(message);
-    const route = routeState(message);
-    const lines = [this.#theme.fg(message.senderType === "agent" ? "accent" : "muted", label), ...body];
+    const body = message.senderType === "agent"
+      ? new Markdown(message.text, 0, 0, getMarkdownTheme(), {
+          color: (text) => this.#theme.fg("text", text),
+        }).render(blockWidth)
+      : message.text.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", blockWidth));
+    const state = showState ? messageState(message) : undefined;
+    const route = showState ? routeState(message) : undefined;
+    const lines = [
+      ...(showHeader ? [this.#theme.fg(message.senderType === "agent" ? "accent" : "muted", label)] : []),
+      ...body,
+    ];
     if (state !== undefined) lines.push(this.#theme.fg(message.status === "failed" ? "error" : "warning", state));
     if (route !== undefined) lines.push(this.#theme.fg(message.routeStatus === "failed" ? "error" : "warning", route));
-    return lines.map((line) => own ? truncateToWidth(line, width) : alignRight(line, width));
+    return alignMessageBlock(lines, width, blockWidth, own ? "right" : "left");
   }
 
   #renderExit(width: number): string[] {
@@ -933,6 +945,14 @@ export class ChatView implements Component, Focusable {
     this.#noticeCounter += 1;
     this.#notices.push({ id: `notice-${this.#noticeCounter}`, timestamp: Date.now(), text });
   }
+
+  #isLatestEntry(messageId: string): boolean {
+    const entries = [
+      ...this.#messages.map((message) => ({ id: message.messageId, timestamp: message.timestamp })),
+      ...this.#notices.map((notice) => ({ id: notice.id, timestamp: notice.timestamp })),
+    ].sort((a, b) => a.timestamp - b.timestamp);
+    return entries.at(-1)?.id === messageId;
+  }
 }
 
 function sortGroups(groups: GroupSummary[]): GroupSummary[] {
@@ -951,32 +971,6 @@ function sortPausedChains(chains: PausedChainPayload[]): PausedChainPayload[] {
   return [...chains].sort((a, b) => b.pausedAt - a.pausedAt);
 }
 
-function sortedMembers(members: Member[], clientId?: string): Member[] {
-  return [...members].sort((a, b) => {
-    const own = Number(b.clientId === clientId) - Number(a.clientId === clientId);
-    if (own !== 0) return own;
-    if (a.clientId === b.clientId && a.type !== b.type) return a.type === "user" ? -1 : 1;
-    return a.displayName.localeCompare(b.displayName, "zh-CN");
-  });
-}
-
-function memberLabel(member: Member, clientId?: string): string {
-  const own = member.clientId === clientId && member.type === "user" ? "（我）" : "";
-  const activity = member.online
-    ? member.agentStatus === "busy" ? "忙碌" : "空闲"
-    : "离线";
-  const permission = member.agentPermission === undefined
-    ? ""
-    : `·${permissionLabel(member.agentPermission)}`;
-  const pending = (member.pendingApprovalCount ?? 0) > 0
-    ? `·待批准 ${member.pendingApprovalCount}`
-    : "";
-  const agent = member.type === "agent"
-    ? ` [Agent·${activity}${permission}${pending}]`
-    : "";
-  return `${member.displayName}${own}${agent}`;
-}
-
 function permissionLabel(permission: AgentPermission): string {
   if (permission === "approval") return "需批准";
   if (permission === "blocked") return "禁止接收";
@@ -987,9 +981,19 @@ function dedupeMessages(messages: HistoryMessage[]): HistoryMessage[] {
   return [...new Map(messages.map((message) => [message.messageId, { ...message }])).values()];
 }
 
-function alignRight(text: string, width: number): string {
-  const clipped = truncateToWidth(text, width);
-  return `${" ".repeat(Math.max(0, width - visibleWidth(clipped)))}${clipped}`;
+function alignMessageBlock(
+  lines: string[],
+  terminalWidth: number,
+  blockWidth: number,
+  side: "left" | "right",
+): string[] {
+  const clipped = lines.map((line) => truncateToWidth(line, blockWidth));
+  const contentWidth = Math.max(1, ...clipped.map((line) => visibleWidth(line)));
+  const indent = side === "right" ? Math.max(0, terminalWidth - contentWidth) : 0;
+  return clipped.map((line) => truncateToWidth(
+    `${" ".repeat(indent)}${line}${" ".repeat(Math.max(0, contentWidth - visibleWidth(line)))}`,
+    terminalWidth,
+  ));
 }
 
 function centerLine(text: string, width: number, fill: string, style: (text: string) => string): string {
@@ -1000,11 +1004,39 @@ function centerLine(text: string, width: number, fill: string, style: (text: str
 }
 
 function formatDate(timestamp: number): string {
-  return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" }).format(timestamp);
+  const date = new Date(timestamp);
+  return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
 }
 
 function formatTime(timestamp: number): string {
-  return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(timestamp);
+  const date = new Date(timestamp);
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function isContinuousMessage(previous: HistoryMessage, current: HistoryMessage): boolean {
+  const gap = current.timestamp - previous.timestamp;
+  return previous.senderId === current.senderId && gap >= 0 && gap <= 2 * 60 * 1000;
+}
+
+function hasFinalFailureState(message: HistoryMessage): boolean {
+  return message.status === "failed" ||
+    message.status === "interrupted" ||
+    message.routeStatus === "failed" ||
+    message.routeStatus === "ended";
+}
+
+function becameFinalFailure(previous: HistoryMessage, current: HistoryMessage): boolean {
+  return !hasFinalFailureState(previous) && hasFinalFailureState(current);
+}
+
+function failureNotice(message: HistoryMessage): string {
+  const target = message.routeTargetName ?? "目标 Agent";
+  const reason = message.routeStatus === "failed"
+    ? failureText(message.routeFailureReason)
+    : message.status === "interrupted"
+      ? "请求已中断"
+      : failureText(message.failureReason);
+  return `${message.senderName} 发给 ${target} 的请求未完成：${reason}`;
 }
 
 function messageState(message: HistoryMessage): string | undefined {

@@ -1,9 +1,10 @@
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import { initTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import {
   KeybindingsManager,
   TUI,
   TUI_KEYBINDINGS,
   setKeybindings,
+  visibleWidth,
   type Terminal,
 } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
@@ -14,10 +15,11 @@ class TestTerminal implements Terminal {
   columns = 100;
   rows = 30;
   kittyProtocolActive = false;
+  readonly writes: string[] = [];
   start(): void {}
   stop(): void {}
   async drainInput(): Promise<void> {}
-  write(): void {}
+  write(data: string): void { this.writes.push(data); }
   moveBy(): void {}
   hideCursor(): void {}
   showCursor(): void {}
@@ -26,6 +28,10 @@ class TestTerminal implements Terminal {
   clearScreen(): void {}
   setTitle(): void {}
   setProgress(): void {}
+
+  clearWrites(): void {
+    this.writes.length = 0;
+  }
 }
 
 const theme = {
@@ -123,14 +129,23 @@ function createView(overrides: Partial<ChatViewActions> = {}) {
     actions,
   });
   view.focused = true;
-  return { view, terminal, actions, done };
+  return { view, terminal, tui, actions, done };
 }
 
 function type(view: ChatView, text: string): void {
   for (const character of text) view.handleInput(character);
 }
 
+async function flushRender(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 30));
+}
+
+function leadingSpaces(line: string): number {
+  return line.length - line.trimStart().length;
+}
+
 beforeAll(() => {
+  initTheme("dark", false);
   setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
 });
 
@@ -157,15 +172,31 @@ describe("最小群聊 TUI", () => {
     expect(view.render(80).join("\n")).toContain("正在加入群组");
   });
 
-  it("将当前用户放左侧，其余成员和 Agent 放右侧", () => {
+  it("将当前用户放右侧，其余用户和所有 Agent 放左侧", () => {
     const history = [
-      message({ messageId: "own", text: "左侧消息" }),
+      message({ messageId: "own", text: "右侧消息" }),
       message({
         messageId: "other",
+        senderId: "user:client-b",
+        senderName: "Bob",
+        text: "其他用户在左侧",
+        timestamp: new Date("2026-07-15T09:33:00+08:00").getTime(),
+      }),
+      message({
+        messageId: "other-agent",
         senderId: "agent:client-b",
         senderName: "Bob-Pi",
         senderType: "agent",
-        text: "右侧回答",
+        text: "其他 Agent 在左侧",
+        timestamp: new Date("2026-07-15T09:36:00+08:00").getTime(),
+      }),
+      message({
+        messageId: "own-agent",
+        senderId: "agent:client-a",
+        senderName: "Alice-Pi",
+        senderType: "agent",
+        text: "自己的 Agent 也在左侧",
+        timestamp: new Date("2026-07-15T09:39:00+08:00").getTime(),
       }),
     ];
     const { view } = createView();
@@ -173,12 +204,30 @@ describe("最小群聊 TUI", () => {
     view.setConnection("connected");
 
     const lines = view.render(100);
-    const own = lines.find((line) => line.includes("左侧消息"));
-    const other = lines.find((line) => line.includes("右侧回答"));
-    expect(own?.startsWith("左侧消息")).toBe(true);
-    expect(other?.startsWith(" ")).toBe(true);
+    const own = lines.find((line) => line.includes("右侧消息"));
+    const other = lines.find((line) => line.includes("其他用户在左侧"));
+    const otherAgent = lines.find((line) => line.includes("其他 Agent 在左侧"));
+    const ownAgent = lines.find((line) => line.includes("自己的 Agent 也在左侧"));
+    expect(own?.startsWith(" ")).toBe(true);
+    expect(other?.startsWith("其他用户在左侧")).toBe(true);
+    expect(otherAgent?.startsWith("其他 Agent 在左侧")).toBe(true);
+    expect(ownAgent?.startsWith("自己的 Agent 也在左侧")).toBe(true);
     expect(lines.join("\n")).toContain("Bob-Pi [Agent]");
-    expect(lines.join("\n")).toContain("Bob-Pi [Agent·忙碌]");
+    expect(lines.join("\n")).not.toContain("Agent·忙碌");
+  });
+
+  it("让右侧多行消息使用完全一致的缩进", () => {
+    const { view } = createView();
+    view.applySnapshot(snapshot([message({
+      text: "第一行内容很长，需要在固定消息块宽度内换行。\n第二段手动换行",
+    })]));
+    view.setConnection("connected");
+
+    const block = view.render(40).filter((line) =>
+      line.includes("Alice  ") || line.includes("第一行") || line.includes("固定消息") || line.includes("第二段"),
+    );
+    expect(block.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(block.map(leadingSpaces))).toHaveLength(1);
   });
 
   it("Broker 确认后清空输入并显示消息", () => {
@@ -216,7 +265,7 @@ describe("最小群聊 TUI", () => {
     view.setConnection("connected");
 
     const screen = view.render(45).join("\n");
-    expect(screen).toContain("2 人在线");
+    expect(screen).toContain("在线 2");
     expect(screen).toContain("窄屏消息");
     expect(screen).toContain("Enter 发送");
   });
@@ -235,7 +284,7 @@ describe("最小群聊 TUI", () => {
     view.handleInput("\x1b[B");
     view.handleInput("\r");
     expect(updatePermission).toHaveBeenCalledWith("approval");
-    expect(view.render(80).join("\n")).toContain("接收：需批准");
+    expect(view.render(80).join("\n")).toContain("接收 需批准");
 
     view.setPendingRequests([{
       requestId: "request-1",
@@ -296,7 +345,7 @@ describe("最小群聊 TUI", () => {
     const chat = view.render(80).join("\n");
     expect(chat).toContain("Bob-Pi [Agent · 第 10 轮]");
     expect(chat).toContain("已达到第 10 轮，等待原发起者决定");
-    expect(chat).toContain("待决定：1");
+    expect(chat).toContain("待处理 1");
 
     view.handleInput("\x10");
     view.handleInput("\x1b[B");
@@ -306,5 +355,168 @@ describe("最小群聊 TUI", () => {
     expect(view.render(80).join("\n")).toContain("参与 Agent：Alice-Pi、Bob-Pi、Carol-Pi");
     view.handleInput("\r");
     expect(continueChain).toHaveBeenCalledWith("chain-1");
+  });
+
+  it("按两分钟规则合并连续消息标题，并由系统消息打断", () => {
+    const base = new Date("2026-07-15T09:30:00+08:00").getTime();
+    const { view } = createView();
+    view.applySnapshot(snapshot([
+      message({ messageId: "one", text: "第一条", timestamp: base }),
+      message({ messageId: "two", text: "第二条", timestamp: base + 120_000 }),
+      message({ messageId: "three", text: "第三条", timestamp: base + 241_000 }),
+    ]));
+    view.setConnection("connected");
+
+    const beforeNotice = view.render(80).join("\n");
+    expect(beforeNotice.match(/Alice  09:/gu)).toHaveLength(2);
+
+    view.updatePresence({
+      memberId: "agent:client-b",
+      clientId: "client-b",
+      type: "agent",
+      displayName: "Bob-Pi",
+      groupId: "group-a",
+      online: false,
+      agentStatus: "idle",
+    });
+    const withNotice = view.render(80).join("\n");
+    expect(withNotice).toContain("Bob 和 Bob-Pi 已离开群组");
+  });
+
+  it("保留完整 timeline，初始 100 条后继续追加且不截断", () => {
+    const base = new Date("2026-07-15T09:30:00+08:00").getTime();
+    const history = Array.from({ length: 100 }, (_, index) => message({
+      messageId: `history-${index}`,
+      text: `历史消息 ${index + 1}`,
+      timestamp: base + index * 180_000,
+    }));
+    const { view, terminal } = createView();
+    terminal.rows = 12;
+    view.applySnapshot(snapshot(history));
+    view.setConnection("connected");
+    for (let index = 100; index < 105; index += 1) {
+      view.receiveMessage(message({
+        messageId: `history-${index}`,
+        text: `历史消息 ${index + 1}`,
+        timestamp: base + index * 180_000,
+      }));
+    }
+
+    const lines = view.render(80);
+    expect(lines.join("\n")).toContain("历史消息 1");
+    expect(lines.join("\n")).toContain("历史消息 105");
+    expect(lines.length).toBeGreaterThan(terminal.rows);
+  });
+
+  it.each([40, 80, 120])("在 %i 列下正确换行且所有输出不超宽", (width) => {
+    const longUrl = `https://example.com/${"very-long-path-".repeat(12)}`;
+    const { view } = createView();
+    view.applySnapshot(snapshot([
+      message({
+        messageId: "unicode",
+        text: `中文与 Emoji 👨‍👩‍👧‍👦 e\u0301\n\n${longUrl}`,
+      }),
+      message({
+        messageId: "markdown",
+        senderId: "agent:client-b",
+        senderName: "Bob-Pi",
+        senderType: "agent",
+        text: "## 检查结果\n\n- **通过**\n- `npm run check`",
+        timestamp: new Date("2026-07-15T09:33:00+08:00").getTime(),
+      }),
+    ]));
+    view.setConnection("connected");
+
+    const lines = view.render(width);
+    expect(lines.join("\n")).toContain("中文与 Emoji");
+    expect(lines.join("\n")).toContain("检查结果");
+    expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+  });
+
+  it("用户消息保持纯文本，Agent 消息使用 Markdown", () => {
+    const { view } = createView();
+    view.applySnapshot(snapshot([
+      message({ messageId: "plain", text: "# 用户标题 **原样**" }),
+      message({
+        messageId: "agent-md",
+        senderId: "agent:client-b",
+        senderName: "Bob-Pi",
+        senderType: "agent",
+        text: "# Agent 标题\n\n**加粗内容**",
+        timestamp: new Date("2026-07-15T09:33:00+08:00").getTime(),
+      }),
+    ]));
+    view.setConnection("connected");
+
+    const screen = view.render(80).join("\n");
+    expect(screen).toContain("# 用户标题 **原样**");
+    expect(screen).toContain("Agent 标题");
+    expect(screen).not.toContain("**加粗内容**");
+  });
+
+  it("普通消息、输入和底部状态变化都不清空终端 scrollback", async () => {
+    const { view, terminal, tui } = createView();
+    tui.addChild(view);
+    tui.start();
+    try {
+      view.applySnapshot(snapshot(Array.from({ length: 12 }, (_, index) => message({
+        messageId: `render-${index}`,
+        text: `渲染消息 ${index}`,
+        timestamp: new Date("2026-07-15T09:30:00+08:00").getTime() + index * 180_000,
+      }))));
+      view.setConnection("connected");
+      await flushRender();
+
+      terminal.clearWrites();
+      view.receiveMessage(message({
+        messageId: "render-new",
+        text: "普通新消息",
+        timestamp: new Date("2026-07-15T10:30:00+08:00").getTime(),
+      }));
+      await flushRender();
+      expect(terminal.writes.join("")).not.toContain("\x1b[3J");
+
+      terminal.clearWrites();
+      type(view, "输入中");
+      await flushRender();
+      expect(terminal.writes.join("")).not.toContain("\x1b[3J");
+
+      terminal.clearWrites();
+      view.setConnection("reconnecting");
+      await flushRender();
+      expect(terminal.writes.join("")).not.toContain("\x1b[3J");
+    } finally {
+      tui.stop();
+    }
+  });
+
+  it("较旧请求晚到失败时追加系统消息，不回改旧消息状态", () => {
+    const base = new Date("2026-07-15T09:30:00+08:00").getTime();
+    const { view } = createView();
+    view.applySnapshot(snapshot([
+      message({
+        messageId: "request-old",
+        text: "@Bob-Pi 请检查",
+        status: "processing",
+        routeTargetName: "Bob-Pi",
+        timestamp: base,
+      }),
+      message({ messageId: "newer", text: "后来的消息", timestamp: base + 180_000 }),
+    ]));
+    view.setConnection("connected");
+    view.receiveMessage(message({
+      messageId: "request-old",
+      text: "@Bob-Pi 请检查",
+      status: "failed",
+      failureReason: "target_offline",
+      routeTargetName: "Bob-Pi",
+      timestamp: base,
+    }));
+
+    const lines = view.render(80);
+    const oldMessageIndex = lines.findIndex((line) => line.includes("@Bob-Pi 请检查"));
+    const noticeIndex = lines.findIndex((line) => line.includes("Alice 发给 Bob-Pi 的请求未完成"));
+    expect(noticeIndex).toBeGreaterThan(oldMessageIndex);
+    expect(lines[oldMessageIndex + 1]).not.toContain("失败");
   });
 });

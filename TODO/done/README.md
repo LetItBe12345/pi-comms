@@ -15,3 +15,4 @@
 - [阶段 8：权限系统](./08-permissions.md)
 - [阶段 9：Agent 对 Agent](./09-agent-to-agent.md)
 - [阶段 10：测试与验收](./10-testing-acceptance.md)
+- [阶段 11：聊天时间线与消息布局](./11-chat-timeline-layout.md)
