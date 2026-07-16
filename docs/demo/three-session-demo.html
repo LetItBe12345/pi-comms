@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Pi Comms 三 Session 演示</title>
+<style>
+  :root { color-scheme: dark; --cyan:#79c7c5; --yellow:#e6c85c; --green:#b5bd68; --red:#cc6666; --muted:#89909b; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; width:100%; height:100%; overflow:hidden; background:#080a0d; color:#e8e8e8; }
+  body { font-family:"Noto Sans CJK SC","Microsoft YaHei",sans-serif; }
+  .page { width:1920px; height:1080px; padding:46px 54px 38px; background:radial-gradient(circle at 50% -20%,#22323b 0,#0d1217 38%,#080a0d 78%); }
+  header { display:flex; align-items:flex-end; justify-content:space-between; height:86px; }
+  h1 { margin:0; font-size:42px; letter-spacing:1px; }
+  .subtitle { color:var(--muted); font-size:21px; margin-top:8px; }
+  .badge { border:1px solid #31525a; border-radius:999px; padding:10px 18px; color:var(--cyan); font:18px monospace; }
+  .panes { display:grid; grid-template-columns:repeat(3,1fr); gap:22px; height:820px; margin-top:24px; }
+  .terminal { background:#020304; border:1px solid #293038; border-radius:14px; overflow:hidden; box-shadow:0 18px 45px #0008; }
+  .bar { height:50px; padding:13px 18px; background:#171b20; border-bottom:1px solid #2b323a; font:18px monospace; display:flex; justify-content:space-between; }
+  .dots { color:#65707c; letter-spacing:3px; }
+  .online { color:var(--green); }
+  .content { padding:18px 20px; font:19px/1.46 "Noto Sans Mono CJK SC","Noto Sans CJK SC",monospace; }
+  .group { font-weight:700; color:#fff; }
+  .members { color:var(--muted); min-height:56px; font-size:16px; margin:4px 0 14px; }
+  .date { color:#4f5964; text-align:center; margin:10px 0 16px; }
+  .message { margin:12px 0; padding:10px 12px; border-left:3px solid #333; background:#0a0d11; border-radius:0 8px 8px 0; }
+  .message.agent { border-color:var(--cyan); background:#0a1417; }
+  .message.own { border-color:#8093a5; }
+  .name { color:#9099a4; font-size:16px; }
+  .agent .name { color:var(--cyan); }
+  .text { margin-top:3px; white-space:normal; }
+  .status { color:var(--yellow); font-size:16px; margin-top:3px; }
+  .done { color:var(--green); }
+  .processing { color:var(--yellow); }
+  .footer { height:58px; margin-top:14px; display:flex; align-items:center; justify-content:space-between; color:var(--muted); font-size:18px; }
+  .progress { display:flex; gap:8px; }
+  .dot { width:34px; height:5px; border-radius:3px; background:#293038; }
+  .dot.active { background:var(--cyan); }
+  .intro { height:820px; margin-top:24px; display:grid; place-items:center; text-align:center; border:1px solid #26313a; border-radius:18px; background:#020304cc; }
+  .intro h2 { font-size:68px; margin:0 0 18px; }
+  .intro p { font-size:28px; color:var(--muted); margin:10px; }
+  .route { margin-top:38px; color:var(--cyan)!important; font:30px monospace; }
+  .metrics { display:flex; gap:18px; justify-content:center; margin-top:36px; }
+  .metric { border:1px solid #31525a; border-radius:12px; padding:18px 28px; min-width:210px; }
+  .metric strong { display:block; color:#fff; font-size:42px; }
+</style>
+<body><div id="root"></div>
+<script>
+const states = [
+  { title:"Pi Comms", intro:"三个真实 Pi Session 的群聊与 Agent 接力", route:"Alice → Bob-Pi → Carol-Pi → Alice-Pi" },
+  { title:"三方在线", messages:[] },
+  { title:"公开群聊", messages:[
+    ["Alice","大家好，这是三个真实 Pi Session 的群聊演示。","user"],
+    ["Bob","Bob 已加入，准备接力。","user"],
+    ["Carol","Carol 已加入，三方在线。","user"]
+  ]},
+  { title:"Alice 发起请求", messages:[
+    ["Alice","@Bob-Pi 请只回复：@Carol-Pi 请只回复：@Alice-Pi 请只回复：三方演示结束。","user","处理中…"]
+  ], busy:"Bob-Pi" },
+  { title:"第 1 轮：Bob-Pi", messages:[
+    ["Alice","@Bob-Pi 请只回复：@Carol-Pi 请只回复：@Alice-Pi 请只回复：三方演示结束。","user","已完成"],
+    ["Bob-Pi","@Carol-Pi 请只回复：@Alice-Pi 请只回复：三方演示结束。","agent","已进入 Carol-Pi 队列 · 下一轮：2"]
+  ], busy:"Carol-Pi" },
+  { title:"第 2 轮：Carol-Pi", messages:[
+    ["Bob-Pi","@Carol-Pi 请只回复：@Alice-Pi 请只回复：三方演示结束。","agent","Carol-Pi 已回答 · 下一轮：2"],
+    ["Carol-Pi","@Alice-Pi 请只回复：三方演示结束。","agent","已进入 Alice-Pi 队列 · 下一轮：3"]
+  ], busy:"Alice-Pi" },
+  { title:"第 3 轮：Alice-Pi", messages:[
+    ["Carol-Pi","@Alice-Pi 请只回复：三方演示结束。","agent","Alice-Pi 已回答 · 下一轮：3"],
+    ["Alice-Pi","三方演示结束。","agent","已完成"]
+  ]},
+  { title:"演示完成", outro:true }
+];
+const people=[
+  {user:"Alice",agent:"Alice-Pi",color:"#79c7c5"},
+  {user:"Bob",agent:"Bob-Pi",color:"#b5bd68"},
+  {user:"Carol",agent:"Carol-Pi",color:"#d29ad5"}
+];
+const index=Math.max(0,Math.min(states.length-1,Number(location.hash.slice(1))||0));
+const state=states[index];
+function escapeHtml(value){return value.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+function pane(person){
+  const messages=(state.messages||[]).map(([name,text,type,status])=>`
+    <div class="message ${type==='agent'?'agent':''} ${name===person.user||name===person.agent?'own':''}">
+      <div class="name">${escapeHtml(name)}${type==='agent'?' [Agent]':''}</div>
+      <div class="text">${escapeHtml(text)}</div>
+      ${status?`<div class="status ${status.includes('完成')?'done':'processing'}">${escapeHtml(status)}</div>`:''}
+    </div>`).join("");
+  const busy=state.busy===person.agent;
+  return `<section class="terminal">
+    <div class="bar"><span><span class="dots">● ● ●</span>　${person.user} Session</span><span class="online">● 已连接</span></div>
+    <div class="content">
+      <div><span class="group">群组：三方演示</span>　接收：自动</div>
+      <div class="members">成员：${person.user}（我）、${person.agent} [Agent·${busy?'忙碌':'空闲'}]、其他 4 位成员</div>
+      <div class="date">──────── 2026/07/16 ────────</div>
+      ${messages||'<div style="color:#65707c;text-align:center;margin-top:90px">三个 Session 已连接，等待消息…</div>'}
+    </div>
+  </section>`;
+}
+function progress(){return `<div class="progress">${states.map((_,i)=>`<span class="dot ${i<=index?'active':''}"></span>`).join('')}</div>`;}
+let main;
+if(state.intro){main=`<div class="intro"><div><h2>${state.intro}</h2><p>真实 Pi 0.80.6 · 真实 Broker · 真实 SQLite</p><p class="route">${state.route}</p></div></div>`;}
+else if(state.outro){main=`<div class="intro"><div><h2>三方演示完成</h2><p>公开消息、定向注入、Agent 自动路由全部成功</p><div class="metrics"><div class="metric"><strong>3</strong>Pi Session</div><div class="metric"><strong>6</strong>群组成员</div><div class="metric"><strong>3</strong>Agent 轮次</div><div class="metric"><strong>4/4</strong>请求完成</div></div></div></div>`;}
+else{main=`<div class="panes">${people.map(pane).join('')}</div>`;}
+document.getElementById('root').innerHTML=`<main class="page"><header><div><h1>${state.title}</h1><div class="subtitle">Pi Comms · 三 Session 真实链路演示</div></div><div class="badge">REAL PTY DEMO · 2026-07-16</div></header>${main}<div class="footer"><span>等待时间已压缩 · 消息内容与路由状态来自真实验收记录</span>${progress()}</div></main>`;
+</script>
+</body>
+</html>
