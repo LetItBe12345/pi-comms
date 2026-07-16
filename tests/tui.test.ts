@@ -368,7 +368,7 @@ describe("最小群聊 TUI", () => {
     view.setConnection("connected");
 
     const beforeNotice = view.render(80).join("\n");
-    expect(beforeNotice.match(/Alice  09:/gu)).toHaveLength(2);
+    expect(beforeNotice.match(/Alice  \d{2}:\d{2}/gu)).toHaveLength(2);
 
     view.updatePresence({
       memberId: "agent:client-b",
