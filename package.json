@@ -35,7 +35,7 @@
     "check": "npm run typecheck && npm test"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@earendil-works/pi-coding-agent": "^0.80.9",
     "@earendil-works/pi-tui": "^0.80.6",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.20.1",
