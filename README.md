@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-项目正在开发中，阶段 9 已完成：Agent 可以在公开回答中继续 `@` 其他 Agent，并按每 10 轮人工续期。尚无正式版本。
+阶段 0～10 已完成，MVP 已通过自动测试和双 Pi 验收。尚无正式版本。
 
 MVP 只支持：
 
@@ -45,3 +45,4 @@ npm run broker
 - [开发流程](./DEVELOPMENT.md)
 - [发布](./RELEASE.md)
 - [任务总览](./TODO/README.md)
+- [MVP 验收记录](./docs/mvp-acceptance.md)
