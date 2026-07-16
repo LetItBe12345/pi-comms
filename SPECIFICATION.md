@@ -225,10 +225,17 @@ interface AgentRequest {
 
 ## 9. 协议
 
+- 当前固定协议版本为 `2`。
+- 每台设备在 `~/.pi/comms/device-id` 保存稳定 UUID。
+- Broker 内部使用 `JSON.stringify([deviceId, sessionId])` 作为统一 `SessionKey`。
+- `clientId` 只表示当前 Broker 实例中的逻辑客户端；群成员 ID 仍基于 `clientId`。
+- 单个 JSONL 帧最大为 8 MiB，超限后返回 `frame_too_large` 并关闭连接。
+
 ### 9.1 Client → Broker
 
 - `client.hello`
 - `client.goodbye`
+- `ping`
 - `group.create`
 - `group.join`
 - `group.leave`
@@ -244,6 +251,8 @@ interface AgentRequest {
 ### 9.2 Broker → Client
 
 - `snapshot`
+- `client.welcome`
+- `pong`
 - `groups.changed`
 - `chat.message`
 - `presence.changed`
@@ -265,6 +274,14 @@ interface Envelope<T = unknown> {
   payload: T;
 }
 ```
+
+连接先完成 `broker.probe`，再在 3 秒内发送 `client.hello`。`client.hello` 包含
+`protocolVersion`、`deviceId`、`sessionId` 和成对出现的可选
+`clientId + resumeToken`。首次连接由 `client.welcome` 返回 256 位随机
+`resumeToken`；它只在当前 Broker 进程内有效。
+
+客户端每 5 秒发送 `ping`，Broker 返回带原请求 ID 的 `pong`。任一方 15 秒未
+收到心跳即断开。协议不兼容时停止自动重连。
 
 ## 10. 名称与成员规则
 
@@ -371,9 +388,9 @@ seenRequestIds: Set<string>;
 - 获取 Session 文件或内部标识。
 - 不在进入群聊前连接 Broker，也不把用户和 Agent 标记为在线。
 - 断线后每秒自动重连。
-- 同一 Broker 实例内，使用 Session 标识恢复原 `clientId`。
-- 意外断线保留 3 秒恢复窗口；正常关闭不等待。
-- 3 秒内重连恢复原群组和两个成员 ID；超时后必须重新加入。
+- 同一 Broker 实例内，使用 `SessionKey + clientId + resumeToken` 恢复原身份。
+- 本机意外断线保留 3 秒，局域网意外断线保留 15 秒；正常关闭不等待。
+- 保留期内恢复原群组和两个成员 ID；超时后获得新 `clientId` 并手动重新加入。
 - `snapshot` 携带 `brokerInstanceId`。实例变化时终止活动远程请求并清理旧队列；跨 Broker 重启恢复留到 SQLite 阶段。
 
 ### 12.2 `/comms`
@@ -419,7 +436,7 @@ seenRequestIds: Set<string>;
 - 断线时保留草稿，禁止发送并自动重连；消息按 ID 去重。重连快照可能重置终端 scrollback。
 - Broker 确认消息写入 SQLite 后才清空输入；失败时保留输入。
 - Esc 在设置流程中返回上一步；聊天中有草稿或活动请求时确认退出，否则直接退出。
-- 成员意外断线后显示离线，保留 3 秒；超时后移除。其他会话的用户和 Agent 加入、离开合并为一条居中系统消息，不写入 SQLite，当前会话不显示自己的加入提示。
+- 成员意外断线后显示离线，本机保留 3 秒、局域网保留 15 秒；超时后移除。其他会话的用户和 Agent 加入、离开合并为一条居中系统消息，不写入 SQLite，当前会话不显示自己的加入提示。
 - 动态请求状态只显示在最新消息下方。较旧请求晚到的失败、拒绝或失效结果在底部追加系统消息，不回改旧行；重新进入时可显示 SQLite 中已有的最终失败状态。
 - 布局随终端宽高自适应，不因窗口较小而阻止聊天。
 - MVP 不支持鼠标和复杂富文本。
@@ -437,7 +454,8 @@ seenRequestIds: Set<string>;
 - SQLite 保留全部公开消息；加入群组时按时间正序返回最近 100 条。
 - Broker 重启时，`pending` 和 `delivered` 请求改为 `interrupted`，不自动重试。
 - 达到轮数上限的暂停链保留；重启后仍只允许原发起 Pi Session 继续或结束。
-- 仍在运行的 Extension 使用原 `clientId` 和名称自动重新加入；Pi 重启后需要手动加入。
+- Broker 重启后，仍在运行的 Extension 获取新 `clientId`，并使用原群组和名称自动重新加入；Pi 重启后需要手动加入。
+- `agent_requests.initiator_session_key` 和 `paused_chains.initiator_session_key` 保存稳定 `SessionKey`。
 - 数据库无法打开或迁移失败时，Broker 启动失败，不自动重建数据库。
 
 ## 15. 目标项目结构

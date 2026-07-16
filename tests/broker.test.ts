@@ -28,12 +28,21 @@ type EnvelopeByType<T extends BrokerEnvelopeType> = Extract<
 class TestClient {
   readonly messages: BrokerEnvelope[] = [];
   readonly sessionId: string;
+  readonly deviceId: string;
+  clientId: string | undefined;
+  resumeToken: string | undefined;
   readonly #socket: Socket;
   readonly #decoder = new JsonlDecoder();
   readonly #listeners = new Set<() => void>();
 
-  private constructor(endpoint: TcpConnectEndpoint, sessionId: string) {
+  private constructor(
+    endpoint: TcpConnectEndpoint,
+    sessionId: string,
+    deviceId: string,
+    credentials?: { clientId: string; resumeToken: string },
+  ) {
     this.sessionId = sessionId;
+    this.deviceId = deviceId;
     this.#socket = createConnection(endpoint);
     this.#socket.once("connect", () => {
       this.send("broker.probe", {
@@ -47,7 +56,17 @@ class TestClient {
         const message = result.value as BrokerEnvelope;
         this.messages.push(message);
         if (message.type === "broker.ready" && message.payload.requestId === "test-probe") {
-          this.send("client.hello", { sessionId, permission: "auto" });
+          this.send("client.hello", {
+            protocolVersion: BROKER_PROTOCOL_VERSION,
+            deviceId,
+            sessionId,
+            permission: "auto",
+            ...credentials,
+          });
+        }
+        if (message.type === "client.welcome") {
+          this.clientId = message.payload.clientId;
+          this.resumeToken = message.payload.resumeToken;
         }
         for (const listener of this.#listeners) listener();
       }
@@ -57,13 +76,24 @@ class TestClient {
   static async connect(
     endpoint: TcpConnectEndpoint,
     sessionId: string = randomUUID(),
+    deviceId = "00000000-0000-4000-8000-000000000001",
+    credentials?: { clientId: string; resumeToken: string },
   ): Promise<TestClient> {
-    const client = new TestClient(endpoint, sessionId);
+    const client = new TestClient(endpoint, sessionId, deviceId, credentials);
     await new Promise<void>((resolve, reject) => {
       client.#socket.once("connect", resolve);
       client.#socket.once("error", reject);
     });
-    await client.waitFor("snapshot");
+    const result = await Promise.race([
+      client.waitFor("snapshot").then(() => "ready" as const),
+      client.waitFor("error", (message) =>
+        message.payload.code === "resume_rejected" ||
+        message.payload.code === "session_in_use").then((message) => message.payload.code),
+    ]);
+    if (result !== "ready") {
+      await client.close();
+      throw new Error(result);
+    }
     return client;
   }
 
@@ -96,7 +126,7 @@ class TestClient {
     return new Promise<EnvelopeByType<T>>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.#listeners.delete(check);
-        reject(new Error(`等待 ${type} 超时`));
+        reject(new Error(`等待 ${type} 超时：${JSON.stringify(this.messages)}`));
       }, 1_000);
       const check = () => {
         const message = find();
@@ -124,6 +154,7 @@ describe("Local Broker 群组与成员", () => {
   let dbPath: string;
   let broker: BrokerServer;
   let clients: TestClient[];
+  let credentials: Map<string, { clientId: string; resumeToken: string }>;
 
   beforeEach(async () => {
     directory = await mkdtemp(join(tmpdir(), "pi-comms-"));
@@ -134,6 +165,7 @@ describe("Local Broker 群组与成员", () => {
       disconnectGraceMs: 80,
     });
     clients = [];
+    credentials = new Map();
     await broker.start();
     endpoint = broker.endpoint;
   });
@@ -144,8 +176,19 @@ describe("Local Broker 群组与成员", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  async function connect(sessionId?: string): Promise<TestClient> {
-    const client = await TestClient.connect(endpoint, sessionId);
+  async function connect(
+    sessionId: string = randomUUID(),
+    deviceId = "00000000-0000-4000-8000-000000000001",
+  ): Promise<TestClient> {
+    const key = `${deviceId}:${sessionId}`;
+    let client: TestClient;
+    try {
+      client = await TestClient.connect(endpoint, sessionId, deviceId, credentials.get(key));
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "resume_rejected") throw error;
+      client = await TestClient.connect(endpoint, sessionId, deviceId);
+    }
+    credentials.set(key, { clientId: client.clientId!, resumeToken: client.resumeToken! });
     clients.push(client);
     return client;
   }
@@ -193,6 +236,43 @@ describe("Local Broker 群组与成员", () => {
         onlineSessionCount: 1,
       },
     ]);
+  });
+
+  it("不同设备使用相同 sessionId 时不会互相覆盖", async () => {
+    const a = await connect(
+      "shared-session",
+      "00000000-0000-4000-8000-000000000001",
+    );
+    const b = await connect(
+      "shared-session",
+      "00000000-0000-4000-8000-000000000002",
+    );
+    expect(a.clientId).not.toBe(b.clientId);
+    await createGroup(a, "A组", "Alice", "Alice-Pi");
+    await createGroup(b, "B组", "Bob", "Bob-Pi");
+    expect((await a.waitFor("snapshot", (item) => item.payload.group?.groupName === "A组"))
+      .payload.group?.groupName).toBe("A组");
+    expect((await b.waitFor("snapshot", (item) => item.payload.group?.groupName === "B组"))
+      .payload.group?.groupName).toBe("B组");
+  });
+
+  it("只有正确 clientId 和 resumeToken 可以接管同一 Session", async () => {
+    const sessionId = "protected-session";
+    const deviceId = "00000000-0000-4000-8000-000000000001";
+    const original = await connect(sessionId, deviceId);
+    await expect(TestClient.connect(endpoint, sessionId, deviceId))
+      .rejects.toThrow("session_in_use");
+    await expect(TestClient.connect(endpoint, sessionId, deviceId, {
+      clientId: original.clientId!,
+      resumeToken: "wrong-token",
+    })).rejects.toThrow("resume_rejected");
+
+    const resumed = await TestClient.connect(endpoint, sessionId, deviceId, {
+      clientId: original.clientId!,
+      resumeToken: original.resumeToken!,
+    });
+    clients.push(resumed);
+    expect(resumed.clientId).toBe(original.clientId);
   });
 
   it("两个 Session 入群后看到四个稳定成员", async () => {
@@ -666,6 +746,17 @@ describe("Local Broker 群组与成员", () => {
     expect(
       b.messages.some((item) => item.type === "agent.deliver" && item.payload.round === 11),
     ).toBe(false);
+
+    const sameSessionOnOtherDevice = await connect(
+      "session-owner",
+      "00000000-0000-4000-8000-000000000002",
+    );
+    await joinGroup(sameSessionOnOtherDevice, groupId, "Dave", "Dave-Pi");
+    sameSessionOnOtherDevice.send("chain.continue", { chainId: "limited-chain" });
+    expect((await sameSessionOnOtherDevice.waitFor(
+      "error",
+      (item) => item.payload.requestId === "limited-chain",
+    )).payload.code).toBe("request_invalid");
 
     b.send("chain.continue", { chainId: "limited-chain" });
     expect((await b.waitFor("error", (item) => item.payload.requestId === "limited-chain")).payload.code)

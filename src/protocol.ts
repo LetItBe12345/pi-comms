@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { StringDecoder } from "node:string_decoder";
 import type {
   Group,
   GroupSummary,
@@ -18,7 +17,8 @@ export interface Envelope<T = unknown> {
 }
 
 export const BROKER_SERVICE = "pi-comms";
-export const BROKER_PROTOCOL_VERSION = 1;
+export const BROKER_PROTOCOL_VERSION = 2;
+export const MAX_JSONL_FRAME_BYTES = 8 * 1024 * 1024;
 
 export interface BrokerProbePayload {
   service: string;
@@ -43,13 +43,24 @@ export interface SnapshotPayload {
 }
 
 export interface ClientHelloPayload {
+  protocolVersion: number;
+  deviceId: string;
   sessionId: string;
   clientId?: string;
+  resumeToken?: string;
   permission: AgentPermission;
 }
 
-export interface ClientGoodbyePayload {
-  sessionId: string;
+export interface ClientWelcomePayload {
+  brokerInstanceId: string;
+  clientId: string;
+  resumeToken: string;
+}
+
+export type ClientGoodbyePayload = Record<string, never>;
+
+export interface PongPayload {
+  requestId: string;
 }
 
 export interface GroupCreatePayload {
@@ -232,7 +243,13 @@ export type ProtocolErrorCode =
   | "already_in_group"
   | "not_in_group"
   | "request_invalid"
-  | "database_error";
+  | "database_error"
+  | "protocol_mismatch"
+  | "hello_timeout"
+  | "frame_too_large"
+  | "resume_rejected"
+  | "session_in_use"
+  | "heartbeat_timeout";
 
 export interface ErrorPayload {
   code: ProtocolErrorCode;
@@ -248,6 +265,9 @@ export type BrokerProbeEnvelope = Envelope<BrokerProbePayload> & {
 };
 export type ClientGoodbyeEnvelope = Envelope<ClientGoodbyePayload> & {
   type: "client.goodbye";
+};
+export type PingEnvelope = Envelope<Record<string, never>> & {
+  type: "ping";
 };
 export type GroupCreateEnvelope = Envelope<GroupCreatePayload> & {
   type: "group.create";
@@ -290,6 +310,7 @@ export type ClientEnvelope =
   | BrokerProbeEnvelope
   | ClientHelloEnvelope
   | ClientGoodbyeEnvelope
+  | PingEnvelope
   | GroupCreateEnvelope
   | GroupJoinEnvelope
   | GroupLeaveEnvelope
@@ -305,6 +326,8 @@ export type ClientEnvelope =
 
 export type BrokerEnvelope =
   | (Envelope<BrokerReadyPayload> & { type: "broker.ready" })
+  | (Envelope<ClientWelcomePayload> & { type: "client.welcome" })
+  | (Envelope<PongPayload> & { type: "pong" })
   | (Envelope<SnapshotPayload> & { type: "snapshot" })
   | (Envelope<GroupsChangedPayload> & { type: "groups.changed" })
   | (Envelope<PresenceChangedPayload> & { type: "presence.changed" })
@@ -320,7 +343,7 @@ export type BrokerEnvelope =
 
 export type JsonlDecodeResult =
   | { ok: true; value: unknown }
-  | { ok: false; error: string };
+  | { ok: false; code: "invalid_json" | "frame_too_large"; error: string };
 
 export type ParseClientEnvelopeResult =
   | { ok: true; envelope: ClientEnvelope }
@@ -349,27 +372,34 @@ export function encodeEnvelope(envelope: Envelope): string {
 }
 
 export class JsonlDecoder {
-  readonly #decoder = new StringDecoder("utf8");
-  #buffer = "";
+  #buffer = Buffer.alloc(0);
+
+  constructor(readonly maxFrameBytes = MAX_JSONL_FRAME_BYTES) {}
 
   push(chunk: string | Uint8Array): JsonlDecodeResult[] {
-    this.#buffer +=
-      typeof chunk === "string"
-        ? chunk
-        : this.#decoder.write(Buffer.from(chunk));
+    const incoming = typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk);
+    this.#buffer = Buffer.concat([this.#buffer, incoming]);
     const results: JsonlDecodeResult[] = [];
-    let newlineIndex = this.#buffer.indexOf("\n");
+    let newlineIndex = this.#buffer.indexOf(0x0a);
     while (newlineIndex !== -1) {
-      const line = this.#buffer.slice(0, newlineIndex).replace(/\r$/, "");
+      if (newlineIndex > this.maxFrameBytes) {
+        this.#buffer = Buffer.alloc(0);
+        return [{ ok: false, code: "frame_too_large", error: "消息帧超过上限" }];
+      }
+      const line = this.#buffer.subarray(0, newlineIndex).toString("utf8").replace(/\r$/, "");
       this.#buffer = this.#buffer.slice(newlineIndex + 1);
       if (line.trim().length > 0) {
         try {
           results.push({ ok: true, value: JSON.parse(line) });
         } catch {
-          results.push({ ok: false, error: "消息不是合法的 JSON" });
+          results.push({ ok: false, code: "invalid_json", error: "消息不是合法的 JSON" });
         }
       }
-      newlineIndex = this.#buffer.indexOf("\n");
+      newlineIndex = this.#buffer.indexOf(0x0a);
+    }
+    if (this.#buffer.length > this.maxFrameBytes) {
+      this.#buffer = Buffer.alloc(0);
+      results.push({ ok: false, code: "frame_too_large", error: "消息帧超过上限" });
     }
     return results;
   }
@@ -402,18 +432,29 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
         ? { ok: true, envelope: value as unknown as BrokerProbeEnvelope }
         : invalid("invalid_payload", "broker.probe payload 无效", requestId);
     case "client.hello": {
-      const result = requireStrings(value, requestId, ["sessionId"]);
+      const result = requireStrings(value, requestId, ["deviceId", "sessionId"]);
       const clientId = value.payload.clientId;
+      const resumeToken = value.payload.resumeToken;
       if (!result.ok) return result;
+      if (value.payload.protocolVersion !== BROKER_PROTOCOL_VERSION) {
+        return invalid("protocol_mismatch", "Pi Comms 协议版本不兼容", requestId);
+      }
       if (clientId !== undefined && (typeof clientId !== "string" || !clientId.trim())) {
         return invalid("invalid_payload", "client.hello clientId 无效", requestId);
+      }
+      if (resumeToken !== undefined && (typeof resumeToken !== "string" || !resumeToken.trim())) {
+        return invalid("invalid_payload", "client.hello resumeToken 无效", requestId);
+      }
+      if ((clientId === undefined) !== (resumeToken === undefined)) {
+        return invalid("invalid_payload", "clientId 和 resumeToken 必须同时提供", requestId);
       }
       return isAgentPermission(value.payload.permission)
         ? result
         : invalid("invalid_payload", "client.hello permission 无效", requestId);
     }
     case "client.goodbye":
-      return requireStrings(value, requestId, ["sessionId"]);
+    case "ping":
+      return { ok: true, envelope: value as unknown as ClientEnvelope };
     case "group.create":
       return requireStrings(value, requestId, [
         "groupName",

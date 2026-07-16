@@ -17,3 +17,4 @@
 - [阶段 10：测试与验收](./10-testing-acceptance.md)
 - [阶段 11：聊天时间线与消息布局](./11-chat-timeline-layout.md)
 - [阶段 12：跨平台 TCP 传输](./12-cross-platform-tcp.md)
+- [阶段 13：跨设备身份与连接可靠性](./13-device-identity-reliability.md)

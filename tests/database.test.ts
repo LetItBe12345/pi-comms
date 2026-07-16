@@ -8,6 +8,10 @@ import {
   historyMessage,
 } from "../src/broker/database.js";
 import type { AgentRequestPayload, ChatMessagePayload } from "../src/protocol.js";
+import { createSessionKey } from "../src/session-key.js";
+
+const DEVICE_ID = "00000000-0000-4000-8000-000000000001";
+const SESSION_KEY = createSessionKey(DEVICE_ID, "session-a");
 
 describe("Broker SQLite", () => {
   let directory: string;
@@ -22,7 +26,7 @@ describe("Broker SQLite", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  it("初始化 v3 Schema、WAL 和 FULL，并恢复群组", () => {
+  it("初始化 v4 Schema、WAL 和 FULL，并恢复群组", () => {
     const store = new BrokerDatabase(dbPath);
     expect(store.configuration()).toEqual({
       journalMode: "wal",
@@ -32,7 +36,7 @@ describe("Broker SQLite", () => {
     store.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(3);
+    expect(raw.pragma("user_version", { simple: true })).toBe(4);
     expect(raw.pragma("journal_mode", { simple: true })).toBe("wal");
     const tables = raw
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -117,7 +121,7 @@ describe("Broker SQLite", () => {
     `);
     legacy.close();
 
-    const migrated = new BrokerDatabase(dbPath);
+    const migrated = new BrokerDatabase(dbPath, DEVICE_ID);
     expect(migrated.groups()).toEqual([{ groupId: "g", groupName: "旧群组" }]);
     expect(migrated.requestStatus("r-completed")).toBe("completed");
     expect(migrated.requestStatus("r-pending")).toBe("interrupted");
@@ -136,11 +140,18 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(3);
+    expect(raw.pragma("user_version", { simple: true })).toBe(4);
     const columns = raw
       .prepare("PRAGMA table_info(agent_requests)")
       .all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain("round_limit");
+    expect(columns.map((column) => column.name)).toContain("initiator_session_key");
+    expect(columns.map((column) => column.name)).not.toContain("initiator_session_id");
+    expect((raw.prepare(
+      "SELECT initiator_session_key AS sessionKey FROM agent_requests WHERE request_id = 'r-completed'",
+    ).get() as { sessionKey: string }).sessionKey).toBe(
+      createSessionKey(DEVICE_ID, "r-completed"),
+    );
     expect(raw.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'paused_chains'",
     ).get()).toBeDefined();
@@ -148,7 +159,7 @@ describe("Broker SQLite", () => {
   });
 
   it("只加载按时间排序的最近 100 条公开消息", () => {
-    const store = new BrokerDatabase(dbPath);
+    const store = new BrokerDatabase(dbPath, DEVICE_ID);
     store.insertGroup({ groupId: "g", groupName: "开发组" });
     for (let index = 0; index < 105; index += 1) {
       const payload: ChatMessagePayload = {
@@ -308,7 +319,7 @@ describe("Broker SQLite", () => {
   });
 
   it("Broker 重启后保留达到轮数上限的待决定通信链", () => {
-    const store = new BrokerDatabase(dbPath);
+    const store = new BrokerDatabase(dbPath, DEVICE_ID);
     store.insertGroup({ groupId: "g", groupName: "开发组" });
     const request: AgentRequestPayload = {
       requestId: "round-10",
@@ -341,7 +352,7 @@ describe("Broker SQLite", () => {
       round: 9,
     }, "sent");
     store.insertAgentRequest(source, request, false, {
-      initiatorSessionId: "session-a",
+      initiatorSessionKey: SESSION_KEY,
       initiatorName: "Alice",
       participants: ["Bob-Pi", "Carol-Pi"],
       roundLimit: 10,
@@ -367,7 +378,7 @@ describe("Broker SQLite", () => {
       chainId: "chain",
       groupId: "g",
       messageId: "answer",
-      initiatorSessionId: "session-a",
+      initiatorSessionKey: SESSION_KEY,
       initiatorName: "Alice",
       sourceAgentName: "Carol-Pi",
       sourceOwnerUserName: "Carol",
@@ -381,8 +392,23 @@ describe("Broker SQLite", () => {
     } });
     store.close();
 
-    const reopened = new BrokerDatabase(dbPath);
-    expect(reopened.pausedChains("session-a", "g")).toEqual([
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      DROP INDEX paused_chains_owner_group_idx;
+      ALTER TABLE agent_requests
+        RENAME COLUMN initiator_session_key TO initiator_session_id;
+      ALTER TABLE paused_chains
+        RENAME COLUMN initiator_session_key TO initiator_session_id;
+      UPDATE agent_requests SET initiator_session_id = 'session-a';
+      UPDATE paused_chains SET initiator_session_id = 'session-a';
+      CREATE INDEX paused_chains_owner_group_idx
+        ON paused_chains(initiator_session_id, group_id, paused_at DESC);
+      PRAGMA user_version = 3;
+    `);
+    legacy.close();
+
+    const reopened = new BrokerDatabase(dbPath, DEVICE_ID);
+    expect(reopened.pausedChains(SESSION_KEY, "g")).toEqual([
       expect.objectContaining({ chainId: "chain", nextRound: 11, roundLimit: 10 }),
     ]);
     expect(reopened.recentMessages("g").at(-1)).toMatchObject({
