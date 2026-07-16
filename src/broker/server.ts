@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { link, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
-import { createConnection, createServer, type Socket } from "node:net";
+import { createServer, type AddressInfo, type Socket } from "node:net";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  BROKER_PROTOCOL_VERSION,
+  BROKER_SERVICE,
   createEnvelope,
   encodeEnvelope,
   JsonlDecoder,
@@ -21,6 +22,14 @@ import {
   type PausedChainPayload,
   type SendFailedPayload,
 } from "../protocol.js";
+import {
+  DEFAULT_BROKER_ENDPOINT,
+  formatEndpoint,
+  validateConnectEndpoint,
+  validateListenEndpoint,
+  type TcpListenEndpoint,
+} from "../transport/tcp-endpoint.js";
+import { probeBroker } from "../transport/broker-probe.js";
 import type { AgentPermission, Member } from "../types.js";
 import {
   BrokerDatabase,
@@ -29,13 +38,13 @@ import {
   type StoredPausedChain,
 } from "./database.js";
 import { GroupState, GroupStateError } from "./group-state.js";
+import { assertNoLiveLegacyBroker } from "./legacy-migration.js";
+import {
+  acquireBrokerProcessLock,
+  BrokerLockBusyError,
+  type BrokerProcessLock,
+} from "./process-lock.js";
 
-export const DEFAULT_SOCKET_PATH = join(
-  homedir(),
-  ".pi",
-  "comms",
-  "broker.sock",
-);
 export const DEFAULT_DATABASE_PATH = join(
   homedir(),
   ".pi",
@@ -46,13 +55,13 @@ export const DEFAULT_DATABASE_PATH = join(
 const DEFAULT_DISCONNECT_GRACE_MS = 3_000;
 
 export interface BrokerServerOptions {
-  socketPath?: string;
+  listen?: TcpListenEndpoint;
   dbPath?: string;
   disconnectGraceMs?: number;
 }
 
 export interface BrokerServer {
-  readonly socketPath: string;
+  readonly endpoint: TcpListenEndpoint;
   readonly dbPath: string;
   readonly instanceId: string;
   start(): Promise<void>;
@@ -80,12 +89,12 @@ interface PendingRequest {
 export function createBrokerServer(
   options: BrokerServerOptions = {},
 ): BrokerServer {
-  const socketPath = options.socketPath ?? DEFAULT_SOCKET_PATH;
+  const listen = validateListenEndpoint(options.listen ?? DEFAULT_BROKER_ENDPOINT);
+  let endpoint = listen;
   const dbPath = options.dbPath ?? DEFAULT_DATABASE_PATH;
   const disconnectGraceMs =
     options.disconnectGraceMs ?? DEFAULT_DISCONNECT_GRACE_MS;
   const instanceId = randomUUID();
-  const lockPath = `${socketPath}.lock`;
   const clients = new Map<string, Socket>();
   const sessions = new Map<string, ClientSession>();
   let groups = new GroupState();
@@ -98,12 +107,13 @@ export function createBrokerServer(
   const server = createServer(handleConnection);
   let started = false;
   let closing = false;
-  let ownsLock = false;
+  let processLock: BrokerProcessLock | undefined;
 
   function handleConnection(socket: Socket): void {
     const decoder = new JsonlDecoder();
     let sessionId: string | undefined;
     let clientId: string | undefined;
+    let acceptedProbe = false;
 
     socket.on("data", (chunk) => {
       for (const result of decoder.push(chunk)) {
@@ -121,7 +131,27 @@ export function createBrokerServer(
           continue;
         }
 
+        if (parsed.envelope.type === "broker.probe") {
+          acceptedProbe = parsed.envelope.payload.service === BROKER_SERVICE &&
+            parsed.envelope.payload.protocolVersion === BROKER_PROTOCOL_VERSION;
+          send(socket, createEnvelope("broker.ready", {
+            service: BROKER_SERVICE,
+            protocolVersion: BROKER_PROTOCOL_VERSION,
+            brokerInstanceId: instanceId,
+            requestId: parsed.envelope.id,
+          }) as BrokerEnvelope);
+          continue;
+        }
+
         if (parsed.envelope.type === "client.hello") {
+          if (!acceptedProbe) {
+            sendError(socket, {
+              code: "invalid_payload",
+              message: "client.hello 前必须完成兼容的 broker.probe",
+              requestId: parsed.envelope.id,
+            });
+            continue;
+          }
           if (clientId !== undefined) {
             sendError(socket, {
               code: "invalid_payload",
@@ -1264,36 +1294,35 @@ export function createBrokerServer(
     if (started) {
       return;
     }
-    await mkdir(dirname(socketPath), { recursive: true });
-    await acquireBrokerLock(lockPath);
-    ownsLock = true;
+    if (dbPath === DEFAULT_DATABASE_PATH) await assertNoLiveLegacyBroker();
+    processLock = await acquireBrokerProcessLock(dbPath);
     try {
-      if (await canConnect(socketPath)) {
-        throw new Error(`Broker 已经在运行：${socketPath}`);
-      }
       database = new BrokerDatabase(dbPath);
       groups = new GroupState(database.groups());
-      await removeSocketIfPresent(socketPath);
       await new Promise<void>((resolveStart, rejectStart) => {
-        const onError = (error: Error) => {
+        const onError = (error: NodeJS.ErrnoException) => {
           server.off("listening", onListening);
-          rejectStart(error);
+          rejectStart(error.code === "EADDRINUSE"
+            ? new Error(`Broker 端口已被占用：${formatEndpoint(listen)}`)
+            : error);
         };
         const onListening = () => {
           server.off("error", onError);
+          const address = server.address() as AddressInfo;
+          endpoint = { host: listen.host, port: address.port };
           resolveStart();
         };
         server.once("error", onError);
         server.once("listening", onListening);
-        server.listen(socketPath);
+        server.listen({ ...listen, exclusive: true });
       });
       started = true;
       closing = false;
     } catch (error) {
       database?.close();
       database = undefined;
-      await releaseBrokerLock(lockPath);
-      ownsLock = false;
+      await processLock.release();
+      processLock = undefined;
       throw error;
     }
   }
@@ -1318,10 +1347,8 @@ export function createBrokerServer(
     started = false;
     database?.close();
     database = undefined;
-    if (ownsLock) {
-      await releaseBrokerLock(lockPath);
-      ownsLock = false;
-    }
+    await processLock?.release();
+    processLock = undefined;
   }
 
   function db(): BrokerDatabase {
@@ -1331,7 +1358,13 @@ export function createBrokerServer(
     return database;
   }
 
-  return { socketPath, dbPath, instanceId, start, close };
+  return {
+    get endpoint() { return endpoint; },
+    dbPath,
+    instanceId,
+    start,
+    close,
+  };
 }
 
 function parseMention(
@@ -1352,79 +1385,70 @@ function send(socket: Socket, envelope: Envelope): void {
   }
 }
 
-async function canConnect(socketPath: string): Promise<boolean> {
-  return new Promise<boolean>((resolveConnection, rejectConnection) => {
-    const socket = createConnection(socketPath);
-    socket.once("connect", () => {
-      socket.destroy();
-      resolveConnection(true);
-    });
-    socket.once("error", (error: NodeJS.ErrnoException) => {
-      socket.destroy();
-      if (error.code === "ENOENT" || error.code === "ECONNREFUSED") {
-        resolveConnection(false);
-      } else {
-        rejectConnection(error);
-      }
-    });
-  });
-}
-
-async function removeSocketIfPresent(socketPath: string): Promise<void> {
-  try {
-    await unlink(socketPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
-  }
-}
-
-async function acquireBrokerLock(lockPath: string): Promise<void> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const candidatePath = `${lockPath}.${process.pid}.${randomUUID()}`;
-    try {
-      await writeFile(candidatePath, String(process.pid), { flag: "wx" });
-      await link(candidatePath, lockPath);
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const ownerPid = Number.parseInt(await readFile(lockPath, "utf8").catch(() => ""), 10);
-      if (Number.isInteger(ownerPid) && processExists(ownerPid)) {
-        throw new Error(`Broker 已经在运行：${lockPath}`);
-      }
-      await releaseBrokerLock(lockPath);
-    } finally {
-      await releaseBrokerLock(candidatePath);
-    }
-  }
-  throw new Error(`无法获取 Broker 锁：${lockPath}`);
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-async function releaseBrokerLock(lockPath: string): Promise<void> {
-  try {
-    await unlink(lockPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-}
-
 async function runBroker(): Promise<void> {
-  const broker = createBrokerServer();
-  await broker.start();
-  console.log(`Pi Comms Broker 正在监听 ${broker.socketPath}`);
+  const { listen, dbPath } = parseBrokerArgs(process.argv.slice(2));
+  if (listen.host !== "127.0.0.1") {
+    console.warn("警告：当前局域网监听尚未启用准入控制，仅供开发测试");
+  }
+  const broker = createBrokerServer({ listen, dbPath });
+  try {
+    await broker.start();
+  } catch (error) {
+    if (listen.port === 0) throw error;
+    const target = validateConnectEndpoint({
+      host: listen.host === "0.0.0.0" ? "127.0.0.1" : listen.host,
+      port: listen.port,
+    });
+    const result = await waitForCompatibleBroker(target, 8_000);
+    if (result === "compatible") {
+      console.log(`复用现有 Pi Comms Broker：${formatEndpoint(target)}`);
+      return;
+    }
+    if (result === "incompatible") {
+      throw new Error(`端口上的服务不是兼容的 Pi Comms Broker：${formatEndpoint(target)}`);
+    }
+    if (error instanceof BrokerLockBusyError) {
+      throw new Error(`等待现有 Broker 就绪超时：${formatEndpoint(target)}`);
+    }
+    throw error;
+  }
+  console.log(`Pi Comms Broker 正在监听 ${formatEndpoint(broker.endpoint)}`);
   const shutdown = async () => broker.close();
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
+}
+
+function parseBrokerArgs(args: string[]): {
+  listen: TcpListenEndpoint;
+  dbPath: string;
+} {
+  let host = DEFAULT_BROKER_ENDPOINT.host;
+  let port = DEFAULT_BROKER_ENDPOINT.port;
+  let dbPath = DEFAULT_DATABASE_PATH;
+  for (let index = 0; index < args.length; index += 2) {
+    const name = args[index];
+    const value = args[index + 1];
+    if (value === undefined) throw new Error(`缺少参数值：${name}`);
+    if (name === "--host") host = value;
+    else if (name === "--port") port = Number(value);
+    else if (name === "--db") dbPath = resolve(value);
+    else throw new Error(`未知参数：${name}`);
+  }
+  return { listen: validateListenEndpoint({ host, port }), dbPath };
+}
+
+async function waitForCompatibleBroker(
+  endpoint: TcpListenEndpoint,
+  timeoutMs: number,
+): Promise<"compatible" | "incompatible" | "unreachable"> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await probeBroker(endpoint);
+    if (result.status === "compatible") return "compatible";
+    if (result.status === "incompatible") return "incompatible";
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  return "unreachable";
 }
 
 const isMainModule =

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  BROKER_PROTOCOL_VERSION,
+  BROKER_SERVICE,
   createEnvelope,
   encodeEnvelope,
   JsonlDecoder,
@@ -71,6 +73,17 @@ describe("JSONL 协议", () => {
 });
 
 describe("客户端消息校验", () => {
+  it("接受 Broker 兼容探测并拒绝无效版本字段", () => {
+    expect(parseClientEnvelope(createEnvelope("broker.probe", {
+      service: BROKER_SERVICE,
+      protocolVersion: BROKER_PROTOCOL_VERSION,
+    })).ok).toBe(true);
+    expect(parseClientEnvelope(createEnvelope("broker.probe", {
+      service: BROKER_SERVICE,
+      protocolVersion: "1",
+    })).ok).toBe(false);
+  });
+
   it("接受群聊消息", () => {
     const broadcast = createEnvelope("chat.send", { text: "公开消息" });
 

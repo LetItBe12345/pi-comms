@@ -13,6 +13,7 @@ import {
   createBrokerServer,
   type BrokerServer,
 } from "../src/broker/server.js";
+import type { TcpConnectEndpoint } from "../src/transport/tcp-endpoint.js";
 import { createCommsExtension } from "../src/extension/index.js";
 
 type EventHandler = (event: any, ctx: ExtensionContext) => Promise<any> | any;
@@ -98,16 +99,19 @@ async function waitFor(
 
 describe("MVP 双 Session 自动验收", () => {
   let directory: string;
-  let socketPath: string;
+  let endpoint: TcpConnectEndpoint;
   let dbPath: string;
   let broker: BrokerServer | undefined;
 
   beforeEach(async () => {
     directory = await mkdtemp(join(tmpdir(), "pi-comms-acceptance-"));
-    socketPath = join(directory, "broker.sock");
     dbPath = join(directory, "comms.db");
-    broker = createBrokerServer({ socketPath, dbPath });
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath,
+    });
     await broker.start();
+    endpoint = broker.endpoint;
   });
 
   afterEach(async () => {
@@ -118,7 +122,7 @@ describe("MVP 双 Session 自动验收", () => {
   function setup(sessionId: string) {
     const session = createSession(sessionId);
     createCommsExtension({
-      socketPath,
+      endpoint,
       reconnectIntervalMs: 20,
       resultRetryIntervalMs: 20,
       registerTestCommands: true,

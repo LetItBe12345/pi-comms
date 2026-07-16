@@ -29,6 +29,7 @@
   },
   "scripts": {
     "broker": "tsx src/broker/server.ts",
+    "broker:migrate": "tsx src/extension/broker-process.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "check": "npm run typecheck && npm test"

@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-阶段 0～10 已完成，MVP v0.1.0 已通过自动测试和双 Pi 验收。
+阶段 0～12 已完成，MVP v0.1.0 已通过自动测试和双 Pi 验收。
 
 MVP 只支持：
 
@@ -63,14 +63,14 @@ pi
 
 ```text
 Pi Session A Extension ─┐
-                        ├── Unix Socket ── Local Broker ── SQLite
+                        ├── loopback TCP ── Local Broker ── SQLite
 Pi Session B Extension ─┘
 ```
 
 - TypeScript
 - Node.js 22
 - Pi Extension
-- Unix Domain Socket
+- TCP IPv4（默认 `127.0.0.1:43127`）
 - SQLite
 - Vitest
 

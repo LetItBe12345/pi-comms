@@ -145,6 +145,33 @@ pi install -l git:https://github.com/你的用户名/pi-comms
 
 官方推荐通过 `pi install`、`pi list`、`pi config` 和 `pi update --extensions` 管理正式发布的扩展。([GitHub][2])
 
+## 从旧 Unix Broker 迁移到 TCP
+
+旧版 Broker 是独立后台进程。更新代码后，它可能仍在运行。不要让新旧 Broker 同时访问同一个 SQLite。
+
+先关闭所有 Pi Session，再更新 Extension：
+
+```bash
+pi update --extensions
+```
+
+进入 Pi 管理的 Git Package 目录并执行一次迁移：
+
+```bash
+cd ~/.pi/agent/git/github.com/LetItBe12345/pi-comms
+npm run broker:migrate
+```
+
+迁移命令会先通过旧协议确认目标确实是 Pi Comms Broker，再停止旧进程并清理 `broker.sock` 和旧锁。校验失败时不会结束进程。
+
+之后重新启动 Pi 并执行：
+
+```text
+/comms
+```
+
+新版默认连接 `127.0.0.1:43127`，不再使用 Unix Socket。
+
 ## PI 主程序本身装在哪里
 
 PI 当前官方发行版通过全局 npm 安装。curl 安装脚本本质上也使用全局 npm。([GitHub][2])

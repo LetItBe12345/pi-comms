@@ -68,9 +68,11 @@ B 的 Pi Agent 处理消息
 - 运行时：Node.js 22.19+。
 - Agent：Pi 正式发行版。
 - Pi 依赖：`@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui`、`typebox`。
-- 本地通信：Node.js `node:net` 和 Unix Domain Socket。
-- Socket 默认路径：`~/.pi/comms/broker.sock`。
+- 本地通信：Node.js `node:net` 和 TCP IPv4。
+- 默认连接端点：`127.0.0.1:43127`。
+- `0.0.0.0` 只能作为监听地址；客户端不能把它作为连接目标。
 - 传输协议：JSON Lines。
+- 连接必须先完成 `broker.probe` / `broker.ready` 握手，并严格匹配 `service: pi-comms` 和 `protocolVersion: 1`。
 - 数据库：SQLite + `better-sqlite3`，开启 WAL 模式。
 - 数据库默认路径：`~/.pi/comms/comms.db`。
 - 只有 Local Broker 可以读写数据库，Extension 不直接访问数据库。
@@ -81,7 +83,7 @@ B 的 Pi Agent 处理消息
 
 ```text
 Pi Session A Extension ─┐
-                        ├── Unix Socket ── Local Broker ── SQLite
+                        ├── loopback TCP ── Local Broker ── SQLite
 Pi Session B Extension ─┘
 ```
 
@@ -100,6 +102,8 @@ Pi Session B Extension ─┘
 - 解析 `@` 目标，路由 Agent 请求并返回发送状态。
 - 保存消息历史、请求结果和 Agent 通信轮数。
 - 统一读写 SQLite。
+- 同一数据目录同时最多运行一个 Broker；数据库级原子锁负责跨进程互斥。
+- 默认端口被兼容 Broker 占用时复用该 Broker；被无关服务占用时明确失败，不自动更换端口。
 
 ### 5.3 TUI
 

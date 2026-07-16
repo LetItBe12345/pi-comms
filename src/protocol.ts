@@ -17,6 +17,21 @@ export interface Envelope<T = unknown> {
   payload: T;
 }
 
+export const BROKER_SERVICE = "pi-comms";
+export const BROKER_PROTOCOL_VERSION = 1;
+
+export interface BrokerProbePayload {
+  service: string;
+  protocolVersion: number;
+}
+
+export interface BrokerReadyPayload {
+  service: string;
+  protocolVersion: number;
+  brokerInstanceId: string;
+  requestId: string;
+}
+
 export interface SnapshotPayload {
   brokerInstanceId: string;
   clientId: string;
@@ -228,6 +243,9 @@ export interface ErrorPayload {
 export type ClientHelloEnvelope = Envelope<ClientHelloPayload> & {
   type: "client.hello";
 };
+export type BrokerProbeEnvelope = Envelope<BrokerProbePayload> & {
+  type: "broker.probe";
+};
 export type ClientGoodbyeEnvelope = Envelope<ClientGoodbyePayload> & {
   type: "client.goodbye";
 };
@@ -269,6 +287,7 @@ export type AgentResultEnvelope = Envelope<AgentResultPayload> & {
 };
 
 export type ClientEnvelope =
+  | BrokerProbeEnvelope
   | ClientHelloEnvelope
   | ClientGoodbyeEnvelope
   | GroupCreateEnvelope
@@ -285,6 +304,7 @@ export type ClientEnvelope =
   | AgentResultEnvelope;
 
 export type BrokerEnvelope =
+  | (Envelope<BrokerReadyPayload> & { type: "broker.ready" })
   | (Envelope<SnapshotPayload> & { type: "snapshot" })
   | (Envelope<GroupsChangedPayload> & { type: "groups.changed" })
   | (Envelope<PresenceChangedPayload> & { type: "presence.changed" })
@@ -375,6 +395,12 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
   }
 
   switch (value.type) {
+    case "broker.probe":
+      return typeof value.payload.service === "string" &&
+        value.payload.service.length > 0 &&
+        Number.isInteger(value.payload.protocolVersion)
+        ? { ok: true, envelope: value as unknown as BrokerProbeEnvelope }
+        : invalid("invalid_payload", "broker.probe payload 无效", requestId);
     case "client.hello": {
       const result = requireStrings(value, requestId, ["sessionId"]);
       const clientId = value.payload.clientId;
