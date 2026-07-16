@@ -24,10 +24,11 @@
 | 8 | [权限系统](./done/08-permissions.md) | 支持三种 Agent 接收权限 | done | 阶段 7 |
 | 9 | [Agent 对 Agent](./done/09-agent-to-agent.md) | 支持每 10 轮由用户决定是否继续 | done | 阶段 8 |
 | 10 | [测试与验收](./done/10-testing-acceptance.md) | 满足 MVP 完成定义 | done | 阶段 9 |
+| 11 | [聊天时间线与消息布局](./in-progress/11-chat-timeline-layout.md) | 使用完整追加式时间线和标准聊天布局 | in-progress | 阶段 10 |
 
 ## 当前里程碑
 
-阶段 0～10 已完成，MVP 已通过自动测试和双 Pi 验收。
+阶段 0～10 已完成。阶段 11 待实施。
 
 ## 维护规则
 
