@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>STARFALL · Pi Comms</title>
+<style>
+  :root { color-scheme: dark; --cyan:#55e6ff; --gold:#ffd166; --green:#7cf7b0; --muted:#8492ad; }
+  * { box-sizing:border-box; }
+  body { margin:0; width:100vw; height:100vh; overflow:hidden; font-family:Inter,"Noto Sans SC",system-ui,sans-serif; color:#edf7ff; background:#030711; }
+  body::before { content:""; position:fixed; inset:0; background:
+    radial-gradient(circle at 50% 5%,rgba(38,96,154,.28),transparent 37%),
+    radial-gradient(circle at 8% 72%,rgba(111,53,160,.18),transparent 30%),
+    linear-gradient(120deg,transparent 0 49.7%,rgba(85,230,255,.035) 50%,transparent 50.3%);
+  }
+  .stars { position:fixed; inset:0; opacity:.7; background-image:
+    radial-gradient(#fff 1px,transparent 1px),radial-gradient(#55e6ff 1px,transparent 1px);
+    background-size:73px 73px,113px 113px; background-position:12px 7px,42px 31px; }
+  main { position:relative; width:100%; height:100%; padding:42px 54px 38px; display:grid; grid-template-rows:auto 1fr auto; gap:25px; }
+  header { display:flex; justify-content:space-between; align-items:flex-start; }
+  .eyebrow { color:var(--cyan); letter-spacing:.24em; font-size:14px; font-weight:800; }
+  h1 { margin:8px 0 0; font-size:48px; line-height:1; letter-spacing:.03em; }
+  h1 span { color:var(--cyan); text-shadow:0 0 28px rgba(85,230,255,.45); }
+  .badges { display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+  .badge { padding:9px 14px; border:1px solid #284660; border-radius:99px; color:#b8cce0; font:600 13px ui-monospace,monospace; background:rgba(7,18,32,.85); }
+  .badge.live { color:var(--green); border-color:#286449; }
+  .panels { display:grid; grid-template-columns:repeat(3,1fr); gap:18px; min-height:0; }
+  .panel { min-width:0; border:1px solid #20364b; border-radius:18px; background:linear-gradient(180deg,rgba(10,23,39,.96),rgba(5,12,23,.97)); box-shadow:0 18px 60px rgba(0,0,0,.35); overflow:hidden; display:grid; grid-template-rows:auto auto 1fr auto; }
+  .panel.active { border-color:var(--cyan); box-shadow:0 0 0 1px rgba(85,230,255,.17),0 18px 70px rgba(19,138,181,.20); }
+  .terminal { display:flex; align-items:center; gap:8px; padding:12px 16px; background:#07101d; border-bottom:1px solid #192a3c; }
+  .dot { width:9px; height:9px; border-radius:50%; background:#33465c; }
+  .dot:nth-child(1){background:#ff6b76}.dot:nth-child(2){background:#ffd166}.dot:nth-child(3){background:#70e49b}
+  .terminal code { margin-left:7px; color:#7388a0; font-size:11px; }
+  .identity { padding:16px 18px 13px; border-bottom:1px solid #17293b; }
+  .role { display:flex; justify-content:space-between; gap:12px; align-items:center; }
+  .role strong { font-size:19px; }
+  .online { color:var(--green); font-size:12px; font-weight:700; }
+  .agent { margin-top:4px; color:var(--cyan); font:13px ui-monospace,monospace; }
+  .feed { padding:15px 16px; overflow:hidden; display:flex; flex-direction:column; gap:10px; }
+  .msg { padding:10px 12px; border-left:2px solid #2e4b68; background:rgba(14,31,51,.64); border-radius:3px 10px 10px 3px; font-size:13px; line-height:1.5; color:#ced9e6; }
+  .msg b { color:#fff; display:block; font-size:11px; margin-bottom:3px; }
+  .msg.agentmsg { border-left-color:var(--cyan); background:rgba(21,71,91,.35); }
+  .msg.success { border-left-color:var(--green); background:rgba(20,84,55,.31); }
+  .tool { font:12px ui-monospace,monospace; color:#9eb2c8; border:1px solid #263d53; border-radius:9px; padding:9px 11px; background:#07111f; }
+  .tool em { color:var(--gold); font-style:normal; }
+  .status { height:42px; padding:11px 16px; border-top:1px solid #182b3e; color:#70869e; font:12px ui-monospace,monospace; display:flex; justify-content:space-between; }
+  .status .busy { color:var(--gold); }
+  footer { display:flex; align-items:center; justify-content:space-between; color:#8fa3ba; }
+  .progress { display:flex; align-items:center; gap:9px; font-size:13px; }
+  .step { width:34px; height:4px; border-radius:9px; background:#20364c; }
+  .step.on { background:var(--cyan); box-shadow:0 0 14px rgba(85,230,255,.55); }
+  .caption { font-size:20px; font-weight:750; color:#eaf7ff; }
+  .caption span { color:var(--gold); }
+  .cover { position:absolute; inset:190px 54px 86px; border:1px solid #25465d; border-radius:24px; display:none; place-items:center; text-align:center; background:linear-gradient(135deg,rgba(4,14,27,.96),rgba(12,34,51,.91)); overflow:hidden; }
+  .cover::before { content:"ORION"; position:absolute; font-size:240px; font-weight:900; letter-spacing:.1em; color:rgba(85,230,255,.035); transform:rotate(-8deg); }
+  .cover .mark { position:relative; font-size:78px; margin-bottom:18px; }
+  .cover h2 { position:relative; margin:0; font-size:58px; }
+  .cover p { position:relative; font-size:22px; color:#a9bfd4; }
+  .cover .route { position:relative; color:var(--cyan); font:700 16px ui-monospace,monospace; letter-spacing:.05em; }
+  body[data-state="0"] .panels, body[data-state="0"] footer { visibility:hidden; }
+  body[data-state="0"] .cover { display:grid; }
+  .s1,.s2,.s3,.s4,.s5,.s6 { display:none; }
+  body[data-state="1"] .s1, body[data-state="2"] .s1, body[data-state="2"] .s2,
+  body[data-state="3"] .s1, body[data-state="3"] .s2, body[data-state="3"] .s3,
+  body[data-state="4"] .s1, body[data-state="4"] .s2, body[data-state="4"] .s3, body[data-state="4"] .s4,
+  body[data-state="5"] .s1, body[data-state="5"] .s2, body[data-state="5"] .s3, body[data-state="5"] .s4, body[data-state="5"] .s5,
+  body[data-state="6"] .s1, body[data-state="6"] .s2, body[data-state="6"] .s3, body[data-state="6"] .s4, body[data-state="6"] .s5, body[data-state="6"] .s6 { display:block; }
+  body[data-state="2"] .bridge, body[data-state="3"] .bridge, body[data-state="4"] .hangar, body[data-state="5"] .tower, body[data-state="6"] .tower { border-color:var(--cyan); }
+</style>
+</head>
+<body><div class="stars"></div><main>
+<header><div><div class="eyebrow">REAL MULTI-SESSION AGENT RELAY</div><h1>STARFALL <span>星坠救援</span></h1></div><div class="badges"><div class="badge live">● 3 PI SESSIONS ONLINE</div><div class="badge">PI 0.80.9</div><div class="badge">PI COMMS v0.1.0 RELEASE</div></div></header>
+<section class="cover"><div><div class="mark">✦</div><h2>三个 Agent，一次深空救援</h2><p>真实诊断 · 真实改代码 · 真实验收</p><div class="route">舰桥 → 机库 → 瞭望塔</div></div></section>
+<section class="panels">
+  <article class="panel bridge"><div class="terminal"><i class="dot"></i><i class="dot"></i><i class="dot"></i><code>π · STARFALL-舰桥</code></div><div class="identity"><div class="role"><strong>🚨 舰桥指挥</strong><span class="online">● ONLINE</span></div><div class="agent">舰桥指挥-Pi · NAVIGATION</div></div><div class="feed"><div class="msg s1"><b>舰桥指挥</b>科研船 ORION 失联，救援倒计时启动。</div><div class="msg agentmsg s2"><b>收到远程任务 · 第 1 轮</b>读取遥测、源码和测试；只诊断，不改文件。</div><div class="tool s2"><em>read</em> data/telemetry.json<br><em>read</em> src/beacon.js<br><em>$</em> npm test → FAIL</div><div class="msg agentmsg s3"><b>舰桥指挥-Pi</b>@机库工程-Pi 已定位三处破损：呼号、经纬度、校验和。</div></div><div class="status"><span>STARFALL-救援频道</span><span class="busy s2">AGENT ACTIVE</span></div></article>
+  <article class="panel hangar"><div class="terminal"><i class="dot"></i><i class="dot"></i><i class="dot"></i><code>π · STARFALL-机库</code></div><div class="identity"><div class="role"><strong>🔧 机库工程</strong><span class="online">● ONLINE</span></div><div class="agent">机库工程-Pi · ENGINEERING</div></div><div class="feed"><div class="msg s1"><b>机库工程</b>修复工具就绪，等待导航线索。</div><div class="msg agentmsg s3"><b>Agent 接力入队 · 第 2 轮</b>来自舰桥：三处故障坐标已确认。</div><div class="tool s4"><em>edit</em> telemetry.json → ORION<br><em>edit</em> beacon.js → LAT/LON + CHECKSUM<br><em>$</em> npm test → <span style="color:var(--green)">PASS</span></div><div class="msg success s4"><b>机库工程-Pi</b>@瞭望塔验收-Pi 信标三处破损已焊回，交你验收。</div></div><div class="status"><span>STARFALL-救援频道</span><span class="busy s4">PATCHING</span></div></article>
+  <article class="panel tower"><div class="terminal"><i class="dot"></i><i class="dot"></i><i class="dot"></i><code>π · STARFALL-瞭望塔</code></div><div class="identity"><div class="role"><strong>🛰️ 瞭望塔验收</strong><span class="online">● ONLINE</span></div><div class="agent">瞭望塔验收-Pi · VALIDATION</div></div><div class="feed"><div class="msg s1"><b>瞭望塔验收</b>正在锁定最后一束遥测脉冲。</div><div class="msg agentmsg s5"><b>Agent 接力入队 · 第 3 轮</b>独立复核修复内容与信标输出。</div><div class="tool s5"><em>read</em> telemetry + beacon<br><em>$</em> npm test → <span style="color:var(--green)">1 PASS · 0 FAIL</span></div><div class="msg success s6"><b>瞭望塔验收-Pi</b>ORION 呼号清晰，经纬归位，校验和稳定。<br><strong style="color:var(--green)">✓ RESCUE WINDOW OPEN</strong></div></div><div class="status"><span>STARFALL-救援频道</span><span class="busy s5">VERIFYING</span></div></article>
+</section>
+<footer><div class="progress"><i class="step on"></i><i class="step"></i><i class="step"></i><i class="step"></i><i class="step"></i><i class="step"></i></div><div class="caption">三个独立 Session · <span>三轮自动接力</span> · SQLite 全部 completed</div></footer>
+</main><script>
+  const state=Math.max(0,Math.min(6,Number(location.hash.slice(1))||0)); document.body.dataset.state=state;
+  document.querySelectorAll('.step').forEach((el,i)=>el.classList.toggle('on',i<Math.max(1,state)));
+  const captions=['发行版实机演示','三个 Session 同时上线','瞭望塔发出紧急任务','舰桥完成诊断并自动转交','机库实际修改代码','瞭望塔独立复验','✓ RESCUE WINDOW OPEN'];
+  document.querySelector('.caption').innerHTML=captions[state];
+</script></body></html>

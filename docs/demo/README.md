@@ -1,5 +1,13 @@
 # 三 Session 视频 Demo
 
+## 最新：TRACE RELAY 分布式代码协作
+
+新的代码场景 Demo 已放在 [`trace-relay/`](./trace-relay/README.md)：三个用户、三个隔离的私有 Git 仓和三个 Pi Session，通过事件契约自动接力修复同一条分布式链路。包含 MP4、WebM、封面和三张关键截图。
+
+## STARFALL 星坠救援
+
+发行版实机剧情 Demo 已放在 [`starfall/`](./starfall/README.md)：三个独立 Pi Session 自动接力诊断、修改代码并验收，包含 MP4、WebM、封面和三张关键截图。
+
 本目录展示三个真实 Pi Session 通过 Pi Comms 群聊并完成 Agent 接力。
 
 ## 文件

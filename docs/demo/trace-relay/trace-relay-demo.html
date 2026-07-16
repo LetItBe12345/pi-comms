@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TRACE RELAY — 三个私有仓，一条协作链</title>
+<style>
+*{box-sizing:border-box}body{margin:0;width:1920px;height:1080px;overflow:hidden;background:#090d14;color:#e8edf5;font-family:Inter,"Noto Sans SC","Microsoft YaHei",sans-serif}body:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 50% -10%,#183356 0,transparent 42%),linear-gradient(90deg,rgba(255,255,255,.02) 1px,transparent 1px),linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px);background-size:auto,48px 48px,48px 48px}.app{position:relative;padding:54px 70px;height:100%}.top{display:flex;align-items:flex-start;justify-content:space-between}.eyebrow{color:#67e8f9;font:700 19px/1.3 ui-monospace,monospace;letter-spacing:.2em}.title{font-size:54px;line-height:1.1;margin:10px 0 8px;letter-spacing:-.035em}.sub{color:#91a1b8;font-size:21px}.badges{display:flex;gap:10px;margin-top:10px}.badge{border:1px solid #2b3b51;border-radius:999px;padding:10px 15px;background:#101824;color:#b9c6d8;font:700 14px ui-monospace,monospace}.release{color:#86efac;border-color:#225f43;background:#0d211b}.tracebar{height:76px;margin:32px 0 25px;display:grid;grid-template-columns:1fr 120px 1fr 120px 1fr;align-items:center}.trace{height:4px;background:#233349;position:relative}.trace:after{content:"";position:absolute;right:-1px;top:-5px;border-left:11px solid #334b67;border-top:7px solid transparent;border-bottom:7px solid transparent}.trace.active{background:linear-gradient(90deg,#38bdf8,#a78bfa)}.trace.active:after{border-left-color:#a78bfa}.packet{position:absolute;left:50%;top:-32px;transform:translateX(-50%);padding:8px 11px;border:1px solid #604cca;border-radius:7px;background:#17162e;color:#c4b5fd;font:700 13px ui-monospace,monospace;white-space:nowrap}.node{text-align:center;color:#64748b;font:700 13px ui-monospace,monospace}.node strong{display:block;color:#d8e2ef;font-size:16px;margin-bottom:3px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:22px}.card{height:628px;border:1px solid #243247;border-radius:14px;background:#0d131d;box-shadow:0 20px 70px #0008;overflow:hidden;position:relative}.card.active{border-color:#4b6f99;box-shadow:0 0 0 1px #274f72,0 25px 80px #0009}.card.done{border-color:#23563d}.head{height:82px;padding:17px 20px;background:#111a27;border-bottom:1px solid #243247;display:flex;justify-content:space-between;align-items:center}.identity{display:flex;gap:13px;align-items:center}.avatar{width:43px;height:43px;border-radius:10px;display:grid;place-items:center;background:#18314c;color:#7dd3fc;font-size:22px}.who{font-size:18px;font-weight:750}.repo{color:#8191a7;font:13px ui-monospace,monospace;margin-top:5px}.lock{font-size:13px;color:#8da0b8;border:1px solid #314158;border-radius:6px;padding:7px 9px}.content{padding:19px}.status{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}.test{font:700 13px ui-monospace,monospace;color:#fb7185}.done .test{color:#4ade80}.session{color:#65778e;font:12px ui-monospace,monospace}.panel{border:1px solid #253449;border-radius:9px;background:#080c12;margin-bottom:13px;overflow:hidden}.panel-title{padding:9px 12px;background:#111927;border-bottom:1px solid #253449;color:#73859c;font:700 12px ui-monospace,monospace;display:flex;justify-content:space-between}.code{padding:13px 14px;color:#adbac9;font:14px/1.65 ui-monospace,monospace;white-space:pre-wrap}.dim{color:#526075}.minus{color:#fb7185;background:#28131a}.plus{color:#4ade80;background:#10251b}.json{color:#c4b5fd}.chat{border-left:3px solid #38bdf8;padding:10px 12px;background:#0c1c2a;color:#bcd0e2;font-size:14px;line-height:1.55}.chat strong{color:#7dd3fc}.handoff{border-left-color:#a78bfa;background:#17142a}.handoff strong{color:#c4b5fd}.result{border-left-color:#22c55e;background:#0d2118}.result strong{color:#86efac}.foot{position:absolute;bottom:14px;left:20px;right:20px;display:flex;justify-content:space-between;color:#52637a;font:12px ui-monospace,monospace}.stage-label{position:absolute;right:70px;bottom:25px;color:#64748b;font:700 13px ui-monospace,monospace}.intro{position:absolute;inset:0;z-index:8;background:radial-gradient(circle at 50% 36%,#153b58 0,#090d14 48%);display:grid;place-items:center;text-align:center}.intro h1{font-size:86px;letter-spacing:-.055em;margin:0}.intro p{font-size:26px;color:#9fb0c6;margin:18px}.intro .line{width:530px;height:3px;margin:38px auto;background:linear-gradient(90deg,#38bdf8,#a78bfa,#22c55e)}.intro .bigtrace{font:700 22px ui-monospace,monospace;color:#67e8f9}.only{display:none}.s0 .intro{display:grid}.s1 .intro,.s2 .intro,.s3 .intro,.s4 .intro,.s5 .intro,.s6 .intro{display:none}.s1 .at1,.s2 .at2,.s3 .at3,.s4 .at4,.s5 .at5,.s6 .at6{display:block}.muted{opacity:.47}.s3 .card:nth-child(1) .test,.s4 .card:nth-child(-n+2) .test,.s5 .test,.s6 .test{color:#4ade80}.s3 .card:nth-child(1),.s4 .card:nth-child(-n+2),.s5 .card,.s6 .card{border-color:#23563d}.s6 .card{opacity:1}.s6 .trace{background:linear-gradient(90deg,#38bdf8,#a78bfa,#22c55e)}.s6 .trace:after{border-left-color:#22c55e}.success{font-size:20px;text-align:center;color:#86efac;font-weight:800;padding:7px}.pulse{box-shadow:0 0 20px #22c55e55}
+</style>
+</head>
+<body class="s0">
+<div class="intro"><div><div class="eyebrow">PI COMMS / RELEASE DEMO</div><h1>TRACE RELAY</h1><p>三个用户 · 三个私有代码仓 · 一条自动接力的修复链</p><div class="line"></div><div class="bigtrace">INC-2049 · trace_id = trc-7f3a</div><div class="badges" style="justify-content:center;margin-top:34px"><span class="badge release">PI 0.80.9</span><span class="badge release">PI COMMS v0.1.0</span><span class="badge">3 REAL PI SESSIONS</span></div></div></div>
+<div class="app">
+  <div class="top"><div><div class="eyebrow">DISTRIBUTED CODE INCIDENT / INC-2049</div><div class="title">三个私有仓，一条协作链</div><div class="sub">每个团队只能修改自己的代码，通过事件契约把修复向下游传递。</div></div><div class="badges"><span class="badge">3 USERS</span><span class="badge">3 PRIVATE REPOS</span><span class="badge release">RELEASE v0.1.0</span></div></div>
+  <div class="tracebar">
+    <div class="node"><strong>EDGE</strong>checkout.requested</div><div class="trace"><span class="packet only at3">trace_id: trc-7f3a →</span></div>
+    <div class="node"><strong>ORDER</strong>order.accepted</div><div class="trace"><span class="packet only at4">trace_id: trc-7f3a →</span></div>
+    <div class="node"><strong>NOTIFY</strong>audit log</div>
+  </div>
+  <div class="cards">
+    <section class="card">
+      <div class="head"><div class="identity"><div class="avatar">🌐</div><div><div class="who">Edge-Ada</div><div class="repo">edge-gateway · main</div></div></div><div class="lock">🔒 PRIVATE</div></div>
+      <div class="content"><div class="status"><span class="test"><span class="only at3 at4 at5 at6">● PASS 1/1</span><span class="only at1 at2">● FAIL trace_id</span></span><span class="session">TRACE-EDGE-PRIVATE</span></div>
+        <div class="panel"><div class="panel-title"><span>src/gateway.js</span><span>git diff</span></div><div class="code"><span class="dim">return {</span>
+  type: "checkout.requested",
+  cart_id: request.cart_id,
+  amount_cents: request.amount_cents,<span class="only at3 at4 at5 at6">
+<span class="plus">+ trace_id: request.headers["x-trace-id"]</span></span>
+<span class="dim">};</span></div></div>
+        <div class="chat only at2"><strong>@Edge-Ada-Pi</strong> 只在你的私有仓修复入口 trace_id，测试后把完整契约交给订单团队。</div>
+        <div class="chat handoff only at3 at4 at5"><strong>@Order-Lin-Pi</strong><br>{ type: "checkout.requested",<br> cart_id: "cart-2049", amount_cents: 12900,<br> <span class="json">trace_id: "trc-7f3a"</span> }</div>
+        <div class="chat result only at6"><strong>✓ EDGE COMPLETE</strong><br>x-trace-id 已写入 checkout.requested</div>
+      </div><div class="foot"><span>/edge-gateway</span><span>only this repo</span></div>
+    </section>
+    <section class="card">
+      <div class="head"><div class="identity"><div class="avatar" style="background:#2b2145;color:#c4b5fd">📦</div><div><div class="who">Order-Lin</div><div class="repo">order-worker · main</div></div></div><div class="lock">🔒 PRIVATE</div></div>
+      <div class="content"><div class="status"><span class="test"><span class="only at4 at5 at6">● PASS 1/1</span><span class="only at1 at2 at3">● FAIL trace_id</span></span><span class="session">TRACE-ORDER-PRIVATE</span></div>
+        <div class="panel"><div class="panel-title"><span>src/worker.js</span><span>git diff</span></div><div class="code"><span class="dim">return {</span>
+  type: "order.accepted",
+  order_id: `ord-${event.cart_id}`,
+  amount_cents: event.amount_cents,<span class="only at4 at5 at6">
+<span class="plus">+ trace_id: event.trace_id</span></span>
+<span class="dim">};</span></div></div>
+        <div class="chat handoff only at3"><strong>INCOMING CONTRACT</strong><br>checkout.requested · trc-7f3a</div>
+        <div class="chat handoff only at4 at5"><strong>@Notify-Mia-Pi</strong><br>{ type: "order.accepted",<br> order_id: "ord-cart-2049", amount_cents: 12900,<br> <span class="json">trace_id: "trc-7f3a"</span> }</div>
+        <div class="chat result only at6"><strong>✓ ORDER COMPLETE</strong><br>trace_id 已传播到 order.accepted</div>
+      </div><div class="foot"><span>/order-worker</span><span>contract boundary</span></div>
+    </section>
+    <section class="card">
+      <div class="head"><div class="identity"><div class="avatar" style="background:#123829;color:#86efac">🔔</div><div><div class="who">Notify-Mia</div><div class="repo">notify-service · main</div></div></div><div class="lock">🔒 PRIVATE</div></div>
+      <div class="content"><div class="status"><span class="test"><span class="only at5 at6">● PASS 1/1</span><span class="only at1 at2 at3 at4">● FAIL audit trace</span></span><span class="session">TRACE-NOTIFY-PRIVATE</span></div>
+        <div class="panel"><div class="panel-title"><span>src/audit.js</span><span>git diff</span></div><div class="code"><span class="dim">return</span><span class="only at1 at2 at3 at4"> `[ORDER ${event.order_id}]`</span><span class="only at5 at6">
+<span class="plus">+ `[TRACE ${event.trace_id}]`</span>
+  + ` [ORDER ${event.order_id}]`</span>
+  + ` accepted amount=${event.amount_cents}`;</div></div>
+        <div class="chat handoff only at4"><strong>INCOMING CONTRACT</strong><br>order.accepted · trc-7f3a</div>
+        <div class="chat result only at5"><strong>npm test ✓ &nbsp; npm run demo ✓</strong><br>[TRACE trc-7f3a] [ORDER ord-cart-2049]<br>accepted amount=12900</div>
+        <div class="chat result pulse only at6"><div class="success">END-TO-END TRACE RESTORED</div><strong>3 / 3 agent rounds completed</strong><br>[TRACE trc-7f3a] [ORDER ord-cart-2049]<br>accepted amount=12900</div>
+      </div><div class="foot"><span>/notify-service</span><span>final acceptance</span></div>
+    </section>
+  </div>
+  <div class="stage-label">REAL RUN · EDITED FOR PACING · <span id="step">01</span>/06</div>
+</div>
+<script>const n=Math.max(0,Math.min(6,Number(location.hash.slice(1))||0));document.body.className='s'+n;document.getElementById('step').textContent=String(n).padStart(2,'0');</script>
+</body></html>
