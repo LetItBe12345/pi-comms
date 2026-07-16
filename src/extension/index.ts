@@ -584,6 +584,7 @@ export function formatAgentRequest(request: AgentRequestPayload): string {
     request.text,
     "",
     `你的回答会作为公开消息发送到群组「${request.groupName}」，用于回应 ${request.senderName}。请直接回答。`,
+    `如果这个问题更适合群里其他在线 Agent 处理，可在回答开头 @Agent名称 并附上要转交的问题，任务会转给该 Agent；每次只转一次。`,
   ].join("\n");
 }
 
