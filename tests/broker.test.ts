@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  BROKER_PROTOCOL_VERSION,
+  BROKER_SERVICE,
   createEnvelope,
   encodeEnvelope,
   JsonlDecoder,
@@ -15,6 +17,7 @@ import {
   createBrokerServer,
   type BrokerServer,
 } from "../src/broker/server.js";
+import type { TcpConnectEndpoint } from "../src/transport/tcp-endpoint.js";
 
 type BrokerEnvelopeType = BrokerEnvelope["type"];
 type EnvelopeByType<T extends BrokerEnvelopeType> = Extract<
@@ -29,26 +32,33 @@ class TestClient {
   readonly #decoder = new JsonlDecoder();
   readonly #listeners = new Set<() => void>();
 
-  private constructor(socketPath: string, sessionId: string) {
+  private constructor(endpoint: TcpConnectEndpoint, sessionId: string) {
     this.sessionId = sessionId;
-    this.#socket = createConnection(socketPath);
+    this.#socket = createConnection(endpoint);
     this.#socket.once("connect", () => {
-      this.send("client.hello", { sessionId, permission: "auto" });
+      this.send("broker.probe", {
+        service: BROKER_SERVICE,
+        protocolVersion: BROKER_PROTOCOL_VERSION,
+      }, "test-probe");
     });
     this.#socket.on("data", (chunk) => {
       for (const result of this.#decoder.push(chunk)) {
         if (!result.ok) throw new Error(result.error);
-        this.messages.push(result.value as BrokerEnvelope);
+        const message = result.value as BrokerEnvelope;
+        this.messages.push(message);
+        if (message.type === "broker.ready" && message.payload.requestId === "test-probe") {
+          this.send("client.hello", { sessionId, permission: "auto" });
+        }
         for (const listener of this.#listeners) listener();
       }
     });
   }
 
   static async connect(
-    socketPath: string,
+    endpoint: TcpConnectEndpoint,
     sessionId: string = randomUUID(),
   ): Promise<TestClient> {
-    const client = new TestClient(socketPath, sessionId);
+    const client = new TestClient(endpoint, sessionId);
     await new Promise<void>((resolve, reject) => {
       client.#socket.once("connect", resolve);
       client.#socket.once("error", reject);
@@ -110,18 +120,22 @@ class TestClient {
 
 describe("Local Broker 群组与成员", () => {
   let directory: string;
-  let socketPath: string;
+  let endpoint: TcpConnectEndpoint;
   let dbPath: string;
   let broker: BrokerServer;
   let clients: TestClient[];
 
   beforeEach(async () => {
     directory = await mkdtemp(join(tmpdir(), "pi-comms-"));
-    socketPath = join(directory, "broker.sock");
     dbPath = join(directory, "comms.db");
-    broker = createBrokerServer({ socketPath, dbPath, disconnectGraceMs: 80 });
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath,
+      disconnectGraceMs: 80,
+    });
     clients = [];
     await broker.start();
+    endpoint = broker.endpoint;
   });
 
   afterEach(async () => {
@@ -131,7 +145,7 @@ describe("Local Broker 群组与成员", () => {
   });
 
   async function connect(sessionId?: string): Promise<TestClient> {
-    const client = await TestClient.connect(socketPath, sessionId);
+    const client = await TestClient.connect(endpoint, sessionId);
     clients.push(client);
     return client;
   }
@@ -692,27 +706,29 @@ describe("Local Broker 群组与成员", () => {
     ).toBe("仍然在线");
   });
 
-  it("拒绝第二个 Broker，并清理失效 Socket 文件", async () => {
-    await expect(createBrokerServer({ socketPath, dbPath }).start()).rejects.toThrow("Broker 已经在运行");
-    const stalePath = join(directory, "stale.sock");
-    await writeFile(stalePath, "stale");
+  it("拒绝同一数据库的第二个 Broker，并支持临时端口", async () => {
+    await expect(createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath,
+    }).start()).rejects.toThrow("Broker 数据目录已被占用");
     const another = createBrokerServer({
-      socketPath: stalePath,
+      listen: { host: "127.0.0.1", port: 0 },
       dbPath: join(directory, "stale.db"),
     });
     await another.start();
-    const client = await TestClient.connect(stalePath);
+    expect(another.endpoint.port).toBeGreaterThan(0);
+    const client = await TestClient.connect(another.endpoint);
     expect((await client.waitFor("snapshot")).payload.clientId).toBeTypeOf("string");
     await client.close();
     await another.close();
   });
 
-  it("并发启动时只允许一个 Broker 获得 Socket", async () => {
-    const racePath = join(directory, "race.sock");
+  it("并发启动时只允许一个 Broker 获得数据库锁", async () => {
     const raceDbPath = join(directory, "race.db");
+    const raceEndpoint = { host: "127.0.0.1", port: 0 };
     const candidates = [
-      createBrokerServer({ socketPath: racePath, dbPath: raceDbPath }),
-      createBrokerServer({ socketPath: racePath, dbPath: raceDbPath }),
+      createBrokerServer({ listen: raceEndpoint, dbPath: raceDbPath }),
+      createBrokerServer({ listen: raceEndpoint, dbPath: raceDbPath }),
     ];
     const results = await Promise.allSettled(candidates.map((candidate) => candidate.start()));
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);

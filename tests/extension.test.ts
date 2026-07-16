@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -12,6 +13,7 @@ import {
   createBrokerServer,
   type BrokerServer,
 } from "../src/broker/server.js";
+import type { TcpConnectEndpoint } from "../src/transport/tcp-endpoint.js";
 import {
   createCommsExtension,
   formatAgentRequest,
@@ -110,15 +112,26 @@ async function waitFor(
   }
 }
 
+async function freePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen({ host: "127.0.0.1", port: 0 }, resolveListen);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("未获得临时端口");
+  await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+  return address.port;
+}
+
 describe("Pi Extension 群组接入", () => {
   let directory: string;
-  let socketPath: string;
+  let endpoint: TcpConnectEndpoint;
   let dbPath: string;
   let broker: BrokerServer | undefined;
 
   beforeEach(async () => {
     directory = await mkdtemp(join(tmpdir(), "pi-comms-extension-"));
-    socketPath = join(directory, "broker.sock");
     dbPath = join(directory, "comms.db");
   });
 
@@ -127,17 +140,29 @@ describe("Pi Extension 群组接入", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  function setup(sessionId: string, branch: unknown[] = []) {
+  function setup(
+    sessionId: string,
+    branch: unknown[] = [],
+    startBroker: () => Promise<void> | void = () => {},
+  ) {
     const pi = new FakePi();
     const context = createFakeContext(sessionId, branch);
     createCommsExtension({
-      socketPath,
+      endpoint,
       reconnectIntervalMs: 20,
       resultRetryIntervalMs: 20,
       registerTestCommands: true,
-      startBroker: () => {},
+      startBroker,
     })(pi.api);
     return { pi, ...context };
+  }
+
+  async function launchBroker(
+    listen: TcpConnectEndpoint = { host: "127.0.0.1", port: 0 },
+  ): Promise<void> {
+    broker = createBrokerServer({ listen, dbPath });
+    await broker.start();
+    endpoint = broker.endpoint;
   }
 
   async function command(
@@ -188,8 +213,7 @@ describe("Pi Extension 群组接入", () => {
   }
 
   it("通过临时命令创建、加入、查看成员并公开聊天", async () => {
-    broker = createBrokerServer({ socketPath, dbPath });
-    await broker.start();
+    await launchBroker();
     const a = setup("session-a");
     const b = setup("session-b");
     await Promise.all([start(a), start(b)]);
@@ -211,8 +235,7 @@ describe("Pi Extension 群组接入", () => {
   });
 
   it("未入群不能发送，并能查看本机群组列表", async () => {
-    broker = createBrokerServer({ socketPath, dbPath });
-    await broker.start();
+    await launchBroker();
     const a = setup("session-a");
     const b = setup("session-b");
     await Promise.all([start(a), start(b)]);
@@ -230,9 +253,38 @@ describe("Pi Extension 群组接入", () => {
     ]);
   });
 
+  it("两个 Extension 并发首次连接时只启动一个 Broker", async () => {
+    endpoint = { host: "127.0.0.1", port: await freePort() };
+    const candidates: BrokerServer[] = [];
+    const starts: Promise<void>[] = [];
+    let winners = 0;
+    const startBroker = () => {
+      const candidate = createBrokerServer({ listen: endpoint, dbPath });
+      candidates.push(candidate);
+      starts.push(candidate.start().then(() => {
+        winners += 1;
+        broker = candidate;
+      }).catch(() => {}));
+    };
+    const a = setup("session-a", [], startBroker);
+    const b = setup("session-b", [], startBroker);
+    await Promise.all([start(a), start(b)]);
+    await Promise.all([command(a, "comms-members"), command(b, "comms-members")]);
+    await Promise.all(starts);
+
+    expect(winners).toBe(1);
+    expect(a.notices.at(-1)?.message).toBe("暂无群组");
+    expect(b.notices.at(-1)?.message).toBe("暂无群组");
+    await Promise.all([
+      a.pi.emit("session_shutdown", a.ctx),
+      b.pi.emit("session_shutdown", b.ctx),
+    ]);
+    await Promise.all(candidates.map((candidate) => candidate.close()));
+    broker = undefined;
+  });
+
   it("@Agent 只注入目标，并使用确定的群聊上下文格式", async () => {
-    broker = createBrokerServer({ socketPath, dbPath });
-    await broker.start();
+    await launchBroker();
     const a = setup("session-a");
     const b = setup("session-b");
     const c = setup("session-c");
@@ -277,8 +329,7 @@ describe("Pi Extension 群组接入", () => {
   });
 
   it("从 Session 恢复需要批准权限，未批准前不注入", async () => {
-    broker = createBrokerServer({ socketPath, dbPath });
-    await broker.start();
+    await launchBroker();
     const a = setup("session-a");
     const b = setup("session-b", [{
       type: "custom",
@@ -306,8 +357,7 @@ describe("Pi Extension 群组接入", () => {
   });
 
   it("忙碌 Agent 按 FIFO 处理连续请求", async () => {
-    broker = createBrokerServer({ socketPath, dbPath });
-    await broker.start();
+    await launchBroker();
     const a = setup("session-a");
     const b = setup("session-b");
     await Promise.all([start(a), start(b)]);
@@ -347,8 +397,7 @@ describe("Pi Extension 群组接入", () => {
   });
 
   it("离群时中止当前远程任务并清空队列", async () => {
-    broker = createBrokerServer({ socketPath, dbPath });
-    await broker.start();
+    await launchBroker();
     const a = setup("session-a");
     const b = setup("session-b");
     await Promise.all([start(a), start(b)]);
@@ -369,8 +418,7 @@ describe("Pi Extension 群组接入", () => {
   });
 
   it("Broker 重启后中止旧请求、自动重新入群并加载历史", async () => {
-    broker = createBrokerServer({ socketPath, dbPath });
-    await broker.start();
+    await launchBroker();
     const a = setup("session-a");
     const b = setup("session-b");
     await Promise.all([start(a), start(b)]);
@@ -379,9 +427,8 @@ describe("Pi Extension 群组接入", () => {
     await command(a, "comms-test", "@Bob-Pi 旧请求");
     await waitFor(() => b.pi.sentUserMessages.length === 1, "旧请求未开始");
 
-    await broker.close();
-    broker = createBrokerServer({ socketPath, dbPath });
-    await broker.start();
+    await broker?.close();
+    await launchBroker(endpoint);
     await waitFor(
       () =>
         a.notices.some((notice) => notice.message.includes("Broker 已重启")) &&

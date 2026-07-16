@@ -1,12 +1,8 @@
-import { spawn } from "node:child_process";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
   ExtensionContext,
   ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_SOCKET_PATH } from "../broker/server.js";
 import type {
   AgentRequestPayload,
   AgentResultAckPayload,
@@ -17,17 +13,23 @@ import type {
   SnapshotPayload,
 } from "../protocol.js";
 import type { AgentPermission, Group, GroupSummary, Member } from "../types.js";
+import {
+  DEFAULT_BROKER_ENDPOINT,
+  validateConnectEndpoint,
+  type TcpConnectEndpoint,
+} from "../transport/tcp-endpoint.js";
 import { ChatView } from "../tui/chat-view.js";
 import { BrokerClient } from "./broker-client.js";
+import { startLocalBroker } from "./broker-process.js";
 import { RemoteQueue } from "./remote-queue.js";
 
 const STATUS_KEY = "pi-comms";
 const PERMISSION_ENTRY = "pi-comms-permission";
 const DEFAULT_RESULT_RETRY_INTERVAL_MS = 1_000;
-const DEFAULT_BROKER_START_TIMEOUT_MS = 2_000;
+const DEFAULT_BROKER_START_TIMEOUT_MS = 8_000;
 
 export interface CommsExtensionOptions {
-  socketPath?: string;
+  endpoint?: TcpConnectEndpoint;
   reconnectIntervalMs?: number;
   resultRetryIntervalMs?: number;
   startBroker?: () => Promise<void> | void;
@@ -37,10 +39,10 @@ export interface CommsExtensionOptions {
 export function createCommsExtension(
   options: CommsExtensionOptions = {},
 ): (pi: ExtensionAPI) => void {
-  const socketPath = options.socketPath ?? DEFAULT_SOCKET_PATH;
+  const endpoint = validateConnectEndpoint(options.endpoint ?? DEFAULT_BROKER_ENDPOINT);
   const resultRetryIntervalMs =
     options.resultRetryIntervalMs ?? DEFAULT_RESULT_RETRY_INTERVAL_MS;
-  const startBroker = options.startBroker ?? startLocalBroker;
+  const startBroker = options.startBroker ?? (() => startLocalBroker(endpoint));
 
   return (pi: ExtensionAPI) => {
     const remoteQueue = new RemoteQueue();
@@ -64,12 +66,13 @@ export function createCommsExtension(
     let cachedUserName = "";
     let cachedAgentName = "";
     let brokerStartTask: Promise<boolean> | undefined;
+    let brokerStartError: string | undefined;
     let permission: AgentPermission = "auto";
     const pendingApprovals = new Map<string, AgentRequestPayload>();
     const pausedChains = new Map<string, PausedChainPayload>();
 
     const brokerClient = new BrokerClient({
-      socketPath,
+      endpoint,
       reconnectIntervalMs: options.reconnectIntervalMs,
       onMessage: handleBrokerMessage,
       onDisconnected: (wasConnected) => {
@@ -345,7 +348,13 @@ export function createCommsExtension(
       brokerStartTask = (async () => {
         if (sessionId === undefined) return false;
         if (await brokerClient.start(sessionId, permission)) return true;
-        await startBroker();
+        try {
+          await startBroker();
+          brokerStartError = undefined;
+        } catch (error) {
+          brokerStartError = error instanceof Error ? error.message : String(error);
+          return false;
+        }
         const deadline = Date.now() + DEFAULT_BROKER_START_TIMEOUT_MS;
         while (Date.now() < deadline) {
           await new Promise((resolveWait) => setTimeout(resolveWait, 50));
@@ -365,7 +374,10 @@ export function createCommsExtension(
       if (await connectOrStartBroker()) {
         return true;
       }
-      ctx.ui.notify("无法启动或连接 Broker", "error");
+      ctx.ui.notify(
+        brokerStartError ?? brokerClient.lastError ?? "无法启动或连接 Broker",
+        "error",
+      );
       return false;
     }
 
@@ -462,6 +474,14 @@ export function createCommsExtension(
         resultRetryTimer ??= setInterval(flushPendingResults, resultRetryIntervalMs);
 
         const connection = connectOrStartBroker();
+        void connection.then((connected) => {
+          if (!connected && commsOpen) {
+            ctx.ui.notify(
+              brokerStartError ?? brokerClient.lastError ?? "无法启动或连接 Broker",
+              "error",
+            );
+          }
+        });
         try {
           await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
             const view = new ChatView({
@@ -691,16 +711,6 @@ function registerTestCommands(
       brokerClient.send("chat.send", { text: args.trim() || "测试消息" });
     },
   });
-}
-
-async function startLocalBroker(): Promise<void> {
-  const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-  const child = spawn("npm", ["run", "broker"], {
-    cwd: projectRoot,
-    detached: true,
-    stdio: "ignore",
-  });
-  child.unref();
 }
 
 function parseCommandArgs(args: string, count: number): string[] | undefined {
