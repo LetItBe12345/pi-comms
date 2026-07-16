@@ -5,7 +5,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createBrokerServer, type BrokerServer } from "../src/broker/server.js";
 import { BrokerClient } from "../src/extension/broker-client.js";
-import { createEnvelope, encodeEnvelope, JsonlDecoder, type BrokerEnvelope } from "../src/protocol.js";
+import {
+  BROKER_PROTOCOL_VERSION,
+  createEnvelope,
+  encodeEnvelope,
+  JsonlDecoder,
+  type BrokerEnvelope,
+} from "../src/protocol.js";
 import { probeBroker } from "../src/transport/broker-probe.js";
 import {
   DEFAULT_BROKER_ENDPOINT,
@@ -83,6 +89,8 @@ describe("TCP Broker 握手", () => {
       socket.once("error", rejectConnect);
     });
     socket.write(encodeEnvelope(createEnvelope("client.hello", {
+      protocolVersion: BROKER_PROTOCOL_VERSION,
+      deviceId: "00000000-0000-4000-8000-000000000001",
       sessionId: "without-probe",
       permission: "auto",
     })));
@@ -91,6 +99,129 @@ describe("TCP Broker 握手", () => {
       payload: { code: "invalid_payload" },
     });
     socket.destroy();
+  });
+
+  it("协议版本不一致时返回明确错误并关闭连接", async () => {
+    directory = await mkdtemp(join(tmpdir(), "pi-comms-tcp-"));
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath: join(directory, "comms.db"),
+    });
+    await broker.start();
+    const socket = createConnection(broker.endpoint);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+    const closed = new Promise<void>((resolve) => socket.once("close", resolve));
+    socket.write(encodeEnvelope(createEnvelope("broker.probe", {
+      service: "pi-comms",
+      protocolVersion: 1,
+    })));
+    expect(await waitSocketMessage(socket)).toMatchObject({
+      type: "error",
+      payload: { code: "protocol_mismatch" },
+    });
+    await closed;
+  });
+
+  it("未发送 client.hello 的连接会超时关闭", async () => {
+    directory = await mkdtemp(join(tmpdir(), "pi-comms-tcp-"));
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath: join(directory, "comms.db"),
+      helloTimeoutMs: 40,
+    });
+    await broker.start();
+    const socket = createConnection(broker.endpoint);
+    const closed = new Promise<void>((resolve) => socket.once("close", resolve));
+    expect(await waitSocketMessage(socket)).toMatchObject({
+      type: "error",
+      payload: { code: "hello_timeout" },
+    });
+    await closed;
+  });
+
+  it("客户端停止心跳后 Broker 判定失联", async () => {
+    directory = await mkdtemp(join(tmpdir(), "pi-comms-tcp-"));
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath: join(directory, "comms.db"),
+      heartbeatTimeoutMs: 60,
+      disconnectGraceMs: 20,
+    });
+    await broker.start();
+    let resolveDisconnected!: () => void;
+    const disconnected = new Promise<void>((resolve) => {
+      resolveDisconnected = resolve;
+    });
+    const errors: BrokerEnvelope[] = [];
+    const client = new BrokerClient({
+      endpoint: broker.endpoint,
+      deviceId: "00000000-0000-4000-8000-000000000001",
+      heartbeatIntervalMs: 1_000,
+      reconnectIntervalMs: 1_000,
+      onMessage(message) {
+        if (message.type === "error") errors.push(message);
+      },
+      onDisconnected() { resolveDisconnected(); },
+    });
+    try {
+      await expect(client.start("heartbeat-session")).resolves.toBe(true);
+      await Promise.race([
+        disconnected,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("等待心跳超时")), 500)),
+      ]);
+      expect(errors).toContainEqual(expect.objectContaining({
+        payload: expect.objectContaining({ code: "heartbeat_timeout" }),
+      }));
+    } finally {
+      await client.stop();
+    }
+  });
+
+  it("正常心跳让连接持续在线", async () => {
+    directory = await mkdtemp(join(tmpdir(), "pi-comms-tcp-"));
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath: join(directory, "comms.db"),
+      heartbeatTimeoutMs: 70,
+    });
+    await broker.start();
+    const client = new BrokerClient({
+      endpoint: broker.endpoint,
+      deviceId: "00000000-0000-4000-8000-000000000001",
+      heartbeatIntervalMs: 20,
+      heartbeatTimeoutMs: 60,
+      onMessage() {},
+      onDisconnected() {},
+    });
+    try {
+      await expect(client.start("healthy-heartbeat")).resolves.toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 140));
+      expect(client.connected).toBe(true);
+    } finally {
+      await client.stop();
+    }
+  });
+
+  it("超大 JSONL 帧返回 frame_too_large 并关闭连接", async () => {
+    directory = await mkdtemp(join(tmpdir(), "pi-comms-tcp-"));
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath: join(directory, "comms.db"),
+      maxFrameBytes: 64,
+    });
+    await broker.start();
+    const socket = createConnection(broker.endpoint);
+    const closed = new Promise<void>((resolve) => socket.once("close", resolve));
+    const message = waitSocketMessage(socket);
+    socket.write("x".repeat(65));
+    expect(await message).toMatchObject({
+      type: "error",
+      payload: { code: "frame_too_large" },
+    });
+    await closed;
   });
 
   it("不会把无关 TCP 服务误认为 Broker", async () => {
@@ -135,6 +266,7 @@ describe("TCP Broker 握手", () => {
     const client = new BrokerClient({
       endpoint: first.endpoint,
       reconnectIntervalMs: 20,
+      deviceId: "00000000-0000-4000-8000-000000000001",
       onMessage(message) {
         if (message.type === "snapshot") snapshots.push(message.payload.brokerInstanceId);
       },
@@ -156,5 +288,19 @@ function listen(server: Server): Promise<void> {
   return new Promise((resolveListen, rejectListen) => {
     server.once("error", rejectListen);
     server.listen({ host: "127.0.0.1", port: 0 }, resolveListen);
+  });
+}
+
+function waitSocketMessage(socket: Socket): Promise<BrokerEnvelope> {
+  const decoder = new JsonlDecoder();
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("等待 Broker 消息超时")), 1_000);
+    socket.on("data", (chunk) => {
+      for (const result of decoder.push(chunk)) {
+        if (!result.ok) continue;
+        clearTimeout(timeout);
+        resolve(result.value as BrokerEnvelope);
+      }
+    });
   });
 }

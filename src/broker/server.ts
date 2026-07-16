@@ -1,8 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createServer, type AddressInfo, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { loadOrCreateDeviceId } from "../device-identity.js";
 import {
   BROKER_PROTOCOL_VERSION,
   BROKER_SERVICE,
@@ -22,6 +23,7 @@ import {
   type PausedChainPayload,
   type SendFailedPayload,
 } from "../protocol.js";
+import { createSessionKey, type SessionKey } from "../session-key.js";
 import {
   DEFAULT_BROKER_ENDPOINT,
   formatEndpoint,
@@ -52,12 +54,21 @@ export const DEFAULT_DATABASE_PATH = join(
   "comms.db",
 );
 
-const DEFAULT_DISCONNECT_GRACE_MS = 3_000;
+export const DEFAULT_LOCAL_DISCONNECT_GRACE_MS = 3_000;
+export const DEFAULT_LAN_DISCONNECT_GRACE_MS = 15_000;
+export const DEFAULT_HELLO_TIMEOUT_MS = 3_000;
+export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 15_000;
 
 export interface BrokerServerOptions {
   listen?: TcpListenEndpoint;
   dbPath?: string;
   disconnectGraceMs?: number;
+  localDisconnectGraceMs?: number;
+  lanDisconnectGraceMs?: number;
+  helloTimeoutMs?: number;
+  heartbeatTimeoutMs?: number;
+  maxFrameBytes?: number;
+  deviceId?: string;
 }
 
 export interface BrokerServer {
@@ -70,8 +81,10 @@ export interface BrokerServer {
 
 interface ClientSession {
   clientId: string;
+  resumeToken: string;
   socket?: Socket;
   disconnectTimer?: ReturnType<typeof setTimeout>;
+  heartbeatTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface PendingRequest {
@@ -92,11 +105,17 @@ export function createBrokerServer(
   const listen = validateListenEndpoint(options.listen ?? DEFAULT_BROKER_ENDPOINT);
   let endpoint = listen;
   const dbPath = options.dbPath ?? DEFAULT_DATABASE_PATH;
-  const disconnectGraceMs =
-    options.disconnectGraceMs ?? DEFAULT_DISCONNECT_GRACE_MS;
+  const localDisconnectGraceMs = options.disconnectGraceMs ??
+    options.localDisconnectGraceMs ?? DEFAULT_LOCAL_DISCONNECT_GRACE_MS;
+  const lanDisconnectGraceMs = options.disconnectGraceMs ??
+    options.lanDisconnectGraceMs ?? DEFAULT_LAN_DISCONNECT_GRACE_MS;
+  const helloTimeoutMs = options.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS;
+  const heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
+  const maxFrameBytes = options.maxFrameBytes;
+  const deviceId = options.deviceId ?? loadOrCreateDeviceId();
   const instanceId = randomUUID();
   const clients = new Map<string, Socket>();
-  const sessions = new Map<string, ClientSession>();
+  const sessions = new Map<SessionKey, ClientSession>();
   let groups = new GroupState();
   let database: BrokerDatabase | undefined;
   const pendingRequests = new Map<string, PendingRequest>();
@@ -110,15 +129,23 @@ export function createBrokerServer(
   let processLock: BrokerProcessLock | undefined;
 
   function handleConnection(socket: Socket): void {
-    const decoder = new JsonlDecoder();
-    let sessionId: string | undefined;
+    const decoder = new JsonlDecoder(maxFrameBytes);
+    let sessionKey: SessionKey | undefined;
     let clientId: string | undefined;
     let acceptedProbe = false;
+    let helloTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
+      sendError(socket, { code: "hello_timeout", message: "client.hello 握手超时" });
+      socket.end();
+    }, helloTimeoutMs);
 
     socket.on("data", (chunk) => {
       for (const result of decoder.push(chunk)) {
         if (!result.ok) {
-          sendError(socket, { code: "invalid_json", message: result.error });
+          sendError(socket, { code: result.code, message: result.error });
+          if (result.code === "frame_too_large") {
+            socket.end();
+            return;
+          }
           continue;
         }
         const parsed = parseClientEnvelope(result.value);
@@ -128,12 +155,24 @@ export function createBrokerServer(
             message: parsed.message,
             requestId: parsed.requestId,
           });
+          if (parsed.code === "protocol_mismatch") socket.end();
           continue;
         }
 
         if (parsed.envelope.type === "broker.probe") {
-          acceptedProbe = parsed.envelope.payload.service === BROKER_SERVICE &&
-            parsed.envelope.payload.protocolVersion === BROKER_PROTOCOL_VERSION;
+          if (
+            parsed.envelope.payload.service !== BROKER_SERVICE ||
+            parsed.envelope.payload.protocolVersion !== BROKER_PROTOCOL_VERSION
+          ) {
+            sendError(socket, {
+              code: "protocol_mismatch",
+              message: "Pi Comms 协议版本不兼容",
+              requestId: parsed.envelope.id,
+            });
+            socket.end();
+            return;
+          }
+          acceptedProbe = true;
           send(socket, createEnvelope("broker.ready", {
             service: BROKER_SERVICE,
             protocolVersion: BROKER_PROTOCOL_VERSION,
@@ -161,12 +200,17 @@ export function createBrokerServer(
             continue;
           }
           const identity = registerClient(socket, parsed.envelope);
-          sessionId = identity.sessionId;
+          if (identity === undefined) return;
+          if (helloTimer !== undefined) {
+            clearTimeout(helloTimer);
+            helloTimer = undefined;
+          }
+          sessionKey = identity.sessionKey;
           clientId = identity.clientId;
           continue;
         }
 
-        if (clientId === undefined || sessionId === undefined) {
+        if (clientId === undefined || sessionKey === undefined) {
           sendError(socket, {
             code: "invalid_payload",
             message: "发送消息前必须先发送 client.hello",
@@ -175,16 +219,15 @@ export function createBrokerServer(
           continue;
         }
 
+        if (parsed.envelope.type === "ping") {
+          const session = sessions.get(sessionKey);
+          if (session?.socket === socket) armHeartbeat(sessionKey, session, socket);
+          send(socket, createEnvelope("pong", { requestId: parsed.envelope.id }) as BrokerEnvelope);
+          continue;
+        }
+
         if (parsed.envelope.type === "client.goodbye") {
-          if (parsed.envelope.payload.sessionId !== sessionId) {
-            sendError(socket, {
-              code: "invalid_payload",
-              message: "client.goodbye sessionId 不匹配",
-              requestId: parsed.envelope.id,
-            });
-            continue;
-          }
-          removeClientSession(sessionId, clientId, socket);
+          removeClientSession(sessionKey, clientId, socket);
           socket.end();
           continue;
         }
@@ -195,8 +238,9 @@ export function createBrokerServer(
 
     socket.on("error", () => socket.destroy());
     socket.once("close", () => {
-      if (clientId !== undefined && sessionId !== undefined) {
-        handleUnexpectedDisconnect(sessionId, clientId, socket);
+      if (helloTimer !== undefined) clearTimeout(helloTimer);
+      if (clientId !== undefined && sessionKey !== undefined) {
+        handleUnexpectedDisconnect(sessionKey, clientId, socket);
       }
     });
   }
@@ -204,12 +248,32 @@ export function createBrokerServer(
   function registerClient(
     socket: Socket,
     hello: ClientHelloEnvelope,
-  ): { sessionId: string; clientId: string } {
-    const sessionId = hello.payload.sessionId;
-    let session = sessions.get(sessionId);
+  ): { sessionKey: SessionKey; clientId: string } | undefined {
+    const sessionKey = createSessionKey(hello.payload.deviceId, hello.payload.sessionId);
+    let session = sessions.get(sessionKey);
     if (session === undefined) {
-      session = { clientId: hello.payload.clientId ?? randomUUID() };
-      sessions.set(sessionId, session);
+      if (hello.payload.clientId !== undefined) {
+        sendError(socket, { code: "resume_rejected", message: "无法恢复原连接" });
+        socket.end();
+        return undefined;
+      }
+      session = {
+        clientId: randomUUID(),
+        resumeToken: randomBytes(32).toString("base64url"),
+      };
+      sessions.set(sessionKey, session);
+    } else if (
+      hello.payload.clientId !== session.clientId ||
+      hello.payload.resumeToken !== session.resumeToken
+    ) {
+      sendError(socket, {
+        code: hello.payload.clientId === undefined ? "session_in_use" : "resume_rejected",
+        message: hello.payload.clientId === undefined
+          ? "该 Pi Session 已在使用中"
+          : "无法恢复原连接",
+      });
+      socket.end();
+      return undefined;
     }
     if (session.disconnectTimer !== undefined) {
       clearTimeout(session.disconnectTimer);
@@ -223,8 +287,14 @@ export function createBrokerServer(
     permissions.set(clientId, hello.payload.permission);
     session.socket = socket;
     clients.set(clientId, socket);
+    armHeartbeat(sessionKey, session, socket);
     groups.setAgentPermission(clientId, hello.payload.permission);
     const reconnectedMembers = groups.setOnline(clientId, true);
+    send(socket, createEnvelope("client.welcome", {
+      brokerInstanceId: instanceId,
+      clientId,
+      resumeToken: session.resumeToken,
+    }) as BrokerEnvelope);
     sendSnapshot(clientId, socket);
     if (reconnectedMembers.length > 0) {
       broadcastPresence(reconnectedMembers, clientId);
@@ -232,11 +302,25 @@ export function createBrokerServer(
     }
     resendUnacknowledgedDeliveries(clientId, socket);
     resendPendingApprovals(clientId, socket);
-    return { sessionId, clientId };
+    return { sessionKey, clientId };
+  }
+
+  function armHeartbeat(
+    sessionKey: SessionKey,
+    session: ClientSession,
+    socket: Socket,
+  ): void {
+    if (session.heartbeatTimer !== undefined) clearTimeout(session.heartbeatTimer);
+    session.heartbeatTimer = setTimeout(() => {
+      session.heartbeatTimer = undefined;
+      if (sessions.get(sessionKey)?.socket !== socket) return;
+      sendError(socket, { code: "heartbeat_timeout", message: "客户端心跳超时" });
+      socket.end();
+    }, heartbeatTimeoutMs);
   }
 
   function handleUnexpectedDisconnect(
-    sessionId: string,
+    sessionKey: SessionKey,
     clientId: string,
     socket: Socket,
   ): void {
@@ -244,9 +328,13 @@ export function createBrokerServer(
       return;
     }
     clients.delete(clientId);
-    const session = sessions.get(sessionId);
+    const session = sessions.get(sessionKey);
     if (session?.socket === socket) {
       session.socket = undefined;
+      if (session.heartbeatTimer !== undefined) {
+        clearTimeout(session.heartbeatTimer);
+        session.heartbeatTimer = undefined;
+      }
     }
     if (closing) {
       return;
@@ -258,6 +346,9 @@ export function createBrokerServer(
       broadcastGroupsChanged();
     }
     if (session !== undefined) {
+      const graceMs = isLoopbackAddress(socket.remoteAddress)
+        ? localDisconnectGraceMs
+        : lanDisconnectGraceMs;
       session.disconnectTimer = setTimeout(() => {
         session.disconnectTimer = undefined;
         if (!clients.has(clientId)) {
@@ -269,21 +360,24 @@ export function createBrokerServer(
             ]);
           }
           failRequestsForTarget(clientId, "target_offline");
+          permissions.delete(clientId);
+          sessions.delete(sessionKey);
         }
-      }, disconnectGraceMs);
+      }, graceMs);
     }
   }
 
   function removeClientSession(
-    sessionId: string,
+    sessionKey: SessionKey,
     clientId: string,
     socket: Socket,
   ): void {
-    const session = sessions.get(sessionId);
+    const session = sessions.get(sessionKey);
     if (session?.disconnectTimer !== undefined) {
       clearTimeout(session.disconnectTimer);
     }
-    sessions.delete(sessionId);
+    if (session?.heartbeatTimer !== undefined) clearTimeout(session.heartbeatTimer);
+    sessions.delete(sessionKey);
     permissions.delete(clientId);
     if (clients.get(clientId) !== socket) {
       return;
@@ -515,6 +609,7 @@ export function createBrokerServer(
             reason,
           ),
           {
+            initiatorSessionKey: sessionKeyForClient(clientId)!,
             requestId,
             groupId: group.groupId,
             messageId: message.id,
@@ -615,7 +710,7 @@ export function createBrokerServer(
       createdAt: Date.now(),
     };
     const context: AgentChainContext = {
-      initiatorSessionId: sessionIdForClient(clientId) ?? clientId,
+      initiatorSessionKey: sessionKeyForClient(clientId) ?? createSessionKey(deviceId, clientId),
       initiatorName: membership.user.displayName,
       participants: [target.displayName],
       roundLimit: 10,
@@ -909,7 +1004,7 @@ export function createBrokerServer(
           chainId: pending.request.chainId,
           groupId: pending.groupId,
           messageId: answer.id,
-          initiatorSessionId: pending.context.initiatorSessionId,
+          initiatorSessionKey: pending.context.initiatorSessionKey,
           initiatorName: pending.context.initiatorName,
           sourceAgentName: pending.request.targetAgentName,
           sourceOwnerUserName: sourceMembership?.user.displayName ?? "",
@@ -1039,12 +1134,12 @@ export function createBrokerServer(
     resume: boolean,
   ): void {
     const paused = db().pausedChain(chainId);
-    const sessionId = sessionIdForClient(clientId);
+    const sessionKey = sessionKeyForClient(clientId);
     const group = groups.groupForClient(clientId);
     if (
       paused === undefined ||
-      sessionId === undefined ||
-      paused.initiatorSessionId !== sessionId ||
+      sessionKey === undefined ||
+      paused.initiatorSessionKey !== sessionKey ||
       group?.groupId !== paused.groupId
     ) {
       sendError(socket, {
@@ -1114,7 +1209,7 @@ export function createBrokerServer(
     const awaitingApproval = permission === "approval";
     const roundLimit = paused.roundLimit + 10;
     const context: AgentChainContext = {
-      initiatorSessionId: paused.initiatorSessionId,
+      initiatorSessionKey: paused.initiatorSessionKey,
       initiatorName: paused.initiatorName,
       participants: paused.participants,
       roundLimit,
@@ -1167,16 +1262,16 @@ export function createBrokerServer(
   }
 
   function sendPausedChain(paused: StoredPausedChain): void {
-    const ownerSocket = sessions.get(paused.initiatorSessionId)?.socket;
+    const ownerSocket = sessions.get(paused.initiatorSessionKey)?.socket;
     if (ownerSocket === undefined) return;
-    const { messageId: _messageId, initiatorSessionId: _sessionId,
+    const { messageId: _messageId, initiatorSessionKey: _sessionKey,
       targetAgentId: _targetAgentId, ...payload } = paused;
     send(ownerSocket, createEnvelope("chain.paused", payload) as BrokerEnvelope);
   }
 
-  function sessionIdForClient(clientId: string): string | undefined {
-    for (const [sessionId, session] of sessions) {
-      if (session.clientId === clientId) return sessionId;
+  function sessionKeyForClient(clientId: string): SessionKey | undefined {
+    for (const [sessionKey, session] of sessions) {
+      if (session.clientId === clientId) return sessionKey;
     }
     return undefined;
   }
@@ -1192,7 +1287,7 @@ export function createBrokerServer(
 
   function sendSnapshot(clientId: string, socket: Socket): void {
     const group = groups.groupForClient(clientId);
-    const sessionId = sessionIdForClient(clientId);
+    const sessionKey = sessionKeyForClient(clientId);
     send(
       socket,
       createEnvelope("snapshot", {
@@ -1204,10 +1299,10 @@ export function createBrokerServer(
         messages:
           group === undefined ? [] : db().recentMessages(group.groupId),
         pausedChains:
-          group === undefined || sessionId === undefined
+          group === undefined || sessionKey === undefined
             ? []
-            : db().pausedChains(sessionId, group.groupId).map((paused) => {
-                const { messageId: _messageId, initiatorSessionId: _owner,
+            : db().pausedChains(sessionKey, group.groupId).map((paused) => {
+                const { messageId: _messageId, initiatorSessionKey: _owner,
                   targetAgentId: _target, ...payload } = paused;
                 return payload;
               }),
@@ -1297,7 +1392,7 @@ export function createBrokerServer(
     if (dbPath === DEFAULT_DATABASE_PATH) await assertNoLiveLegacyBroker();
     processLock = await acquireBrokerProcessLock(dbPath);
     try {
-      database = new BrokerDatabase(dbPath);
+      database = new BrokerDatabase(dbPath, deviceId);
       groups = new GroupState(database.groups());
       await new Promise<void>((resolveStart, rejectStart) => {
         const onError = (error: NodeJS.ErrnoException) => {
@@ -1335,6 +1430,9 @@ export function createBrokerServer(
     for (const session of sessions.values()) {
       if (session.disconnectTimer !== undefined) {
         clearTimeout(session.disconnectTimer);
+      }
+      if (session.heartbeatTimer !== undefined) {
+        clearTimeout(session.heartbeatTimer);
       }
       session.socket?.destroy();
     }
@@ -1383,6 +1481,13 @@ function send(socket: Socket, envelope: Envelope): void {
   if (!socket.destroyed) {
     socket.write(encodeEnvelope(envelope));
   }
+}
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  return address === undefined ||
+    address === "::1" ||
+    address.startsWith("127.") ||
+    address.startsWith("::ffff:127.");
 }
 
 async function runBroker(): Promise<void> {

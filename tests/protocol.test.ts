@@ -66,9 +66,17 @@ describe("JSONL 协议", () => {
     const valid = createEnvelope("chat.send", { text: "继续" });
 
     expect(decoder.push(`{bad json}\n${encodeEnvelope(valid)}`)).toEqual([
-      { ok: false, error: "消息不是合法的 JSON" },
+      { ok: false, code: "invalid_json", error: "消息不是合法的 JSON" },
       { ok: true, value: valid },
     ]);
+  });
+
+  it("帧超过上限时立即拒绝并清空缓存", () => {
+    const decoder = new JsonlDecoder(8);
+    expect(decoder.push("123456789")).toEqual([
+      { ok: false, code: "frame_too_large", error: "消息帧超过上限" },
+    ]);
+    expect(decoder.push("{}\n")).toEqual([{ ok: true, value: {} }]);
   });
 });
 
@@ -130,6 +138,8 @@ describe("客户端消息校验", () => {
     expect(
       parseClientEnvelope(
         createEnvelope("client.hello", {
+          protocolVersion: BROKER_PROTOCOL_VERSION,
+          deviceId: "00000000-0000-4000-8000-000000000001",
           sessionId: "session-a",
           permission: "auto",
         }),
@@ -137,7 +147,7 @@ describe("客户端消息校验", () => {
     ).toBe(true);
     expect(
       parseClientEnvelope(
-        createEnvelope("client.goodbye", { sessionId: "session-a" }),
+        createEnvelope("client.goodbye", {}),
       ).ok,
     ).toBe(true);
     expect(
@@ -163,6 +173,22 @@ describe("客户端消息校验", () => {
     expect(
       parseClientEnvelope(createEnvelope("chain.end", { chainId: "chain-a" })).ok,
     ).toBe(true);
+  });
+
+  it("拒绝旧协议以及不成对的恢复凭证", () => {
+    expect(parseClientEnvelope(createEnvelope("client.hello", {
+      protocolVersion: 1,
+      deviceId: "device-a",
+      sessionId: "session-a",
+      permission: "auto",
+    }))).toMatchObject({ ok: false, code: "protocol_mismatch" });
+    expect(parseClientEnvelope(createEnvelope("client.hello", {
+      protocolVersion: BROKER_PROTOCOL_VERSION,
+      deviceId: "device-a",
+      sessionId: "session-a",
+      clientId: "client-a",
+      permission: "auto",
+    }))).toMatchObject({ ok: false, code: "invalid_payload" });
   });
 
   it("接受创建、加入和离开群组", () => {

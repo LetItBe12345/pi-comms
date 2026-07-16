@@ -60,6 +60,10 @@ export function probeBroker(
           return;
         }
         const message = decoded.value as BrokerEnvelope;
+        if (message.type === "error") {
+          finish({ status: "incompatible", reason: message.payload.message });
+          return;
+        }
         if (message.type !== "broker.ready" || message.payload.requestId !== probe.id) {
           continue;
         }

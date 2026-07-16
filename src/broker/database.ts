@@ -11,6 +11,8 @@ import type {
   PausedChainPayload,
 } from "../protocol.js";
 import type { Group } from "../types.js";
+import { createSessionKey, type SessionKey } from "../session-key.js";
+import { loadOrCreateDeviceId } from "../device-identity.js";
 
 export type AgentRequestStatus =
   | "awaiting_approval"
@@ -24,6 +26,7 @@ export type AgentRequestStatus =
   | "invalid";
 
 export interface FailedAgentRequest {
+  initiatorSessionKey: SessionKey;
   requestId: string;
   groupId: string;
   messageId: string;
@@ -39,7 +42,7 @@ export interface FailedAgentRequest {
 }
 
 export interface AgentChainContext {
-  initiatorSessionId: string;
+  initiatorSessionKey: SessionKey;
   initiatorName: string;
   participants: string[];
   roundLimit: number;
@@ -47,14 +50,17 @@ export interface AgentChainContext {
 
 export interface StoredPausedChain extends PausedChainPayload {
   messageId: string;
-  initiatorSessionId: string;
+  initiatorSessionKey: SessionKey;
   targetAgentId: string;
 }
 
 export class BrokerDatabase {
   readonly #db: Database.Database;
 
-  constructor(readonly path: string) {
+  constructor(
+    readonly path: string,
+    readonly migrationDeviceId: string = loadOrCreateDeviceId(),
+  ) {
     mkdirSync(dirname(path), { recursive: true });
     this.#db = new Database(path);
     try {
@@ -138,7 +144,7 @@ export class BrokerDatabase {
              request_id, group_id, message_id, sender_id, sender_name,
              target_agent_id, target_agent_name, owner_user_name,
              sender_type, sender_owner_user_name, online_members, text,
-             chain_id, round, status, initiator_session_id, initiator_name,
+             chain_id, round, status, initiator_session_key, initiator_name,
              participants, round_limit, created_at, updated_at
            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
@@ -158,7 +164,7 @@ export class BrokerDatabase {
           request.chainId,
           request.round,
           awaitingApproval ? "awaiting_approval" : "pending",
-          context?.initiatorSessionId ?? "",
+          context?.initiatorSessionKey ?? createSessionKey(this.migrationDeviceId, request.requestId),
           context?.initiatorName ?? request.senderName,
           JSON.stringify(context?.participants ?? [request.targetAgentName]),
           context?.roundLimit ?? 10,
@@ -187,7 +193,7 @@ export class BrokerDatabase {
         const paused = next.paused;
         this.#db.prepare(
           `INSERT INTO paused_chains (
-             chain_id, group_id, message_id, initiator_session_id,
+             chain_id, group_id, message_id, initiator_session_key,
              initiator_name, source_agent_name, target_agent_id,
              source_owner_user_name, target_agent_name, text, next_round, round_limit,
              participants, paused_at
@@ -196,7 +202,7 @@ export class BrokerDatabase {
           paused.chainId,
           paused.groupId,
           paused.messageId,
-          paused.initiatorSessionId,
+          paused.initiatorSessionKey,
           paused.initiatorName,
           paused.sourceAgentName,
           paused.targetAgentId,
@@ -215,26 +221,26 @@ export class BrokerDatabase {
     })();
   }
 
-  pausedChains(sessionId: string, groupId: string): StoredPausedChain[] {
+  pausedChains(sessionKey: SessionKey, groupId: string): StoredPausedChain[] {
     const rows = this.#db.prepare(
       `SELECT chain_id AS chainId, group_id AS groupId, message_id AS messageId,
-              initiator_session_id AS initiatorSessionId,
+              initiator_session_key AS initiatorSessionKey,
               initiator_name AS initiatorName, source_agent_name AS sourceAgentName,
               source_owner_user_name AS sourceOwnerUserName,
               target_agent_id AS targetAgentId, target_agent_name AS targetAgentName,
               text, next_round AS nextRound, round_limit AS roundLimit,
               participants, paused_at AS pausedAt
        FROM paused_chains
-       WHERE initiator_session_id = ? AND group_id = ?
+       WHERE initiator_session_key = ? AND group_id = ?
        ORDER BY paused_at DESC`,
-    ).all(sessionId, groupId) as Array<Omit<StoredPausedChain, "participants"> & { participants: string }>;
+    ).all(sessionKey, groupId) as Array<Omit<StoredPausedChain, "participants"> & { participants: string }>;
     return rows.map((row) => ({ ...row, participants: JSON.parse(row.participants) as string[] }));
   }
 
   pausedChain(chainId: string): StoredPausedChain | undefined {
     const row = this.#db.prepare(
       `SELECT chain_id AS chainId, group_id AS groupId, message_id AS messageId,
-              initiator_session_id AS initiatorSessionId,
+              initiator_session_key AS initiatorSessionKey,
               initiator_name AS initiatorName, source_agent_name AS sourceAgentName,
               source_owner_user_name AS sourceOwnerUserName,
               target_agent_id AS targetAgentId, target_agent_name AS targetAgentName,
@@ -288,8 +294,8 @@ export class BrokerDatabase {
              request_id, group_id, message_id, sender_id, sender_name,
              target_agent_id, target_agent_name, owner_user_name,
              online_members, text, chain_id, round, status, failure_reason,
-             created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?)`,
+             initiator_session_key, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           request.requestId,
@@ -305,6 +311,7 @@ export class BrokerDatabase {
           request.round,
           status,
           request.failureReason,
+          request.initiatorSessionKey,
           message.timestamp,
           message.timestamp,
         );
@@ -426,7 +433,7 @@ export class BrokerDatabase {
          request_id, group_id, message_id, sender_id, sender_name,
          target_agent_id, target_agent_name, owner_user_name,
          sender_type, sender_owner_user_name, online_members, text,
-         chain_id, round, status, initiator_session_id, initiator_name,
+         chain_id, round, status, initiator_session_key, initiator_name,
          participants, round_limit, created_at, updated_at
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
@@ -436,7 +443,7 @@ export class BrokerDatabase {
       request.senderOwnerUserName ?? null, JSON.stringify(request.onlineMembers),
       request.text, request.chainId, request.round,
       awaitingApproval ? "awaiting_approval" : "pending",
-      context.initiatorSessionId, context.initiatorName,
+      context.initiatorSessionKey, context.initiatorName,
       JSON.stringify(context.participants), context.roundLimit,
       timestamp, timestamp,
     );
@@ -581,10 +588,43 @@ export class BrokerDatabase {
 
   #migrate(): void {
     const version = this.#db.pragma("user_version", { simple: true }) as number;
-    if (version > 3) {
+    if (version > 4) {
       throw new Error(`数据库版本不受支持：${version}`);
     }
+    if (version === 4) {
+      return;
+    }
     if (version === 3) {
+      this.#db.transaction(() => {
+        this.#db.exec(`
+          DROP INDEX paused_chains_owner_group_idx;
+          ALTER TABLE agent_requests
+            RENAME COLUMN initiator_session_id TO initiator_session_key;
+          ALTER TABLE paused_chains
+            RENAME COLUMN initiator_session_id TO initiator_session_key;
+          CREATE INDEX paused_chains_owner_group_idx
+            ON paused_chains(initiator_session_key, group_id, paused_at DESC);
+        `);
+        const requestRows = this.#db.prepare(
+          "SELECT request_id AS id, initiator_session_key AS sessionId FROM agent_requests",
+        ).all() as Array<{ id: string; sessionId: string }>;
+        const updateRequest = this.#db.prepare(
+          "UPDATE agent_requests SET initiator_session_key = ? WHERE request_id = ?",
+        );
+        for (const row of requestRows) {
+          updateRequest.run(createSessionKey(this.migrationDeviceId, row.sessionId || row.id), row.id);
+        }
+        const pausedRows = this.#db.prepare(
+          "SELECT chain_id AS id, initiator_session_key AS sessionId FROM paused_chains",
+        ).all() as Array<{ id: string; sessionId: string }>;
+        const updatePaused = this.#db.prepare(
+          "UPDATE paused_chains SET initiator_session_key = ? WHERE chain_id = ?",
+        );
+        for (const row of pausedRows) {
+          updatePaused.run(createSessionKey(this.migrationDeviceId, row.sessionId), row.id);
+        }
+        this.#db.pragma("user_version = 4");
+      })();
       return;
     }
     if (version === 2) {
@@ -622,6 +662,7 @@ export class BrokerDatabase {
         PRAGMA user_version = 3;
         COMMIT;
       `);
+      this.#migrate();
       return;
     }
     if (version === 1) {
@@ -729,7 +770,7 @@ export class BrokerDatabase {
         chain_id TEXT NOT NULL,
         round INTEGER NOT NULL,
           status TEXT NOT NULL CHECK (status IN ('awaiting_approval', 'pending', 'delivered', 'completed', 'failed', 'interrupted', 'rejected', 'blocked', 'invalid')),
-          initiator_session_id TEXT NOT NULL DEFAULT '',
+          initiator_session_key TEXT NOT NULL DEFAULT '',
           initiator_name TEXT NOT NULL DEFAULT '',
           participants TEXT NOT NULL DEFAULT '[]',
           round_limit INTEGER NOT NULL DEFAULT 10,
@@ -743,7 +784,7 @@ export class BrokerDatabase {
         chain_id TEXT PRIMARY KEY,
         group_id TEXT NOT NULL REFERENCES groups(group_id),
         message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id),
-        initiator_session_id TEXT NOT NULL,
+        initiator_session_key TEXT NOT NULL,
         initiator_name TEXT NOT NULL,
         source_agent_name TEXT NOT NULL,
         source_owner_user_name TEXT NOT NULL,
@@ -763,8 +804,8 @@ export class BrokerDatabase {
       CREATE INDEX agent_requests_chain_round_idx
         ON agent_requests(chain_id, round);
       CREATE INDEX paused_chains_owner_group_idx
-        ON paused_chains(initiator_session_id, group_id, paused_at DESC);
-      PRAGMA user_version = 3;
+        ON paused_chains(initiator_session_key, group_id, paused_at DESC);
+      PRAGMA user_version = 4;
       COMMIT;
     `);
   }
