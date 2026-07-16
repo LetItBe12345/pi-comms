@@ -1,0 +1,150 @@
+name: Release
+
+run-name: Release v${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without the v prefix, for example 0.1.0
+        required: true
+        type: string
+      confirm:
+        description: Type RELEASE to confirm
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_CONFIRM: ${{ inputs.confirm }}
+
+    steps:
+      - name: Validate release request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Release must run from main, got: $GITHUB_REF" >&2
+            exit 1
+          fi
+
+          if [[ "$RELEASE_CONFIRM" != "RELEASE" ]]; then
+            echo "Confirmation must be exactly RELEASE" >&2
+            exit 1
+          fi
+
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must use X.Y.Z format without a v prefix" >&2
+            exit 1
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Validate version and release availability
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_version="$(node -p 'require("./package.json").version')"
+          tag="v${RELEASE_VERSION}"
+
+          if [[ "$package_version" != "$RELEASE_VERSION" ]]; then
+            echo "package.json is $package_version, requested $RELEASE_VERSION" >&2
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag already exists: $tag" >&2
+            exit 1
+          fi
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release already exists: $tag" >&2
+            exit 1
+          fi
+
+      - name: Install development dependencies
+        run: npm ci
+
+      - name: Run checks
+        run: npm run check
+
+      - name: Install production dependencies
+        run: npm ci --omit=dev
+
+      - name: Verify production package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -x node_modules/.bin/tsx
+          test ! -e node_modules/@earendil-works/pi-coding-agent
+          test ! -e node_modules/@earendil-works/pi-tui
+
+          smoke_home="$RUNNER_TEMP/pi-comms-release-smoke"
+          broker_log="$RUNNER_TEMP/pi-comms-broker.log"
+          mkdir -p "$smoke_home"
+
+          set +e
+          HOME="$smoke_home" timeout --signal=TERM --kill-after=2s 5s npm run broker >"$broker_log" 2>&1
+          broker_status=$?
+          set -e
+
+          cat "$broker_log"
+          if [[ "$broker_status" -ne 124 ]]; then
+            echo "Broker exited unexpectedly with status $broker_status" >&2
+            exit 1
+          fi
+          grep -F "Pi Comms Broker 正在监听" "$broker_log"
+
+      - name: Create tag and GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="v${RELEASE_VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" "$GITHUB_SHA" -m "pi-comms $tag"
+          git push origin "$tag"
+
+          notes="$(printf '%s\n\n%s\n\n%s\n' \
+            'Pi Comms stable release.' \
+            'Install:' \
+            "pi install git:github.com/LetItBe12345/pi-comms@$tag")"
+
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Pi Comms $tag" \
+            --notes "$notes" \
+            --generate-notes \
+            --fail-on-no-commits \
+            --latest
+
+          echo "### Released $tag" >> "$GITHUB_STEP_SUMMARY"
+          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+          echo "pi install git:github.com/LetItBe12345/pi-comms@$tag" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
