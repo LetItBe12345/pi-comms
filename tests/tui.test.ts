@@ -4,6 +4,7 @@ import {
   TUI,
   TUI_KEYBINDINGS,
   setKeybindings,
+  visibleWidth,
   type Terminal,
 } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
@@ -130,6 +131,10 @@ function type(view: ChatView, text: string): void {
   for (const character of text) view.handleInput(character);
 }
 
+function leadingSpaces(line: string): number {
+  return line.length - line.trimStart().length;
+}
+
 beforeAll(() => {
   setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
 });
@@ -157,15 +162,15 @@ describe("最小群聊 TUI", () => {
     expect(view.render(80).join("\n")).toContain("正在加入群组");
   });
 
-  it("将当前用户放左侧，其余成员和 Agent 放右侧", () => {
+  it("将当前用户放右侧，其余成员和 Agent 放左侧", () => {
     const history = [
-      message({ messageId: "own", text: "左侧消息" }),
+      message({ messageId: "own", text: "右侧消息" }),
       message({
         messageId: "other",
         senderId: "agent:client-b",
         senderName: "Bob-Pi",
         senderType: "agent",
-        text: "右侧回答",
+        text: "左侧回答",
       }),
     ];
     const { view } = createView();
@@ -173,12 +178,78 @@ describe("最小群聊 TUI", () => {
     view.setConnection("connected");
 
     const lines = view.render(100);
-    const own = lines.find((line) => line.includes("左侧消息"));
-    const other = lines.find((line) => line.includes("右侧回答"));
-    expect(own?.startsWith("左侧消息")).toBe(true);
-    expect(other?.startsWith(" ")).toBe(true);
+    const own = lines.find((line) => line.includes("右侧消息"));
+    const other = lines.find((line) => line.includes("左侧回答"));
+    expect(own?.startsWith(" ")).toBe(true);
+    expect(other?.startsWith("左侧回答")).toBe(true);
     expect(lines.join("\n")).toContain("Bob-Pi [Agent]");
     expect(lines.join("\n")).toContain("Bob-Pi [Agent·忙碌]");
+  });
+
+  it("右侧多行消息整体右移，但每行保持相同左边缘", () => {
+    const { view } = createView();
+    view.applySnapshot(snapshot([
+      message({ text: "这是比较长的第一行消息\n短行" }),
+    ]));
+    view.setConnection("connected");
+
+    const lines = view.render(100);
+    const first = lines.find((line) => line.includes("这是比较长的第一行消息"));
+    const second = lines.find((line) => line.includes("短行"));
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    expect(leadingSpaces(first!)).toBe(leadingSpaces(second!));
+    expect(leadingSpaces(first!)).toBeGreaterThan(0);
+  });
+
+  it("连续两分钟内的同一发送者只显示一次标题", () => {
+    const timestamp = new Date("2026-07-15T09:30:00+08:00").getTime();
+    const { view } = createView();
+    view.applySnapshot(snapshot([
+      message({ messageId: "one", text: "第一条", timestamp }),
+      message({ messageId: "two", text: "第二条", timestamp: timestamp + 60_000 }),
+    ]));
+    view.setConnection("connected");
+
+    const screen = view.render(100).join("\n");
+    expect(screen).toContain("第一条");
+    expect(screen).toContain("第二条");
+    expect(screen.match(/你  /g)).toHaveLength(1);
+  });
+
+  it("返回完整时间线并交给终端原生 scrollback", () => {
+    const history = Array.from({ length: 20 }, (_, index) =>
+      message({
+        messageId: `message-${index}`,
+        text: `历史消息 ${index}`,
+        timestamp: new Date("2026-07-15T09:30:00+08:00").getTime() + index * 180_000,
+      }),
+    );
+    const { view, terminal } = createView();
+    terminal.rows = 8;
+    view.applySnapshot(snapshot(history));
+    view.setConnection("connected");
+
+    const lines = view.render(80);
+    expect(lines.join("\n")).toContain("历史消息 0");
+    expect(lines.join("\n")).toContain("历史消息 19");
+    expect(lines.length).toBeGreaterThan(terminal.rows);
+    expect(lines.join("\n")).not.toContain("Ctrl+PageUp/PageDown");
+  });
+
+  it("长 URL、中文和 Emoji 换行后不超过终端宽度", () => {
+    const { view } = createView();
+    view.applySnapshot(snapshot([
+      message({
+        text: `中文🙂 https://example.com/${"very-long-path-".repeat(20)}结束`,
+      }),
+    ]));
+    view.setConnection("connected");
+
+    const width = 40;
+    const lines = view.render(width);
+    expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+    expect(lines.join("\n")).toContain("中文🙂");
   });
 
   it("Broker 确认后清空输入并显示消息", () => {
