@@ -148,6 +148,9 @@ export function createBrokerServer(
   const idleShutdownMs = options.idleShutdownMs ?? DEFAULT_IDLE_SHUTDOWN_MS;
   const mdnsPublisherFactory =
     options.mdnsPublisherFactory ?? publishBrokerMdns;
+  const publishMdns =
+    options.mdnsPublisherFactory !== undefined ||
+    process.env.PI_COMMS_DISABLE_MDNS !== "1";
   const clients = new Map<string, Socket>();
   const sessions = new Map<SessionKey, ClientSession>();
   let groups = new GroupState();
@@ -2014,7 +2017,7 @@ export function createBrokerServer(
         mode,
         startedAt: Date.now(),
       });
-      if (mode === "lan-host") {
+      if (mode === "lan-host" && publishMdns) {
         mdnsPublisher = mdnsPublisherFactory({
           brokerId: stableBrokerId,
           port: endpoint.port,

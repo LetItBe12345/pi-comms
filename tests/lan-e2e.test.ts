@@ -75,6 +75,7 @@ describe("真实网络栈三 Session E2E", () => {
         listen: { host: "0.0.0.0", port: 0 },
         dbPath: join(directory, "comms.db"),
         mode: "lan-host",
+        mdnsPublisherFactory: () => ({ async stop() {} }),
       });
       await broker.start();
       const endpoint = { host: lanAddress, port: broker.endpoint.port };

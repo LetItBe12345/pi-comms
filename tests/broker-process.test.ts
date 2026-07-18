@@ -3,7 +3,7 @@ import { access, mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { brokerLockPath } from "../src/broker/process-lock.js";
 import {
   startLanHostBroker,
@@ -22,6 +22,19 @@ interface ChildRecord {
 describe("Broker 跨进程竞争", () => {
   let directory: string | undefined;
   const children: ChildRecord[] = [];
+  const previousDisableMdns = process.env.PI_COMMS_DISABLE_MDNS;
+
+  beforeAll(() => {
+    process.env.PI_COMMS_DISABLE_MDNS = "1";
+  });
+
+  afterAll(() => {
+    if (previousDisableMdns === undefined) {
+      delete process.env.PI_COMMS_DISABLE_MDNS;
+    } else {
+      process.env.PI_COMMS_DISABLE_MDNS = previousDisableMdns;
+    }
+  });
 
   afterEach(async () => {
     for (const child of children) {

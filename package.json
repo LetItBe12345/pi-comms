@@ -33,7 +33,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "test:unit": "vitest run --passWithNoTests --exclude tests/broker-process.test.ts --exclude tests/acceptance.test.ts --exclude tests/extension.test.ts --exclude tests/lan-e2e.test.ts",
-    "test:e2e": "vitest run tests/broker-process.test.ts tests/acceptance.test.ts tests/extension.test.ts tests/lan-e2e.test.ts",
+    "test:e2e": "vitest run --maxWorkers=1 tests/broker-process.test.ts tests/acceptance.test.ts tests/extension.test.ts tests/lan-e2e.test.ts",
     "check": "npm run typecheck && npm run test:unit && npm run test:e2e"
   },
   "devDependencies": {
