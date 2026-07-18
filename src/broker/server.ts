@@ -6,6 +6,8 @@ import { loadOrCreateDeviceId } from "../device-identity.js";
 import {
   BROKER_PROTOCOL_VERSION,
   BROKER_SERVICE,
+  PI_COMMS_BUILD_CHANNEL,
+  PI_COMMS_VERSION,
   createEnvelope,
   encodeEnvelope,
   JsonlDecoder,
@@ -29,6 +31,7 @@ import {
   type MdnsPublisher,
 } from "../discovery/mdns.js";
 import { primaryOrdinaryNetwork } from "../discovery/network.js";
+import { NetworkAccessStore } from "../discovery/network-access.js";
 import {
   DEFAULT_BROKER_ENDPOINT,
   formatEndpoint,
@@ -86,6 +89,8 @@ export interface BrokerServerOptions {
   isLoopback?: (address: string | undefined) => boolean;
   idleShutdownMs?: number;
   mdnsPublisherFactory?: typeof publishBrokerMdns;
+  networkAccessRequired?: boolean;
+  configureAutostart?: typeof configureBrokerAutostart;
 }
 
 export interface BrokerServer {
@@ -151,6 +156,10 @@ export function createBrokerServer(
   const publishMdns =
     options.mdnsPublisherFactory !== undefined ||
     process.env.PI_COMMS_DISABLE_MDNS !== "1";
+  const networkAccessStore = new NetworkAccessStore(dbPath);
+  const networkAccessRequired = options.networkAccessRequired ?? true;
+  const updateAutostart =
+    options.configureAutostart ?? configureBrokerAutostart;
   const clients = new Map<string, Socket>();
   const sessions = new Map<SessionKey, ClientSession>();
   let groups = new GroupState();
@@ -167,6 +176,10 @@ export function createBrokerServer(
   let processLock: BrokerProcessLock | undefined;
   let stableBrokerId = "";
   let mdnsPublisher: MdnsPublisher | undefined;
+  let networkAccessAllowed = mode !== "lan-host";
+  let networkAccessAddress: string | undefined;
+  let observedNetworkKey: string | undefined;
+  let networkRefreshTimer: ReturnType<typeof setInterval> | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
   function handleConnection(socket: Socket): void {
@@ -213,6 +226,28 @@ export function createBrokerServer(
             socket.end();
             return;
           }
+          if (
+            !isLoopback(socket.remoteAddress) &&
+            mode === "lan-host" &&
+            (
+              !networkAccessAllowed ||
+              (
+                networkAccessRequired &&
+                !isAddressOnOrdinaryNetwork(
+                  socket.remoteAddress,
+                  networkAccessAddress,
+                )
+              )
+            )
+          ) {
+            sendError(socket, {
+              code: "network_unavailable",
+              message: "当前网络尚未允许附近设备连接",
+              requestId: parsed.envelope.id,
+            });
+            socket.end();
+            return;
+          }
           acceptedProbe = true;
           send(socket, createEnvelope("broker.ready", {
             service: BROKER_SERVICE,
@@ -220,6 +255,8 @@ export function createBrokerServer(
             brokerId: stableBrokerId,
             brokerInstanceId: instanceId,
             brokerMode: mode,
+            appVersion: PI_COMMS_VERSION,
+            buildChannel: PI_COMMS_BUILD_CHANNEL,
             requestId: parsed.envelope.id,
           }) as BrokerEnvelope);
           continue;
@@ -506,6 +543,30 @@ export function createBrokerServer(
     socket: Socket,
     envelope: Exclude<ClientEnvelope, ClientHelloEnvelope>,
   ): void {
+    if (envelope.type === "broker.network.refresh") {
+      if (!isLoopback(socket.remoteAddress)) {
+        sendError(socket, {
+          code: "invalid_payload",
+          message: "只能在这台电脑上更新网络状态",
+          requestId: envelope.id,
+        });
+        return;
+      }
+      void refreshNetworkAccess().then((result) => {
+        send(socket, createEnvelope("broker.network.updated", {
+          requestId: envelope.id,
+          allowed: result.allowed,
+          ...(result.address === undefined ? {} : { address: result.address }),
+        }) as BrokerEnvelope);
+      }).catch((error: unknown) => {
+        sendError(socket, {
+          code: "database_error",
+          message: error instanceof Error ? error.message : String(error),
+          requestId: envelope.id,
+        });
+      });
+      return;
+    }
     if (envelope.type === "agent.deliver.ack") {
       const pending = pendingRequests.get(envelope.payload.requestId);
       if (pending?.targetClientId === clientId) {
@@ -610,6 +671,14 @@ export function createBrokerServer(
         ...(inviteCode === undefined ? {} : { inviteCode }),
       }) as BrokerEnvelope);
       sendSnapshotsForGroup(envelope.payload.groupId);
+      void refreshNetworkAccess();
+      void syncBackgroundSupervisor().catch((error) => {
+        sendError(socket, {
+          code: "database_error",
+          message: `后台开放设置失败：${error instanceof Error ? error.message : String(error)}`,
+          requestId: envelope.id,
+        });
+      });
       return;
     }
     if (envelope.type === "group.availability.update") {
@@ -631,10 +700,7 @@ export function createBrokerServer(
         envelope.payload.keepAvailableWhenEmpty,
         envelope.payload.openAtLogin,
       );
-      const shouldAutostart = db().storedGroups().some(
-        (stored) => stored.openAtLogin,
-      );
-      void configureBrokerAutostart(shouldAutostart, dbPath).catch((error) => {
+      void syncBackgroundSupervisor().catch((error) => {
         sendError(socket, {
           code: "database_error",
           message: `登录后自动开放设置失败：${error instanceof Error ? error.message : String(error)}`,
@@ -735,6 +801,8 @@ export function createBrokerServer(
         if (targetSocket !== undefined) sendSnapshot(membership.user.clientId, targetSocket);
       }
       broadcastGroupsChanged();
+      void refreshNetworkAccess();
+      void syncBackgroundSupervisor().catch(() => undefined);
       scheduleIdleShutdown();
       return;
     }
@@ -840,6 +908,7 @@ export function createBrokerServer(
       }) as BrokerEnvelope);
       sendSnapshot(clientId, socket);
       broadcastGroupsChanged();
+      void refreshNetworkAccess();
     } catch (error) {
       if (groupId !== undefined) {
         groups.removeIfJoined(clientId);
@@ -859,6 +928,18 @@ export function createBrokerServer(
     try {
       const storedGroup = db().storedGroup(payload.groupId);
       if (storedGroup === undefined) {
+        const deletedGroup = db().consumeGroupTombstone(
+          payload.groupId,
+          sessionKey,
+        );
+        if (deletedGroup !== undefined) {
+          sendError(socket, {
+            code: "group_deleted",
+            message: `群组“${deletedGroup}”已解散`,
+            requestId,
+          });
+          return;
+        }
         throw new GroupStateError("group_not_found", "群组不存在");
       }
       let userName: string;
@@ -1837,6 +1918,7 @@ export function createBrokerServer(
             online: false,
           }),
           stableSessionKey: stored.sessionKey,
+          lastActiveAt: stored.lastActiveAt,
           isOwner: db().storedGroup(groupId)?.ownerSessionKey === stored.sessionKey,
           ...(stored.status === "removed" ? { removed: true, online: false } : {}),
         },
@@ -1853,6 +1935,7 @@ export function createBrokerServer(
             pendingApprovalCount: 0,
           }),
           stableSessionKey: stored.sessionKey,
+          lastActiveAt: stored.lastActiveAt,
           ...(stored.status === "removed" ? { removed: true, online: false } : {}),
         },
       );
@@ -2015,14 +2098,24 @@ export function createBrokerServer(
         host: endpoint.host,
         port: endpoint.port,
         mode,
+        appVersion: PI_COMMS_VERSION,
+        buildChannel: PI_COMMS_BUILD_CHANNEL,
         startedAt: Date.now(),
       });
-      if (mode === "lan-host" && publishMdns) {
-        mdnsPublisher = mdnsPublisherFactory({
-          brokerId: stableBrokerId,
-          port: endpoint.port,
-          interfaceAddress: primaryOrdinaryNetwork()?.address,
-        });
+      await refreshNetworkAccess();
+      if (mode === "lan-host") {
+        networkRefreshTimer = setInterval(() => {
+          const networkKey = primaryOrdinaryNetwork()?.networkKey;
+          if (networkKey === observedNetworkKey) return;
+          void refreshNetworkAccess().catch(() => undefined);
+        }, 2_000);
+        networkRefreshTimer.unref?.();
+      }
+      if (
+        mode === "lan-host" &&
+        database.storedGroups().some((group) => group.keepAvailableWhenEmpty)
+      ) {
+        await syncBackgroundSupervisor();
       }
       started = true;
       closing = false;
@@ -2041,12 +2134,60 @@ export function createBrokerServer(
     }
   }
 
+  async function refreshNetworkAccess(): Promise<{
+    allowed: boolean;
+    address?: string;
+  }> {
+    await mdnsPublisher?.stop();
+    mdnsPublisher = undefined;
+    if (mode !== "lan-host") {
+      networkAccessAllowed = true;
+      networkAccessAddress = undefined;
+      return { allowed: true };
+    }
+    const network = primaryOrdinaryNetwork();
+    observedNetworkKey = network?.networkKey;
+    networkAccessAllowed =
+      !networkAccessRequired ||
+      (
+        network !== undefined &&
+        await networkAccessStore.isConfirmed(network)
+      );
+    networkAccessAddress = networkAccessAllowed ? network?.address : undefined;
+    const hasNearbyGroups = database?.storedGroups()
+      .some((group) => group.visibility === "nearby") === true;
+    if (networkAccessAllowed && publishMdns && hasNearbyGroups) {
+      mdnsPublisher = mdnsPublisherFactory({
+        brokerId: stableBrokerId,
+        port: endpoint.port,
+        interfaceAddress: network!.address,
+      });
+    }
+    return {
+      allowed: networkAccessAllowed,
+      ...(network === undefined ? {} : { address: network.address }),
+    };
+  }
+
+  async function syncBackgroundSupervisor(): Promise<void> {
+    const storedGroups = db().storedGroups();
+    await updateAutostart(
+      storedGroups.some((group) => group.keepAvailableWhenEmpty),
+      storedGroups.some((group) => group.openAtLogin),
+      dbPath,
+    );
+  }
+
   async function close(): Promise<void> {
     if (!started || closing) {
       return;
     }
     closing = true;
     clearIdleShutdown();
+    if (networkRefreshTimer !== undefined) {
+      clearInterval(networkRefreshTimer);
+      networkRefreshTimer = undefined;
+    }
     for (const session of sessions.values()) {
       if (session.disconnectTimer !== undefined) {
         clearTimeout(session.disconnectTimer);
@@ -2139,6 +2280,21 @@ function isLoopbackAddress(address: string | undefined): boolean {
     address === "::1" ||
     address.startsWith("127.") ||
     address.startsWith("::ffff:127.");
+}
+
+export function isAddressOnOrdinaryNetwork(
+  remoteAddress: string | undefined,
+  ordinaryAddress: string | undefined,
+): boolean {
+  if (remoteAddress === undefined || ordinaryAddress === undefined) return false;
+  const remote = remoteAddress.startsWith("::ffff:")
+    ? remoteAddress.slice("::ffff:".length)
+    : remoteAddress;
+  const remoteParts = remote.split(".");
+  const ordinaryParts = ordinaryAddress.split(".");
+  return remoteParts.length === 4 &&
+    ordinaryParts.length === 4 &&
+    remoteParts.slice(0, 3).join(".") === ordinaryParts.slice(0, 3).join(".");
 }
 
 function createCredential(): string {

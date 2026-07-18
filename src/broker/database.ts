@@ -371,11 +371,42 @@ export class BrokerDatabase {
 
   deleteGroup(groupId: string): void {
     this.#db.transaction(() => {
+      const group = this.#db.prepare(
+        "SELECT group_name AS groupName FROM groups WHERE group_id = ?",
+      ).get(groupId) as { groupName: string } | undefined;
+      if (group !== undefined) {
+        this.#db.prepare(
+          `INSERT OR REPLACE INTO group_tombstones
+             (group_id, session_key, group_name, created_at)
+           SELECT group_id, session_key, ?, ?
+             FROM group_memberships
+            WHERE group_id = ?`,
+        ).run(group.groupName, Date.now(), groupId);
+      }
       this.#db.prepare("DELETE FROM paused_chains WHERE group_id = ?").run(groupId);
       this.#db.prepare("DELETE FROM agent_requests WHERE group_id = ?").run(groupId);
       this.#db.prepare("DELETE FROM messages WHERE group_id = ?").run(groupId);
       this.#db.prepare("DELETE FROM group_memberships WHERE group_id = ?").run(groupId);
       this.#db.prepare("DELETE FROM groups WHERE group_id = ?").run(groupId);
+    })();
+  }
+
+  consumeGroupTombstone(
+    groupId: string,
+    sessionKey: SessionKey,
+  ): string | undefined {
+    return this.#db.transaction(() => {
+      const row = this.#db.prepare(
+        `SELECT group_name AS groupName
+           FROM group_tombstones
+          WHERE group_id = ? AND session_key = ?`,
+      ).get(groupId, sessionKey) as { groupName: string } | undefined;
+      if (row !== undefined) {
+        this.#db.prepare(
+          "DELETE FROM group_tombstones WHERE group_id = ? AND session_key = ?",
+        ).run(groupId, sessionKey);
+      }
+      return row?.groupName;
     })();
   }
 
@@ -875,10 +906,25 @@ export class BrokerDatabase {
 
   #migrate(): void {
     const version = this.#db.pragma("user_version", { simple: true }) as number;
-    if (version > 6) {
+    if (version > 7) {
       throw new Error(`数据库版本不受支持：${version}`);
     }
+    if (version === 7) {
+      return;
+    }
     if (version === 6) {
+      this.#db.exec(`
+        BEGIN;
+        CREATE TABLE IF NOT EXISTS group_tombstones (
+          group_id TEXT NOT NULL,
+          session_key TEXT NOT NULL,
+          group_name TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY (group_id, session_key)
+        );
+        PRAGMA user_version = 7;
+        COMMIT;
+      `);
       return;
     }
     if (version === 5) {
@@ -887,6 +933,7 @@ export class BrokerDatabase {
       }>;
       if (groupColumns.some((column) => column.name === "owner_session_key")) {
         this.#db.pragma("user_version = 6");
+        this.#migrate();
         return;
       }
       this.#db.exec(`
@@ -917,6 +964,7 @@ export class BrokerDatabase {
         PRAGMA user_version = 6;
         COMMIT;
       `);
+      this.#migrate();
       return;
     }
     if (version === 4) {
@@ -1163,6 +1211,14 @@ export class BrokerDatabase {
         value TEXT NOT NULL
       );
 
+      CREATE TABLE group_tombstones (
+        group_id TEXT NOT NULL,
+        session_key TEXT NOT NULL,
+        group_name TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (group_id, session_key)
+      );
+
       CREATE INDEX messages_group_time_idx
         ON messages(group_id, timestamp DESC);
       CREATE INDEX agent_requests_group_status_idx
@@ -1173,7 +1229,7 @@ export class BrokerDatabase {
         ON paused_chains(initiator_session_key, group_id, paused_at DESC);
       CREATE INDEX group_memberships_group_status_idx
         ON group_memberships(group_id, status, last_active_at DESC);
-      PRAGMA user_version = 6;
+      PRAGMA user_version = 7;
       COMMIT;
     `);
   }

@@ -261,4 +261,55 @@ describe("每群邀请与长期成员", () => {
     );
     expect(renamed.type === "snapshot" && renamed.payload.isOwner).toBe(true);
   });
+
+  it("解散后离线成员收到一次通知并失去长期凭证", async () => {
+    await startBroker();
+    const created = await createNearbyGroup();
+    local = false;
+    const bob = new Session(
+      broker!.endpoint,
+      "00000000-0000-4000-8000-000000000202",
+    );
+    sessions.push(bob);
+    await bob.start("bob-session");
+    bob.send("group.join", {
+      groupId: created.groupId,
+      userName: "Bob",
+      agentName: "Bob-Pi",
+      inviteCode: created.inviteCode,
+    });
+    const welcome = await bob.waitFor(
+      (message) => message.type === "membership.welcome",
+    );
+    if (welcome.type !== "membership.welcome") throw new Error("未获得成员凭证");
+    await bob.client.stop();
+
+    local = true;
+    created.owner.send("group.delete", {
+      groupId: created.groupId,
+      ownerCredential: created.ownerCredential,
+    });
+    await created.owner.waitFor(
+      (message) => message.type === "snapshot" &&
+        message.payload.group === undefined,
+    );
+
+    local = false;
+    const restored = new Session(
+      broker!.endpoint,
+      "00000000-0000-4000-8000-000000000202",
+    );
+    sessions.push(restored);
+    await restored.start("bob-session");
+    restored.send("group.join", {
+      groupId: created.groupId,
+      membershipCredential: welcome.payload.membershipCredential,
+    });
+    const deleted = await restored.waitFor(
+      (message) => message.type === "error" &&
+        message.payload.code === "group_deleted",
+    );
+    expect(deleted.type === "error" && deleted.payload.message)
+      .toContain("分布式开发组");
+  });
 });

@@ -12,7 +12,7 @@ describe("用户级登录自启配置", () => {
       "/home/me/.pi/comms.db",
     );
     expect(service).toContain('ExecStart="/usr/bin/node" --import "tsx" "/opt/pi comms/launcher.ts"');
-    expect(service).toContain("Restart=on-failure");
+    expect(service).toContain("Restart=always");
     expect(service).toContain("WantedBy=default.target");
   });
 
@@ -25,5 +25,12 @@ describe("用户级登录自启配置", () => {
     expect(plist).toContain("<string>io.pi-comms.broker</string>");
     expect(plist).toContain("/Users/me/Pi &amp; Comms/launcher.ts");
     expect(plist).toContain("<key>RunAtLoad</key>");
+    expect(renderLaunchAgent(
+      "/usr/local/bin/node",
+      "/Users/me/Pi & Comms/launcher.ts",
+      "/Users/me/.pi/comms.db",
+      "tsx",
+      false,
+    )).toContain("<false/>");
   });
 });

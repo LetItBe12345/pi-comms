@@ -66,6 +66,25 @@ export function restoreConnectionConfig(entries: unknown[]): ConnectionConfig | 
   return config;
 }
 
+export function hasLegacyRemoteConnection(entries: unknown[]): boolean {
+  return entries.some((entry) => {
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      !("type" in entry) ||
+      entry.type !== "custom" ||
+      !("customType" in entry) ||
+      entry.customType !== CONNECTION_CONFIG_ENTRY ||
+      !("data" in entry) ||
+      typeof entry.data !== "object" ||
+      entry.data === null
+    ) return false;
+    return "mode" in entry.data &&
+      entry.data.mode === "lan-client" &&
+      (!("groupId" in entry.data) || typeof entry.data.groupId !== "string");
+  });
+}
+
 export function getLanIPv4Addresses(): string[] {
   return ordinaryNetworks().map((network) => network.address);
 }

@@ -36,7 +36,7 @@ describe("Broker SQLite", () => {
     store.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(6);
+    expect(raw.pragma("user_version", { simple: true })).toBe(7);
     expect(raw.pragma("journal_mode", { simple: true })).toBe("wal");
     const tables = raw
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -45,6 +45,7 @@ describe("Broker SQLite", () => {
       "agent_requests",
       "broker_metadata",
       "group_memberships",
+      "group_tombstones",
       "groups",
       "messages",
       "paused_chains",
@@ -142,7 +143,7 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(6);
+    expect(raw.pragma("user_version", { simple: true })).toBe(7);
     const columns = raw
       .prepare("PRAGMA table_info(agent_requests)")
       .all() as Array<{ name: string }>;

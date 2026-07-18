@@ -68,6 +68,8 @@ describe("TCP Broker 握手", () => {
       brokerId: broker.brokerId,
       brokerInstanceId: broker.instanceId,
       brokerMode: "local",
+      appVersion: "0.1.0",
+      buildChannel: "release",
     });
   });
 

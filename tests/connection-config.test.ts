@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CONNECTION_CONFIG_ENTRY,
   formatInvitation,
+  hasLegacyRemoteConnection,
   parseInvitation,
   restoreConnectionConfig,
 } from "../src/extension/connection-config.js";
@@ -44,5 +45,17 @@ describe("协作空间连接配置", () => {
       inviteCode: "ABCDEFGHJK",
       brokerId: "broker-a",
     });
+  });
+
+  it("识别旧的远程设备配置", () => {
+    expect(hasLegacyRemoteConnection([{
+      type: "custom",
+      customType: CONNECTION_CONFIG_ENTRY,
+      data: {
+        mode: "lan-client",
+        endpoint: { host: "192.168.1.8", port: 43_127 },
+        inviteCode: "OLDDEVICE",
+      },
+    }])).toBe(true);
   });
 });

@@ -4,5 +4,4 @@
 
 任务文件完成后，将其移入 [`../done/`](../done/README.md)，并同步更新 [`TODO 总览`](../README.md) 中的链接和状态。
 
-- [阶段 15：mDNS 自动发现、附近群组与群主管理](./15-mdns-discovery-tui.md)
 - [阶段 16：跨平台测试与局域网验收](./16-cross-platform-acceptance.md)
