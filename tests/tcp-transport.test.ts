@@ -42,6 +42,7 @@ describe("TCP Broker 握手", () => {
   let broker: BrokerServer | undefined;
   let unrelated: Server | undefined;
   const unrelatedSockets = new Set<Socket>();
+  const noMdns = () => ({ async stop() {} });
 
   afterEach(async () => {
     await broker?.close();
@@ -76,6 +77,7 @@ describe("TCP Broker 握手", () => {
       listen: { host: "127.0.0.1", port: 0 },
       dbPath: join(directory, "comms.db"),
       mode: "lan-host",
+      mdnsPublisherFactory: noMdns,
     });
     await broker.start();
     const received: BrokerEnvelope[] = [];
@@ -114,6 +116,7 @@ describe("TCP Broker 握手", () => {
       listen: { host: "127.0.0.1", port: 0 },
       dbPath: join(directory, "comms.db"),
       mode: "lan-host",
+      mdnsPublisherFactory: noMdns,
     });
     await broker.start();
     const local = new BrokerClient({
@@ -132,6 +135,7 @@ describe("TCP Broker 握手", () => {
       listen: { host: "127.0.0.1", port: 0 },
       dbPath: join(directory, "comms.db"),
       mode: "lan-host",
+      mdnsPublisherFactory: noMdns,
     });
     await broker.start();
     const client = new BrokerClient({

@@ -85,6 +85,7 @@ export interface BrokerServerOptions {
   inviteCooldownMs?: number;
   isLoopback?: (address: string | undefined) => boolean;
   idleShutdownMs?: number;
+  mdnsPublisherFactory?: typeof publishBrokerMdns;
 }
 
 export interface BrokerServer {
@@ -145,6 +146,8 @@ export function createBrokerServer(
   const inviteCooldownMs = options.inviteCooldownMs ?? DEFAULT_INVITE_COOLDOWN_MS;
   const isLoopback = options.isLoopback ?? isLoopbackAddress;
   const idleShutdownMs = options.idleShutdownMs ?? DEFAULT_IDLE_SHUTDOWN_MS;
+  const mdnsPublisherFactory =
+    options.mdnsPublisherFactory ?? publishBrokerMdns;
   const clients = new Map<string, Socket>();
   const sessions = new Map<SessionKey, ClientSession>();
   let groups = new GroupState();
@@ -2012,7 +2015,7 @@ export function createBrokerServer(
         startedAt: Date.now(),
       });
       if (mode === "lan-host") {
-        mdnsPublisher = publishBrokerMdns({
+        mdnsPublisher = mdnsPublisherFactory({
           brokerId: stableBrokerId,
           port: endpoint.port,
           interfaceAddress: primaryOrdinaryNetwork()?.address,
