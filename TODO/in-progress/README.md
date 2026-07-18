@@ -4,4 +4,5 @@
 
 任务文件完成后，将其移入 [`../done/`](../done/README.md)，并同步更新 [`TODO 总览`](../README.md) 中的链接和状态。
 
-- [阶段 16：跨平台测试与局域网验收](./16-cross-platform-acceptance.md)
+- [阶段 16A：跨平台自动化与局域网验收准备](./16a-cross-platform-automation.md)
+- [阶段 16B：三台真实设备局域网验收](./16b-real-lan-acceptance.md)（等待设备）

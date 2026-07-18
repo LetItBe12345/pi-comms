@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -159,6 +159,46 @@ describe("Broker SQLite", () => {
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'paused_chains'",
     ).get()).toBeDefined();
     raw.close();
+  });
+
+  it("从真实 v0.1.0 schema fixture 升级并保留发行版数据", async () => {
+    const fixture = await readFile(
+      new URL("./fixtures/v0.1.0-schema.sql", import.meta.url),
+      "utf8",
+    );
+    const legacy = new Database(dbPath);
+    legacy.exec(fixture);
+    legacy.close();
+
+    const migrated = new BrokerDatabase(dbPath, DEVICE_ID);
+    expect(migrated.groups()).toEqual([{
+      groupId: "release-group",
+      groupName: "发行版群组",
+    }]);
+    expect(migrated.requestStatus("release-request")).toBe("completed");
+    expect(migrated.recentMessages("release-group")).toEqual([
+      expect.objectContaining({
+        messageId: "release-message",
+        text: "@Bob-Pi 验证升级",
+        status: "completed",
+      }),
+    ]);
+    migrated.close();
+
+    const raw = new Database(dbPath, { readonly: true });
+    expect(raw.pragma("user_version", { simple: true })).toBe(7);
+    expect((raw.prepare(
+      "SELECT initiator_session_key AS value FROM agent_requests WHERE request_id = ?",
+    ).get("release-request") as { value: string }).value).toBe(
+      createSessionKey(DEVICE_ID, "release-session"),
+    );
+    raw.close();
+  });
+
+  it("数据库损坏时明确失败而不是静默覆盖", async () => {
+    await writeFile(dbPath, "这不是 SQLite 数据库", "utf8");
+    expect(() => new BrokerDatabase(dbPath, DEVICE_ID))
+      .toThrow(/database|SQLite|encrypted|malformed/i);
   });
 
   it("只加载按时间排序的最近 100 条公开消息", () => {

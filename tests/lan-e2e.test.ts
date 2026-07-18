@@ -48,7 +48,7 @@ class LanSession {
   }
 }
 
-describe("真实网络栈三 Session E2E", () => {
+describe("单机网络栈三 Session 模拟", () => {
   let directory: string | undefined;
   let broker: BrokerServer | undefined;
   const sessions: LanSession[] = [];
