@@ -42,6 +42,7 @@ export interface Member {
   isOwner?: boolean;
   stableSessionKey?: string;
   removed?: boolean;
+  lastActiveAt?: number;
 }
 
 export interface OnlineMember {

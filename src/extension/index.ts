@@ -29,24 +29,34 @@ import {
   type TcpConnectEndpoint,
 } from "../transport/tcp-endpoint.js";
 import { ChatView } from "../tui/chat-view.js";
+import {
+  GroupPicker,
+  RequiredChoice,
+  type GroupPickerMembership,
+  type GroupPickerResult,
+} from "../tui/group-picker.js";
 import { BrokerClient } from "./broker-client.js";
 import { startLanHostBroker, startLocalBroker } from "./broker-process.js";
 import {
   CONNECTION_CONFIG_ENTRY,
   formatInvitation,
   getLanIPv4Addresses,
+  hasLegacyRemoteConnection,
   parseInvitation,
   restoreConnectionConfig,
   type ConnectionConfig,
 } from "./connection-config.js";
 import { RemoteQueue } from "./remote-queue.js";
 import { BrokerDiscovery } from "../discovery/mdns.js";
-import { collectNearbyGroups } from "../discovery/group-catalog.js";
+import { NearbyGroupsWatcher } from "../discovery/group-catalog.js";
+import { primaryOrdinaryNetwork } from "../discovery/network.js";
+import { NetworkAccessStore } from "../discovery/network-access.js";
 
 const STATUS_KEY = "pi-comms";
 const PERMISSION_ENTRY = "pi-comms-permission";
 const MEMBERSHIP_ENTRY = "pi-comms-membership";
 const MEMBERSHIP_REMOVED_ENTRY = "pi-comms-membership-removed";
+const DEFAULT_NAMES_ENTRY = "pi-comms-default-names";
 const DEFAULT_RESULT_RETRY_INTERVAL_MS = 1_000;
 const DEFAULT_BROKER_START_TIMEOUT_MS = 8_000;
 
@@ -59,6 +69,7 @@ interface SavedMembership {
   userName: string;
   agentName: string;
   updatedAt: number;
+  inviteCode?: string;
   connection?: Exclude<ConnectionConfig, { mode: "local" }> | { mode: "local" };
 }
 
@@ -115,6 +126,14 @@ export function createCommsExtension(
     let activeView: ChatView | undefined;
     let cachedUserName = "";
     let cachedAgentName = "";
+    let pendingCreate:
+      | { groupName: string; visibility: "local" | "nearby" }
+      | undefined;
+    let openGroupManagement = false;
+    let networkMonitorTimer: ReturnType<typeof setInterval> | undefined;
+    let activeNetworkKey: string | undefined;
+    let askingNetworkPermission = false;
+    const networkAccessStore = new NetworkAccessStore(dbPath);
     let brokerStartTask: Promise<boolean> | undefined;
     let brokerStartError: string | undefined;
     let permission: AgentPermission = "auto";
@@ -168,22 +187,72 @@ export function createCommsExtension(
     async function chooseConnectionConfig(
       ctx: ExtensionContext,
     ): Promise<ConnectionConfig | undefined> {
-      const first = await ctx.ui.select("打开群聊", [
-        ...[...savedMemberships.values()]
-          .sort((a, b) => b.updatedAt - a.updatedAt)
-          .map((membership) =>
-            `${membership.ownerCredential === undefined ? "已加入" : "我的群组"} · ${membership.groupName ?? membership.groupId}`,
-          ),
-        "这台设备上的群组",
-        "加入附近群组",
-        "创建可供附近加入的群组",
-      ]);
-      if (first === undefined) return undefined;
-      const stored = [...savedMemberships.values()].find(
-        (membership) =>
-          `${membership.ownerCredential === undefined ? "已加入" : "我的群组"} · ${membership.groupName ?? membership.groupId}` === first,
-      );
-      if (stored !== undefined) {
+      const memberships: GroupPickerMembership[] = [...savedMemberships.values()]
+        .map((membership) => ({
+          key: membershipKey(membership),
+          groupId: membership.groupId,
+          ...(membership.connection?.mode === "lan-client" &&
+              membership.connection.brokerId !== undefined
+            ? { brokerId: membership.connection.brokerId }
+            : {}),
+          groupName: membership.groupName ?? membership.groupId,
+          owner: membership.ownerCredential !== undefined,
+          updatedAt: membership.updatedAt,
+        }));
+      const discovery = new BrokerDiscovery({
+        interfaceAddress: getLanIPv4Addresses()[0],
+        onChanged() {},
+      });
+      let picker: GroupPicker | undefined;
+      let emptyTimer: ReturnType<typeof setTimeout> | undefined;
+      const watcher = new NearbyGroupsWatcher({
+        discovery,
+        onChanged: (catalog) => {
+          if (catalog.groups.length > 0 || catalog.updateRequiredCount > 0) {
+            if (emptyTimer !== undefined) clearTimeout(emptyTimer);
+            picker?.setNearby(catalog.groups, {
+              searching: false,
+              updateRequiredCount: catalog.updateRequiredCount,
+            });
+          }
+        },
+      });
+      emptyTimer = setTimeout(() => {
+        picker?.setNearby([], { searching: false });
+      }, 2_500);
+      let picked: GroupPickerResult;
+      try {
+        picked = await ctx.ui.custom<GroupPickerResult>((tui, theme, _keybindings, done) => {
+          picker = new GroupPicker({
+            tui,
+            theme,
+            done,
+            memberships,
+            onRefresh: () => {
+              picker?.setNearby([], { searching: true });
+              discovery.refresh();
+              void watcher.refresh();
+            },
+          });
+          watcher.start();
+          return picker;
+        });
+      } finally {
+        if (emptyTimer !== undefined) clearTimeout(emptyTimer);
+        watcher.stop();
+      }
+      if (picked.type === "cancel") return undefined;
+      if (picked.type === "membership") {
+        const stored = savedMemberships.get(picked.membershipKey);
+        if (stored === undefined) return undefined;
+        if (stored.ownerCredential !== undefined) {
+          const action = await ctx.ui.select(stored.groupName ?? "我的群组", [
+            "进入群聊",
+            "群组管理",
+          ]);
+          if (action === undefined) return undefined;
+          openGroupManagement = action === "群组管理";
+        }
         savedMembership = stored;
         desiredMembership = {
           groupId: stored.groupId,
@@ -193,53 +262,51 @@ export function createCommsExtension(
         };
         return stored.connection ?? { mode: "local" };
       }
-      if (first === "这台设备上的群组") return { mode: "local" };
-      if (first === "创建可供附近加入的群组") {
-        const confirmed = await ctx.ui.confirm(
-          "允许附近设备加入",
-          "群组会显示在同一网络的“附近群组”中。VPN 不会被用作附近网络。是否继续？",
+      if (picked.type === "local") return { mode: "local" };
+      if (picked.type === "create") {
+        const groupName = await ctx.ui.input("群组名称", "例如：项目协作");
+        if (groupName === undefined || !groupName.trim()) return undefined;
+        const range = await ctx.ui.custom<"nearby" | "local" | undefined>(
+          (tui, theme, _keybindings, done) => new RequiredChoice({
+            tui,
+            theme,
+            title: "谁可以使用这个群组？",
+            done,
+            choices: [
+              {
+                value: "nearby",
+                label: "允许附近设备加入",
+                description: "同一网络中的用户可以看到",
+              },
+              {
+                value: "local",
+                label: "仅这台电脑",
+                description: "只供本机 Pi Session 使用",
+              },
+            ],
+          }),
         );
-        return confirmed ? { mode: "lan-host" } : undefined;
+        if (range === undefined) return undefined;
+        const visibility = range;
+        if (visibility === "nearby") {
+          const network = primaryOrdinaryNetwork();
+          if (network === undefined) {
+            ctx.ui.notify("当前网络无法连接附近设备", "error");
+            return undefined;
+          }
+          const confirmed = await ctx.ui.confirm(
+            "允许附近设备看到这个群组？",
+            "只会使用当前普通网络。VPN 打开或关闭不会改变这个设置。",
+          );
+          if (!confirmed) return undefined;
+          await networkAccessStore.confirm(network);
+          activeNetworkKey = network.networkKey;
+        }
+        if (!(await ensureDefaultNames(ctx))) return undefined;
+        pendingCreate = { groupName: groupName.trim(), visibility };
+        return visibility === "nearby" ? { mode: "lan-host" } : { mode: "local" };
       }
-
-      const interfaceAddress = getLanIPv4Addresses()[0];
-      const discovered = new Map<string, {
-        label: string;
-        endpoint: TcpConnectEndpoint;
-        groupId: string;
-        brokerId: string;
-      }>();
-      const discovery = new BrokerDiscovery({
-        interfaceAddress,
-        onChanged() {},
-      });
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
-      const brokers = discovery.brokers;
-      discovery.stop();
-      const nearbyGroups = await collectNearbyGroups(brokers);
-      const nameCounts = new Map<string, number>();
-      for (const group of nearbyGroups) {
-        nameCounts.set(group.groupName, (nameCounts.get(group.groupName) ?? 0) + 1);
-      }
-      for (const group of nearbyGroups) {
-        const device = (nameCounts.get(group.groupName) ?? 0) > 1
-          ? ` · 来自 ${group.endpoint.host}`
-          : "";
-        const label = `${group.groupName} · ${group.onlineSessionCount} 人在线${device}`;
-        discovered.set(`${group.brokerId}:${group.groupId}`, {
-          label,
-          endpoint: group.endpoint,
-          groupId: group.groupId,
-          brokerId: group.brokerId,
-        });
-      }
-      const paste = "粘贴群组邀请";
-      const selected = await ctx.ui.select("附近群组", [
-        ...[...discovered.values()].map((item) => item.label),
-        paste,
-      ]);
-      if (selected === undefined) return undefined;
-      if (selected === paste) {
+      if (picked.type === "paste") {
         const invitation = await ctx.ui.input(
           "粘贴群组邀请",
           "192.168.1.23:43127 群组ID ABCDE-FGHIJ",
@@ -252,8 +319,7 @@ export function createCommsExtension(
           return undefined;
         }
       }
-      const target = [...discovered.values()].find((item) => item.label === selected);
-      if (target === undefined) return undefined;
+      const target = picked.group;
       const inviteCode = await ctx.ui.input("输入这个群的邀请码", "ABCDE-FGHIJ");
       if (inviteCode === undefined) return undefined;
       try {
@@ -268,6 +334,65 @@ export function createCommsExtension(
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         return undefined;
+      }
+    }
+
+    async function ensureDefaultNames(ctx: ExtensionContext): Promise<boolean> {
+      if (!cachedUserName) {
+        const value = await ctx.ui.input("你的名称", "例如：Alice");
+        if (value === undefined || !value.trim()) return false;
+        cachedUserName = value.trim();
+      }
+      if (!cachedAgentName) {
+        const value = await ctx.ui.input("你的 Agent 名称", `${cachedUserName}-Pi`);
+        if (value === undefined || !value.trim()) return false;
+        cachedAgentName = value.trim();
+      }
+      pi.appendEntry(DEFAULT_NAMES_ENTRY, {
+        userName: cachedUserName,
+        agentName: cachedAgentName,
+      });
+      return true;
+    }
+
+    function startNetworkMonitor(ctx: ExtensionContext): void {
+      if (connectionConfig?.mode !== "lan-host" || networkMonitorTimer !== undefined) {
+        return;
+      }
+      activeNetworkKey = primaryOrdinaryNetwork()?.networkKey;
+      networkMonitorTimer = setInterval(() => {
+        void refreshOrdinaryNetwork(ctx);
+      }, 2_000);
+      networkMonitorTimer.unref?.();
+    }
+
+    async function refreshOrdinaryNetwork(ctx: ExtensionContext): Promise<void> {
+      const network = primaryOrdinaryNetwork();
+      if (network?.networkKey === activeNetworkKey || askingNetworkPermission) return;
+      activeNetworkKey = network?.networkKey;
+      brokerClient.send("broker.network.refresh", {});
+      if (network === undefined) {
+        activeView?.setNetworkStatus("unavailable");
+        return;
+      }
+      if (await networkAccessStore.isConfirmed(network)) {
+        brokerClient.send("broker.network.refresh", {});
+        activeView?.setNetworkStatus("available", network.interfaceName);
+        return;
+      }
+      activeView?.setNetworkStatus("paused", network.interfaceName);
+      askingNetworkPermission = true;
+      try {
+        const confirmed = await ctx.ui.confirm(
+          "网络已改变",
+          "是否允许当前网络中的附近设备看到你的群组？VPN 的开关不会触发这个提示。",
+        );
+        if (!confirmed) return;
+        await networkAccessStore.confirm(network);
+        brokerClient.send("broker.network.refresh", {});
+        activeView?.setNetworkStatus("restoring", network.interfaceName);
+      } finally {
+        askingNetworkPermission = false;
       }
     }
 
@@ -290,6 +415,17 @@ export function createCommsExtension(
           saveMembership(message.payload);
           return;
         case "group.invite.updated": {
+          if (savedMembership?.groupId === message.payload.groupId) {
+            savedMembership = {
+              ...savedMembership,
+              ...(message.payload.inviteCode === undefined
+                ? { inviteCode: undefined }
+                : { inviteCode: message.payload.inviteCode }),
+              updatedAt: Date.now(),
+            };
+            savedMemberships.set(membershipKey(savedMembership), savedMembership);
+            pi.appendEntry(MEMBERSHIP_ENTRY, savedMembership);
+          }
           if (message.payload.inviteCode !== undefined) {
             const address = getLanIPv4Addresses()[0];
             if (address !== undefined) {
@@ -315,10 +451,16 @@ export function createCommsExtension(
               ownerSessionId: sessionId,
               updatedAt: Date.now(),
             };
-            savedMemberships.set(savedMembership.groupId, savedMembership);
+            savedMemberships.set(membershipKey(savedMembership), savedMembership);
             pi.appendEntry?.(MEMBERSHIP_ENTRY, savedMembership);
             ui?.notify("已恢复群主管理权，旧群主凭证已失效", "info");
           }
+          return;
+        case "broker.network.updated":
+          activeView?.setNetworkStatus(
+            message.payload.allowed ? "available" : "paused",
+            message.payload.address,
+          );
           return;
         case "groups.changed":
           availableGroups = message.payload.groups;
@@ -400,7 +542,8 @@ export function createCommsExtension(
         case "error":
           if (
             message.payload.code === "member_removed" ||
-            message.payload.code === "membership_invalid"
+            message.payload.code === "membership_invalid" ||
+            message.payload.code === "group_deleted"
           ) {
             clearSavedMembership();
           }
@@ -422,6 +565,9 @@ export function createCommsExtension(
               ownerCredential: welcome.ownerCredential,
               ownerSessionId: sessionId,
             }),
+        ...(welcome.inviteCode === undefined
+          ? {}
+          : { inviteCode: welcome.inviteCode }),
         userName: own.userName,
         agentName: own.agentName,
         updatedAt: Date.now(),
@@ -433,8 +579,11 @@ export function createCommsExtension(
                 : connectionConfig,
             }),
       };
-      savedMemberships.set(savedMembership.groupId, savedMembership);
+      savedMemberships.set(membershipKey(savedMembership), savedMembership);
       pi.appendEntry?.(MEMBERSHIP_ENTRY, savedMembership);
+      if (welcome.ownerCredential !== undefined) {
+        ui?.notify("群组已创建，可通过 Ctrl+G 管理附近加入和成员", "info");
+      }
       desiredMembership = {
         groupId: welcome.groupId,
         membershipCredential: welcome.membershipCredential,
@@ -460,11 +609,12 @@ export function createCommsExtension(
       if (savedMembership !== undefined) {
         pi.appendEntry?.(MEMBERSHIP_REMOVED_ENTRY, {
           groupId: savedMembership.groupId,
+          membershipKey: membershipKey(savedMembership),
           removedAt: Date.now(),
         });
       }
       if (savedMembership !== undefined) {
-        savedMemberships.delete(savedMembership.groupId);
+        savedMemberships.delete(membershipKey(savedMembership));
       }
       savedMembership = undefined;
       desiredMembership = undefined;
@@ -498,7 +648,7 @@ export function createCommsExtension(
           groupName: snapshot.group.groupName,
           updatedAt: Date.now(),
         };
-        savedMemberships.set(savedMembership.groupId, savedMembership);
+        savedMemberships.set(membershipKey(savedMembership), savedMembership);
         pi.appendEntry?.(MEMBERSHIP_ENTRY, savedMembership);
       }
       history = snapshot.messages;
@@ -652,7 +802,9 @@ export function createCommsExtension(
           return brokerClient.start(sessionId, permission);
         }
         if (await brokerClient.start(sessionId, permission)) return true;
-        if (connectionConfig.mode === "lan-client") return false;
+        if (connectionConfig.mode === "lan-client") {
+          return rediscoverSavedGroup();
+        }
         try {
           await startBroker(connectionConfig.mode);
           brokerStartError = undefined;
@@ -672,6 +824,65 @@ export function createCommsExtension(
       } finally {
         brokerStartTask = undefined;
       }
+    }
+
+    async function rediscoverSavedGroup(): Promise<boolean> {
+      if (
+        sessionId === undefined ||
+        connectionConfig?.mode !== "lan-client" ||
+        connectionConfig.brokerId === undefined
+      ) return false;
+      const targetBrokerId = connectionConfig.brokerId;
+      const targetGroupId = connectionConfig.groupId;
+      const discovery = new BrokerDiscovery({
+        interfaceAddress: getLanIPv4Addresses()[0],
+        onChanged() {},
+      });
+      return new Promise<boolean>((resolveResult) => {
+        let settled = false;
+        const finish = (connected: boolean) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          watcher.stop();
+          resolveResult(connected);
+        };
+        const watcher = new NearbyGroupsWatcher({
+          discovery,
+          onChanged: (catalog) => {
+            const found = catalog.groups.find(
+              (group) =>
+                group.brokerId === targetBrokerId &&
+                group.groupId === targetGroupId,
+            );
+            if (found === undefined) return;
+            void (async () => {
+              connectionConfig = {
+                mode: "lan-client",
+                endpoint: found.endpoint,
+                groupId: targetGroupId,
+                brokerId: targetBrokerId,
+              };
+              saveConnectionConfig(connectionConfig);
+              if (savedMembership?.groupId === targetGroupId) {
+                savedMembership = {
+                  ...savedMembership,
+                  connection: connectionConfig,
+                  updatedAt: Date.now(),
+                };
+                savedMemberships.set(membershipKey(savedMembership), savedMembership);
+                pi.appendEntry(MEMBERSHIP_ENTRY, savedMembership);
+              }
+              finish(await brokerClient.setConnection({
+                endpoint: found.endpoint,
+                expectedBrokerId: targetBrokerId,
+              }));
+            })();
+          },
+        });
+        const timer = setTimeout(() => finish(false), 3_000);
+        watcher.start();
+      });
     }
 
     async function ensureConnected(ctx: ExtensionContext): Promise<boolean> {
@@ -695,6 +906,9 @@ export function createCommsExtension(
       updateContext(ctx);
       permission = restorePermission(ctx);
       savedMemberships = restoreMemberships(ctx);
+      const names = restoreDefaultNames(ctx);
+      cachedUserName = names.userName;
+      cachedAgentName = names.agentName;
       savedMembership = [...savedMemberships.values()]
         .sort((a, b) => b.updatedAt - a.updatedAt)[0];
       if (savedMembership !== undefined) {
@@ -707,7 +921,14 @@ export function createCommsExtension(
       }
       brokerClient.setPermission(permission);
       if (options.connectionConfig === undefined && !options.registerTestCommands) {
-        connectionConfig = restoreConnectionConfig(ctx.sessionManager.getBranch());
+        const branch = ctx.sessionManager.getBranch();
+        if (hasLegacyRemoteConnection(branch)) {
+          ctx.ui.notify(
+            "邀请方式已升级，请向群主获取新的群组邀请",
+            "warning",
+          );
+        }
+        connectionConfig = restoreConnectionConfig(branch);
         connectionConfigPersisted = connectionConfig !== undefined;
       }
       if (connectionConfig !== undefined) void applyConnectionConfig(connectionConfig);
@@ -719,6 +940,10 @@ export function createCommsExtension(
       if (resultRetryTimer !== undefined) {
         clearInterval(resultRetryTimer);
         resultRetryTimer = undefined;
+      }
+      if (networkMonitorTimer !== undefined) {
+        clearInterval(networkMonitorTimer);
+        networkMonitorTimer = undefined;
       }
       clearRemoteWork();
       await brokerClient.stop();
@@ -812,7 +1037,16 @@ export function createCommsExtension(
         resultRetryTimer ??= setInterval(flushPendingResults, resultRetryIntervalMs);
 
         let connected = await connectOrStartBroker();
-        while (!connected && connectionConfig.mode === "lan-client") {
+        const canWaitOffline =
+          savedMembership !== undefined &&
+          connectionConfig.mode === "lan-client" &&
+          savedMembership.groupId === connectionConfig.groupId &&
+          savedMembership.membershipCredential.length > 0;
+        while (
+          !connected &&
+          connectionConfig.mode === "lan-client" &&
+          !canWaitOffline
+        ) {
           ctx.ui.notify(
             `${brokerClient.lastError ?? "无法连接群组"}\n` +
             "当前网络或 VPN 可能禁止附近设备互访，请检查“允许局域网访问”。",
@@ -842,7 +1076,7 @@ export function createCommsExtension(
           }
           connected = await connectOrStartBroker();
         }
-        if (!connected) {
+        if (!connected && !canWaitOffline) {
           if (connectionConfig.mode !== "lan-client") {
             ctx.ui.notify(
               brokerStartError ?? brokerClient.lastError ?? "无法连接群组",
@@ -867,6 +1101,7 @@ export function createCommsExtension(
           connectionConfigPersisted = true;
         }
         if (
+          connected &&
           connectionConfig.mode === "lan-client" &&
           savedMembership?.groupId !== connectionConfig.groupId
         ) {
@@ -877,6 +1112,41 @@ export function createCommsExtension(
             inviteCode: connectionConfig.inviteCode,
           };
         }
+        if (connected && pendingCreate !== undefined) {
+          while (availableGroups.some(
+            (group) =>
+              group.groupName.toLocaleLowerCase("en-US") ===
+              pendingCreate!.groupName.toLocaleLowerCase("en-US"),
+          )) {
+            const replacement = await ctx.ui.input(
+              "这个名称已经被使用",
+              "请输入新的群组名称",
+            );
+            if (replacement === undefined || !replacement.trim()) {
+              pendingCreate = undefined;
+              break;
+            }
+            pendingCreate = {
+              ...pendingCreate,
+              groupName: replacement.trim(),
+            };
+          }
+        }
+        if (connected && pendingCreate !== undefined) {
+          desiredMembership = {
+            groupId: "",
+            userName: cachedUserName,
+            agentName: cachedAgentName,
+          };
+          brokerClient.send("group.create", {
+            groupName: pendingCreate.groupName,
+            userName: cachedUserName,
+            agentName: cachedAgentName,
+            visibility: pendingCreate.visibility,
+          });
+          pendingCreate = undefined;
+        }
+        startNetworkMonitor(ctx);
         try {
           await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
             const view = new ChatView({
@@ -889,6 +1159,10 @@ export function createCommsExtension(
               initialPermission: permission,
               initialPendingRequests: [...pendingApprovals.values()],
               initialPausedChains: [...pausedChains.values()],
+              ...(canWaitOffline
+                ? { initialGroupName: savedMembership?.groupName ?? savedMembership?.groupId }
+                : {}),
+              openGroupPanelOnJoin: openGroupManagement,
               actions: {
                 createGroup: (groupName, userName, agentName) => {
                   desiredMembership = { groupId: "", userName, agentName };
@@ -972,6 +1246,72 @@ export function createCommsExtension(
                     groupId: currentGroup.groupId,
                     ownerCredential: savedMembership.ownerCredential,
                   });
+                },
+                showGroupInvitation: () => {
+                  const address = getLanIPv4Addresses()[0];
+                  if (
+                    address === undefined ||
+                    currentGroup === undefined ||
+                    savedMembership?.inviteCode === undefined
+                  ) {
+                    ctx.ui.notify(
+                      "当前没有可显示的邀请码，请生成新的邀请码",
+                      "warning",
+                    );
+                    return;
+                  }
+                  ctx.ui.notify(
+                    `群组邀请：${formatInvitation(
+                      { host: address, port: endpoint.port },
+                      currentGroup.groupId,
+                      savedMembership.inviteCode,
+                    )}`,
+                    "info",
+                  );
+                },
+                confirmAutostart: () => ctx.ui.confirm(
+                  "开启登录后自动开放？",
+                  "这会修改当前用户的后台启动配置，不需要管理员密码。",
+                ),
+                confirmNearbyAccess: async () => {
+                  const network = primaryOrdinaryNetwork();
+                  if (network === undefined) {
+                    ctx.ui.notify("当前网络无法连接附近设备", "error");
+                    return false;
+                  }
+                  if (!await networkAccessStore.isConfirmed(network)) {
+                    const confirmed = await ctx.ui.confirm(
+                      "允许附近设备看到这个群组？",
+                      "只会使用当前普通网络。VPN 打开或关闭不会改变这个设置。",
+                    );
+                    if (!confirmed) return false;
+                    await networkAccessStore.confirm(network);
+                  }
+                  activeNetworkKey = network.networkKey;
+                  if (connectionConfig?.mode === "local") {
+                    await brokerClient.stop();
+                    await startBroker("lan-host");
+                    connectionConfig = { mode: "lan-host" };
+                    saveConnectionConfig(connectionConfig);
+                    if (savedMembership !== undefined) {
+                      savedMembership = {
+                        ...savedMembership,
+                        connection: connectionConfig,
+                        updatedAt: Date.now(),
+                      };
+                      savedMemberships.set(membershipKey(savedMembership), savedMembership);
+                      pi.appendEntry(MEMBERSHIP_ENTRY, savedMembership);
+                    }
+                    await applyConnectionConfig(connectionConfig);
+                    if (sessionId === undefined ||
+                      !await brokerClient.start(sessionId, permission)) {
+                      ctx.ui.notify("正在重新开放群组，请稍后重试", "warning");
+                      return false;
+                    }
+                    startNetworkMonitor(ctx);
+                  }
+                  brokerClient.send("broker.network.refresh", {});
+                  return true;
                 },
                 updateGroupAvailability: (
                   keepAvailableWhenEmpty,
@@ -1064,11 +1404,25 @@ export function createCommsExtension(
             return view;
           });
         } finally {
+          const remainingOnline = [...members.values()].filter(
+            (member) =>
+              member.type === "user" &&
+              member.online &&
+              member.clientId !== clientId,
+          ).length;
+          if (currentIsOwner && remainingOnline > 0) {
+            ctx.ui.notify(
+              `你已离线，群组内还有 ${remainingOnline} 人在线`,
+              "info",
+            );
+          }
           if (activeView !== undefined) {
             cachedUserName = activeView.userName;
             cachedAgentName = activeView.agentName;
           }
           activeView = undefined;
+          openGroupManagement = false;
+          pendingCreate = undefined;
           commsOpen = false;
           clearRemoteWork();
           desiredMembership = undefined;
@@ -1082,6 +1436,10 @@ export function createCommsExtension(
           if (resultRetryTimer !== undefined) {
             clearInterval(resultRetryTimer);
             resultRetryTimer = undefined;
+          }
+          if (networkMonitorTimer !== undefined) {
+            clearInterval(networkMonitorTimer);
+            networkMonitorTimer = undefined;
           }
           ctx.ui.setStatus(STATUS_KEY, undefined);
         }
@@ -1158,7 +1516,16 @@ function restoreMemberships(
       "groupId" in entry.data &&
       typeof entry.data.groupId === "string"
     ) {
-      memberships.delete(entry.data.groupId);
+      if (
+        "membershipKey" in entry.data &&
+        typeof entry.data.membershipKey === "string"
+      ) {
+        memberships.delete(entry.data.membershipKey);
+      } else {
+        for (const [key, membership] of memberships) {
+          if (membership.groupId === entry.data.groupId) memberships.delete(key);
+        }
+      }
       continue;
     }
     if (
@@ -1176,7 +1543,7 @@ function restoreMemberships(
       typeof value.updatedAt === "number"
     ) {
       const connection = parseSavedConnection(value.connection);
-      memberships.set(value.groupId, {
+      const membership: SavedMembership = {
         groupId: value.groupId,
         ...(typeof value.groupName === "string" ? { groupName: value.groupName } : {}),
         membershipCredential: value.membershipCredential,
@@ -1190,11 +1557,43 @@ function restoreMemberships(
         userName: value.userName,
         agentName: value.agentName,
         updatedAt: value.updatedAt,
+        ...(typeof value.inviteCode === "string"
+          ? { inviteCode: value.inviteCode }
+          : {}),
         ...(connection === undefined ? {} : { connection }),
-      });
+      };
+      memberships.set(membershipKey(membership), membership);
     }
   }
   return memberships;
+}
+
+function membershipKey(membership: Pick<SavedMembership, "groupId" | "connection">): string {
+  if (membership.connection?.mode === "lan-client") {
+    const broker = membership.connection.brokerId ??
+      `${membership.connection.endpoint.host}:${membership.connection.endpoint.port}`;
+    return `${broker}:${membership.groupId}`;
+  }
+  return `local:${membership.groupId}`;
+}
+
+function restoreDefaultNames(
+  ctx: ExtensionContext,
+): { userName: string; agentName: string } {
+  let names = { userName: "", agentName: "" };
+  for (const entry of ctx.sessionManager.getBranch()) {
+    if (
+      entry.type !== "custom" ||
+      entry.customType !== DEFAULT_NAMES_ENTRY ||
+      typeof entry.data !== "object" ||
+      entry.data === null
+    ) continue;
+    const value = entry.data as { userName?: unknown; agentName?: unknown };
+    if (typeof value.userName === "string" && typeof value.agentName === "string") {
+      names = { userName: value.userName, agentName: value.agentName };
+    }
+  }
+  return names;
 }
 
 function parseSavedConnection(value: unknown): ConnectionConfig | undefined {

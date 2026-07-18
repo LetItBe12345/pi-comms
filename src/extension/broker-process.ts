@@ -3,16 +3,24 @@ import { createConnection } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 import { migrateLegacyBroker } from "../broker/legacy-migration.js";
-import type { BrokerMode } from "../broker/runtime-metadata.js";
+import {
+  readBrokerRuntimeMetadata,
+  type BrokerMode,
+} from "../broker/runtime-metadata.js";
 import {
   BROKER_PROTOCOL_VERSION,
   BROKER_SERVICE,
+  PI_COMMS_BUILD_CHANNEL,
+  PI_COMMS_VERSION,
   createEnvelope,
   encodeEnvelope,
   JsonlDecoder,
   type BrokerEnvelope,
 } from "../protocol.js";
-import { probeBroker } from "../transport/broker-probe.js";
+import {
+  probeBroker,
+  type BrokerProbeResult,
+} from "../transport/broker-probe.js";
 import {
   DEFAULT_BROKER_ENDPOINT,
   formatEndpoint,
@@ -41,12 +49,33 @@ export async function startBroker(options: {
   const endpoint = options.endpoint ?? DEFAULT_BROKER_ENDPOINT;
   const existing = await probeBroker(endpoint);
   if (existing.status === "compatible") {
-    if (options.mode === "local" || existing.brokerMode === "lan-host") return;
+    const action = brokerCompatibilityAction(existing, options.mode);
+    if (action === "reject") {
+      throw new Error("开发版不能接管正在运行的发行版 Pi Comms");
+    }
+    if (action === "reuse") return;
     await stopBroker(endpoint);
   } else if (existing.status === "incompatible") {
-    throw new Error(
-      `端口上的服务不是兼容的 Pi Comms Broker：${formatEndpoint(endpoint)}`,
-    );
+    const metadata = options.dbPath === undefined
+      ? undefined
+      : await readBrokerRuntimeMetadata(options.dbPath);
+    if (
+      PI_COMMS_BUILD_CHANNEL === "development" &&
+      metadata?.buildChannel !== "development"
+    ) {
+      throw new Error("开发版不能接管正在运行的发行版 Pi Comms");
+    }
+    if (
+      PI_COMMS_BUILD_CHANNEL !== "release" ||
+      metadata === undefined ||
+      !isProcessAlive(metadata.pid)
+    ) {
+      throw new Error(
+        `端口上的服务不是兼容的 Pi Comms：${formatEndpoint(endpoint)}`,
+      );
+    }
+    process.kill(metadata.pid, "SIGTERM");
+    await waitUntilStopped(endpoint, 5_000);
   }
 
   const launcherPath = fileURLToPath(new URL("../broker/launcher.ts", import.meta.url));
@@ -90,6 +119,52 @@ export async function startBroker(options: {
     await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   }
   throw new Error(`启动协作空间超时：${formatEndpoint(endpoint)}`);
+}
+
+export function brokerCompatibilityAction(
+  existing: Extract<BrokerProbeResult, { status: "compatible" }>,
+  requestedMode: BrokerMode,
+  current: {
+    appVersion: string;
+    buildChannel: "release" | "development";
+  } = {
+    appVersion: PI_COMMS_VERSION,
+    buildChannel: PI_COMMS_BUILD_CHANNEL,
+  },
+): "reuse" | "restart" | "reject" {
+  if (
+    current.buildChannel === "development" &&
+    existing.buildChannel === "release"
+  ) return "reject";
+  const sameBuild =
+    existing.appVersion === current.appVersion &&
+    existing.buildChannel === current.buildChannel;
+  if (
+    sameBuild &&
+    (requestedMode === "local" || existing.brokerMode === "lan-host")
+  ) return "reuse";
+  return "restart";
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitUntilStopped(
+  endpoint: TcpConnectEndpoint,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await probeBroker(endpoint)).status === "unreachable") return;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  throw new Error(`旧发行版未能停止：${formatEndpoint(endpoint)}`);
 }
 
 export async function stopBroker(

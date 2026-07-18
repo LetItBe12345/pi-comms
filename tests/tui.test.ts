@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { ChatView, type ChatViewActions } from "../src/tui/chat-view.js";
+import { GroupPicker } from "../src/tui/group-picker.js";
 import type { HistoryMessage, SnapshotPayload } from "../src/protocol.js";
 
 class TestTerminal implements Terminal {
@@ -167,11 +168,17 @@ describe("最小群聊 TUI", () => {
 
     expect(view.render(80).join("\n")).toContain("Ctrl+G 群组管理");
     view.handleInput("\x07");
-    const management = view.render(80).join("\n");
-    expect(management).toContain("群组管理");
-    expect(management).toContain("Alice [群主]");
-    expect(management).toContain("生成新的邀请码");
+    expect(view.render(80).join("\n")).toContain("群组管理");
+    view.handleInput("\x1b[B");
+    view.handleInput("\x1b[B");
+    view.handleInput("\r");
+    expect(view.render(80).join("\n")).toContain("Alice [群主]");
+    view.handleInput("\x1b");
+    view.handleInput("\x1b[B");
+    view.handleInput("\r");
+    expect(view.render(80).join("\n")).toContain("生成新的邀请码");
 
+    view.handleInput("\x1b");
     view.handleInput("\x1b");
     view.handleInput("?");
     expect(view.render(40).join("\n")).toContain("Ctrl+P  Agent 控制");
@@ -324,7 +331,7 @@ describe("最小群聊 TUI", () => {
     const screen = view.render(45).join("\n");
     expect(screen).toContain("在线 2");
     expect(screen).toContain("窄屏消息");
-    expect(screen).toContain("Enter 发送");
+    expect(screen).toContain("? 快捷键");
   });
 
   it("通过 Ctrl+P 切换权限并批准待处理请求", () => {
@@ -575,5 +582,73 @@ describe("最小群聊 TUI", () => {
     const noticeIndex = lines.findIndex((line) => line.includes("Alice 发给 Bob-Pi 的请求未完成"));
     expect(noticeIndex).toBeGreaterThan(oldMessageIndex);
     expect(lines[oldMessageIndex + 1]).not.toContain("失败");
+  });
+});
+
+describe("群组首屏", () => {
+  it("同屏显示三个分区，并在附近更新时保持选择", () => {
+    const terminal = new TestTerminal();
+    const tui = new TUI(terminal);
+    const done = vi.fn();
+    const refresh = vi.fn();
+    const picker = new GroupPicker({
+      tui,
+      theme,
+      done,
+      onRefresh: refresh,
+      memberships: [
+        {
+          key: "local:mine",
+          groupId: "mine",
+          groupName: "我的项目",
+          owner: true,
+          updatedAt: 2,
+        },
+        {
+          key: "broker-b:joined",
+          groupId: "joined",
+          groupName: "设计协作",
+          owner: false,
+          updatedAt: 1,
+        },
+      ],
+    });
+    picker.focused = true;
+    picker.setNearby([
+      {
+        brokerId: "broker-a",
+        groupId: "nearby",
+        groupName: "附近开发组",
+        onlineSessionCount: 2,
+        endpoint: { host: "192.168.1.8", port: 43_127 },
+        connectionState: "available",
+      },
+    ], { searching: false });
+
+    const screen = picker.render(80).join("\n");
+    expect(screen).toContain("我的群组");
+    expect(screen).toContain("已加入");
+    expect(screen).toContain("附近群组");
+    expect(screen).toContain("R 重新查找");
+
+    picker.handleInput("\x1b[A");
+    picker.setNearby([
+      {
+        brokerId: "broker-a",
+        groupId: "nearby",
+        groupName: "附近开发组",
+        onlineSessionCount: 3,
+        endpoint: { host: "192.168.1.9", port: 43_127 },
+        connectionState: "available",
+      },
+    ], { searching: false });
+    picker.handleInput("\r");
+    expect(done).toHaveBeenCalledWith(expect.objectContaining({
+      type: "nearby",
+      group: expect.objectContaining({ onlineSessionCount: 3 }),
+    }));
+
+    picker.handleInput("r");
+    expect(refresh).toHaveBeenCalled();
   });
 });

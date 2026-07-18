@@ -20,6 +20,11 @@ export interface Envelope<T = unknown> {
 
 export const BROKER_SERVICE = "pi-comms";
 export const PI_COMMS_VERSION = "0.1.0";
+export type PiCommsBuildChannel = "release" | "development";
+export const PI_COMMS_BUILD_CHANNEL: PiCommsBuildChannel =
+  process.env.PI_COMMS_BUILD_CHANNEL === "development"
+    ? "development"
+    : "release";
 export const BROKER_PROTOCOL_VERSION = 4;
 export const MAX_JSONL_FRAME_BYTES = 8 * 1024 * 1024;
 
@@ -34,6 +39,8 @@ export interface BrokerReadyPayload {
   brokerId: string;
   brokerInstanceId: string;
   brokerMode: "local" | "lan-host";
+  appVersion: string;
+  buildChannel: PiCommsBuildChannel;
   requestId: string;
 }
 
@@ -69,6 +76,12 @@ export type ClientGoodbyePayload = Record<string, never>;
 
 export interface PongPayload {
   requestId: string;
+}
+
+export interface NetworkAccessUpdatedPayload {
+  requestId: string;
+  allowed: boolean;
+  address?: string;
 }
 
 export interface GroupCreatePayload {
@@ -318,7 +331,9 @@ export type ProtocolErrorCode =
   | "owner_required"
   | "owner_cannot_leave"
   | "member_removed"
-  | "broker_changed";
+  | "group_deleted"
+  | "broker_changed"
+  | "network_unavailable";
 
 export interface ErrorPayload {
   code: ProtocolErrorCode;
@@ -340,6 +355,9 @@ export type ClientGoodbyeEnvelope = Envelope<ClientGoodbyePayload> & {
 };
 export type PingEnvelope = Envelope<Record<string, never>> & {
   type: "ping";
+};
+export type NetworkRefreshEnvelope = Envelope<Record<string, never>> & {
+  type: "broker.network.refresh";
 };
 export type GroupCreateEnvelope = Envelope<GroupCreatePayload> & {
   type: "group.create";
@@ -408,6 +426,7 @@ export type ClientEnvelope =
   | ClientHelloEnvelope
   | ClientGoodbyeEnvelope
   | PingEnvelope
+  | NetworkRefreshEnvelope
   | GroupCreateEnvelope
   | GroupJoinEnvelope
   | GroupLeaveEnvelope
@@ -432,6 +451,9 @@ export type BrokerEnvelope =
   | (Envelope<{ requestId: string }> & { type: "broker.stopping" })
   | (Envelope<ClientWelcomePayload> & { type: "client.welcome" })
   | (Envelope<PongPayload> & { type: "pong" })
+  | (Envelope<NetworkAccessUpdatedPayload> & {
+      type: "broker.network.updated";
+    })
   | (Envelope<GroupsChangedPayload> & { type: "group.catalog.result" })
   | (Envelope<MembershipWelcomePayload> & { type: "membership.welcome" })
   | (Envelope<GroupInviteUpdatedPayload> & { type: "group.invite.updated" })
@@ -563,6 +585,7 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
         : invalid("invalid_payload", "client.hello permission 无效", requestId);
     }
     case "broker.shutdown":
+    case "broker.network.refresh":
     case "client.goodbye":
     case "ping":
       return { ok: true, envelope: value as unknown as ClientEnvelope };

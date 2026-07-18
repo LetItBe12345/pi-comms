@@ -10,15 +10,16 @@ const SERVICE_NAME = "pi-comms";
 const LAUNCH_AGENT_ID = "io.pi-comms.broker";
 
 export async function configureBrokerAutostart(
-  enabled: boolean,
+  keepAlive: boolean,
+  openAtLogin: boolean,
   dbPath: string,
 ): Promise<void> {
   if (platform() === "linux") {
-    await configureSystemd(enabled, dbPath);
+    await configureSystemd(keepAlive, openAtLogin, dbPath);
     return;
   }
   if (platform() === "darwin") {
-    await configureLaunchAgent(enabled, dbPath);
+    await configureLaunchAgent(keepAlive, openAtLogin, dbPath);
   }
 }
 
@@ -36,7 +37,7 @@ export function renderSystemdUserService(
     "[Service]",
     "Type=simple",
     `ExecStart=${systemdQuote(nodePath)} --import ${systemdQuote(tsxImport)} ${systemdQuote(launcherPath)} --mode lan-host --port 43127 --db ${systemdQuote(dbPath)}`,
-    "Restart=on-failure",
+    "Restart=always",
     "RestartSec=2",
     "",
     "[Install]",
@@ -50,6 +51,7 @@ export function renderLaunchAgent(
   launcherPath: string,
   dbPath: string,
   tsxImport = "tsx",
+  openAtLogin = true,
 ): string {
   const args = [
     nodePath,
@@ -75,21 +77,22 @@ export function renderLaunchAgent(
     args,
     "  </array>",
     "  <key>RunAtLoad</key>",
-    "  <true/>",
+    `  <${openAtLogin ? "true" : "false"}/>`,
     "  <key>KeepAlive</key>",
-    "  <dict>",
-    "    <key>SuccessfulExit</key>",
-    "    <false/>",
-    "  </dict>",
+    "  <true/>",
     "</dict>",
     "</plist>",
     "",
   ].join("\n");
 }
 
-async function configureSystemd(enabled: boolean, dbPath: string): Promise<void> {
+async function configureSystemd(
+  keepAlive: boolean,
+  openAtLogin: boolean,
+  dbPath: string,
+): Promise<void> {
   const path = join(homedir(), ".config", "systemd", "user", `${SERVICE_NAME}.service`);
-  if (enabled) {
+  if (keepAlive) {
     await mkdir(dirname(path), { recursive: true });
     await writeFile(
       path,
@@ -102,7 +105,11 @@ async function configureSystemd(enabled: boolean, dbPath: string): Promise<void>
       { encoding: "utf8", mode: 0o600 },
     );
     await execFileAsync("systemctl", ["--user", "daemon-reload"]);
-    await execFileAsync("systemctl", ["--user", "enable", "--now", `${SERVICE_NAME}.service`]);
+    await execFileAsync(
+      "systemctl",
+      ["--user", openAtLogin ? "enable" : "disable", `${SERVICE_NAME}.service`],
+    );
+    await execFileAsync("systemctl", ["--user", "start", `${SERVICE_NAME}.service`]);
     return;
   }
   await execFileAsync("systemctl", ["--user", "disable", "--now", `${SERVICE_NAME}.service`])
@@ -111,10 +118,19 @@ async function configureSystemd(enabled: boolean, dbPath: string): Promise<void>
   await execFileAsync("systemctl", ["--user", "daemon-reload"]).catch(() => undefined);
 }
 
-async function configureLaunchAgent(enabled: boolean, dbPath: string): Promise<void> {
-  const path = join(homedir(), "Library", "LaunchAgents", `${LAUNCH_AGENT_ID}.plist`);
+async function configureLaunchAgent(
+  keepAlive: boolean,
+  openAtLogin: boolean,
+  dbPath: string,
+): Promise<void> {
+  const loginPath = join(homedir(), "Library", "LaunchAgents", `${LAUNCH_AGENT_ID}.plist`);
+  const sessionPath = join(dirname(dbPath), `${LAUNCH_AGENT_ID}.plist`);
+  const path = openAtLogin ? loginPath : sessionPath;
   const domain = `gui/${process.getuid?.() ?? 0}`;
-  if (enabled) {
+  if (keepAlive) {
+    await execFileAsync("launchctl", ["bootout", domain, loginPath]).catch(() => undefined);
+    await execFileAsync("launchctl", ["bootout", domain, sessionPath]).catch(() => undefined);
+    await rm(openAtLogin ? sessionPath : loginPath, { force: true });
     await mkdir(dirname(path), { recursive: true });
     await writeFile(
       path,
@@ -123,6 +139,7 @@ async function configureLaunchAgent(enabled: boolean, dbPath: string): Promise<v
         launcherPath(),
         dbPath,
         import.meta.resolve("tsx"),
+        openAtLogin,
       ),
       { encoding: "utf8", mode: 0o600 },
     );
@@ -130,8 +147,10 @@ async function configureLaunchAgent(enabled: boolean, dbPath: string): Promise<v
     await execFileAsync("launchctl", ["bootstrap", domain, path]);
     return;
   }
-  await execFileAsync("launchctl", ["bootout", domain, path]).catch(() => undefined);
-  await rm(path, { force: true });
+  await execFileAsync("launchctl", ["bootout", domain, loginPath]).catch(() => undefined);
+  await execFileAsync("launchctl", ["bootout", domain, sessionPath]).catch(() => undefined);
+  await rm(loginPath, { force: true });
+  await rm(sessionPath, { force: true });
 }
 
 function launcherPath(): string {

@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { brokerLockPath } from "../src/broker/process-lock.js";
 import {
+  brokerCompatibilityAction,
   startLanHostBroker,
   startLocalBroker,
   stopBroker,
@@ -101,6 +102,32 @@ describe("Broker 跨进程竞争", () => {
       process.chdir(originalCwd);
     }
   }, 20_000);
+});
+
+describe("发行版接管规则", () => {
+  const running = {
+    status: "compatible" as const,
+    brokerId: "broker",
+    brokerInstanceId: "instance",
+    brokerMode: "lan-host" as const,
+    appVersion: "0.1.0",
+    buildChannel: "release" as const,
+  };
+
+  it("新发行版会重启旧发行版，开发版拒绝接管发行版", () => {
+    expect(brokerCompatibilityAction(running, "lan-host", {
+      appVersion: "0.2.0",
+      buildChannel: "release",
+    })).toBe("restart");
+    expect(brokerCompatibilityAction(running, "lan-host", {
+      appVersion: "0.2.0-dev",
+      buildChannel: "development",
+    })).toBe("reject");
+    expect(brokerCompatibilityAction(running, "local", {
+      appVersion: "0.1.0",
+      buildChannel: "release",
+    })).toBe("reuse");
+  });
 });
 
 function startBrokerProcess(port: number, dbPath: string): ChildRecord {

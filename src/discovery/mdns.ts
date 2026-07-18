@@ -53,14 +53,16 @@ export interface BrokerDiscoverySource {
   readonly brokers: DiscoveredBroker[];
   refresh(): void;
   stop(): void;
+  subscribe(listener: (brokers: DiscoveredBroker[]) => void): () => void;
 }
 
 export class FakeBrokerDiscovery implements BrokerDiscoverySource {
   #brokers: DiscoveredBroker[] = [];
-  readonly #onChanged: (brokers: DiscoveredBroker[]) => void;
+  readonly #listeners = new Set<(brokers: DiscoveredBroker[]) => void>();
+  readonly #lastSeen = new Map<string, number>();
 
   constructor(onChanged: (brokers: DiscoveredBroker[]) => void = () => {}) {
-    this.#onChanged = onChanged;
+    this.#listeners.add(onChanged);
   }
 
   get brokers(): DiscoveredBroker[] {
@@ -77,18 +79,44 @@ export class FakeBrokerDiscovery implements BrokerDiscoverySource {
         addresses: [...broker.addresses],
       }]),
     ).values()];
-    this.#onChanged(this.brokers);
+    const now = Date.now();
+    for (const broker of brokers) this.#lastSeen.set(broker.brokerId, now);
+    this.#emit();
   }
 
   remove(brokerId: string): void {
     this.#brokers = this.#brokers.filter((broker) => broker.brokerId !== brokerId);
-    this.#onChanged(this.brokers);
+    this.#lastSeen.delete(brokerId);
+    this.#emit();
   }
 
   refresh(): void {}
 
   stop(): void {
     this.#brokers = [];
+    this.#lastSeen.clear();
+    this.#emit();
+  }
+
+  subscribe(listener: (brokers: DiscoveredBroker[]) => void): () => void {
+    this.#listeners.add(listener);
+    listener(this.brokers);
+    return () => this.#listeners.delete(listener);
+  }
+
+  expireOlderThan(maxAgeMs: number, now = Date.now()): void {
+    const expired = [...this.#lastSeen.entries()]
+      .filter(([, lastSeen]) => now - lastSeen >= maxAgeMs)
+      .map(([brokerId]) => brokerId);
+    for (const brokerId of expired) {
+      this.#lastSeen.delete(brokerId);
+      this.#brokers = this.#brokers.filter((broker) => broker.brokerId !== brokerId);
+    }
+    if (expired.length > 0) this.#emit();
+  }
+
+  #emit(): void {
+    for (const listener of this.#listeners) listener(this.brokers);
   }
 }
 
@@ -96,14 +124,16 @@ export class BrokerDiscovery implements BrokerDiscoverySource {
   readonly #bonjour: Bonjour;
   readonly #browser: Browser;
   readonly #brokers = new Map<string, DiscoveredBroker>();
-  readonly #onChanged: (brokers: DiscoveredBroker[]) => void;
+  readonly #lastSeen = new Map<string, number>();
+  readonly #listeners = new Set<(brokers: DiscoveredBroker[]) => void>();
+  readonly #expiryTimer: ReturnType<typeof setInterval>;
 
   constructor(options: {
     interfaceAddress?: string;
     onChanged: (brokers: DiscoveredBroker[]) => void;
     onError?: (error: Error) => void;
   }) {
-    this.#onChanged = options.onChanged;
+    this.#listeners.add(options.onChanged);
     this.#bonjour = createBonjour(options.interfaceAddress, options.onError);
     this.#browser = this.#bonjour.find({ type: BROKER_SERVICE });
     this.#browser.on("up", (service: Service) => this.#upsert(service));
@@ -112,9 +142,12 @@ export class BrokerDiscovery implements BrokerDiscoverySource {
       const brokerId = txtString(service.txt?.brokerId);
       if (brokerId !== undefined) {
         this.#brokers.delete(brokerId);
+        this.#lastSeen.delete(brokerId);
         this.#emit();
       }
     });
+    this.#expiryTimer = setInterval(() => this.#expire(), 5_000);
+    this.#expiryTimer.unref?.();
   }
 
   get brokers(): DiscoveredBroker[] {
@@ -129,9 +162,18 @@ export class BrokerDiscovery implements BrokerDiscoverySource {
   }
 
   stop(): void {
+    clearInterval(this.#expiryTimer);
     this.#browser.stop();
     this.#bonjour.destroy();
     this.#brokers.clear();
+    this.#lastSeen.clear();
+    this.#emit();
+  }
+
+  subscribe(listener: (brokers: DiscoveredBroker[]) => void): () => void {
+    this.#listeners.add(listener);
+    listener(this.brokers);
+    return () => this.#listeners.delete(listener);
   }
 
   #upsert(service: Service): void {
@@ -151,11 +193,23 @@ export class BrokerDiscovery implements BrokerDiscoverySource {
       protocolVersion,
       appVersion,
     });
+    this.#lastSeen.set(brokerId, Date.now());
     this.#emit();
   }
 
   #emit(): void {
-    this.#onChanged(this.brokers);
+    for (const listener of this.#listeners) listener(this.brokers);
+  }
+
+  #expire(now = Date.now()): void {
+    let changed = false;
+    for (const [brokerId, lastSeen] of this.#lastSeen) {
+      if (now - lastSeen < 120_000) continue;
+      this.#lastSeen.delete(brokerId);
+      this.#brokers.delete(brokerId);
+      changed = true;
+    }
+    if (changed) this.#emit();
   }
 }
 

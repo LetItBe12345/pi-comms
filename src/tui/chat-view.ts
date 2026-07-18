@@ -26,7 +26,12 @@ import type {
   SendFailedPayload,
   SnapshotPayload,
 } from "../protocol.js";
-import type { AgentPermission, GroupSummary, Member } from "../types.js";
+import type {
+  AgentPermission,
+  GroupSettings,
+  GroupSummary,
+  Member,
+} from "../types.js";
 
 type SetupStage =
   | "user"
@@ -37,6 +42,7 @@ type SetupStage =
   | "invite"
   | "chat";
 type ConnectionState = "connecting" | "connected" | "reconnecting";
+type NetworkStatus = "available" | "paused" | "restoring" | "unavailable";
 
 export interface ChatViewActions {
   createGroup(groupName: string, userName: string, agentName: string): string | undefined;
@@ -55,6 +61,9 @@ export interface ChatViewActions {
   updateGroupVisibility?(visibility: "local" | "nearby"): string | undefined;
   renameGroup?(groupName: string): string | undefined;
   rotateGroupInvite?(): string | undefined;
+  showGroupInvitation?(): void;
+  confirmAutostart?(): Promise<boolean>;
+  confirmNearbyAccess?(): Promise<boolean>;
   updateGroupAvailability?(
     keepAvailableWhenEmpty: boolean,
     openAtLogin: boolean,
@@ -78,6 +87,8 @@ export interface ChatViewOptions {
   initialPermission?: AgentPermission;
   initialPendingRequests?: AgentRequestPayload[];
   initialPausedChains?: PausedChainPayload[];
+  initialGroupName?: string;
+  openGroupPanelOnJoin?: boolean;
 }
 
 interface PendingSetup {
@@ -104,6 +115,9 @@ export class ChatView implements Component, Focusable {
   readonly #editor: Editor;
   #stage: SetupStage = "user";
   #connection: ConnectionState = "connecting";
+  #networkStatus: { state: NetworkStatus; name?: string } = {
+    state: "available",
+  };
   #groups: GroupSummary[] = [];
   #snapshot: SnapshotPayload | undefined;
   #messages: HistoryMessage[] = [];
@@ -121,6 +135,7 @@ export class ChatView implements Component, Focusable {
   #groupDeleteList: SelectList;
   #memberActionList: SelectList;
   #selectedMember: Member | undefined;
+  #groupSection: "root" | "settings" | "nearby" | "members" | "danger" = "root";
   #panel:
     | "permission"
     | "pending"
@@ -129,6 +144,7 @@ export class ChatView implements Component, Focusable {
     | "chain-decision"
     | "group"
     | "group-delete"
+    | "local-confirm"
     | "delete-name"
     | "member-action"
     | "rename"
@@ -144,6 +160,8 @@ export class ChatView implements Component, Focusable {
   #pendingMessage: { id: string; text: string } | undefined;
   #error: string | undefined;
   #focused = false;
+  #initialGroupName: string | undefined;
+  #openGroupPanelOnJoin: boolean;
   #noticeCounter = 0;
   readonly #historicalFinalStatusIds = new Set<string>();
 
@@ -156,6 +174,9 @@ export class ChatView implements Component, Focusable {
     this.#userInput.setValue(options.initialUserName ?? "");
     this.#agentInput.setValue(options.initialAgentName ?? "");
     this.#permission = options.initialPermission ?? "auto";
+    this.#initialGroupName = options.initialGroupName;
+    this.#openGroupPanelOnJoin = options.openGroupPanelOnJoin === true;
+    if (this.#initialGroupName !== undefined) this.#stage = "chat";
     this.#pendingRequests = sortPendingRequests(options.initialPendingRequests ?? []);
     this.#pausedChains = sortPausedChains(options.initialPausedChains ?? []);
 
@@ -256,6 +277,15 @@ export class ChatView implements Component, Focusable {
     this.#tui.requestRender();
   }
 
+  setNetworkStatus(state: NetworkStatus, name?: string): void {
+    this.#networkStatus = {
+      state,
+      ...(name === undefined ? {} : { name }),
+    };
+    this.#groupPanelList = this.#createGroupPanelList();
+    this.#tui.requestRender();
+  }
+
   setGroups(groups: GroupSummary[]): void {
     this.#groups = sortGroups(groups);
     this.#groupList = this.#createGroupList();
@@ -274,9 +304,16 @@ export class ChatView implements Component, Focusable {
     this.#groupPanelList = this.#createGroupPanelList();
     if (snapshot.group !== undefined) {
       this.#stage = "chat";
+      this.#initialGroupName = snapshot.group.groupName;
       this.#pendingSetup = undefined;
       this.#error = undefined;
       this.#editor.setAutocompleteProvider(this.#memberAutocomplete());
+      if (this.#openGroupPanelOnJoin) {
+        this.#panel = "group";
+        this.#groupSection = "root";
+        this.#openGroupPanelOnJoin = false;
+        this.#groupPanelList = this.#createGroupPanelList();
+      }
     }
     this.#syncFocus();
     this.#tui.requestRender();
@@ -465,6 +502,7 @@ export class ChatView implements Component, Focusable {
     }
     if (this.#stage === "chat" && matchesKey(data, "ctrl+g")) {
       this.#panel = "group";
+      this.#groupSection = "root";
       this.#groupPanelList = this.#createGroupPanelList();
       this.#syncFocus();
       this.#tui.requestRender();
@@ -645,10 +683,13 @@ export class ChatView implements Component, Focusable {
     const header = this.#renderHeader(width);
     const timeline = this.#renderTimeline(width);
     const editor = this.#editor.render(width);
+    const shortcutText = width < 60
+      ? "Esc 返回 · ? 快捷键"
+      : `Enter 发送 · Ctrl+G ${this.#snapshot?.isOwner ? "群组管理" : "群组信息"} · Ctrl+P Agent 控制 · Esc 返回 · ? 帮助`;
     const hint = truncateToWidth(
       this.#theme.fg(
         "dim",
-        `Enter 发送 · Ctrl+G ${this.#snapshot?.isOwner ? "群组管理" : "群组信息"} · Ctrl+P Agent 控制 · Esc 返回 · ? 帮助`,
+        shortcutText,
       ),
       width,
     );
@@ -659,7 +700,9 @@ export class ChatView implements Component, Focusable {
   }
 
   #renderHeader(width: number): string[] {
-    const group = this.#snapshot?.group?.groupName ?? "未加入群组";
+    const group = this.#snapshot?.group?.groupName ??
+      this.#initialGroupName ??
+      "未加入群组";
     return [truncateToWidth(this.#theme.bold(`Pi Comms · ${group}`), width)];
   }
 
@@ -753,11 +796,14 @@ export class ChatView implements Component, Focusable {
       this.#panel === "chains" ? "待决定自动对话" :
       this.#panel === "chain-decision" ? "处理自动对话" :
       this.#panel === "group-delete" ? "解散群组？" :
+      this.#panel === "local-confirm" ? "改为仅这台电脑？" :
       this.#panel === "delete-name" ? "输入群组名称确认解散" :
       this.#panel === "member-action" ? "成员管理" :
       this.#panel === "rename" ? "修改群组名称" :
       this.#panel === "help" ? "快捷键" :
-      this.#snapshot?.isOwner ? "群组管理" : "群组信息";
+      this.#snapshot?.isOwner
+        ? groupSectionTitle(this.#groupSection)
+        : "群组信息";
     const lines = [this.#theme.bold(title), ""];
     if (this.#panel === "help") {
       lines.push(
@@ -808,6 +854,7 @@ export class ChatView implements Component, Focusable {
     if (this.#panel === "chain-decision") return this.#chainDecisionList;
     if (this.#panel === "group") return this.#groupPanelList;
     if (this.#panel === "group-delete") return this.#groupDeleteList;
+    if (this.#panel === "local-confirm") return this.#groupDeleteList;
     if (this.#panel === "member-action") return this.#memberActionList;
     if (this.#panel === "rename") return this.#groupInput;
     if (this.#panel === "delete-name") return this.#groupInput;
@@ -817,13 +864,18 @@ export class ChatView implements Component, Focusable {
   #closePanel(): void {
     if (this.#panel === "decision") this.#panel = "pending";
     else if (this.#panel === "chain-decision") this.#panel = "chains";
-    else if (this.#panel === "group-delete") this.#panel = "group";
+    else if (this.#panel === "group-delete" || this.#panel === "local-confirm") {
+      this.#panel = "group";
+    }
     else if (this.#panel === "member-action") this.#panel = "group";
     else if (this.#panel === "rename") this.#panel = "group";
     else if (this.#panel === "delete-name") this.#panel = "group";
     else if (this.#panel === "pending") this.#panel = "permission";
     else if (this.#panel === "chains") this.#panel = "permission";
-    else this.#panel = undefined;
+    else if (this.#panel === "group" && this.#groupSection !== "root") {
+      this.#groupSection = "root";
+      this.#groupPanelList = this.#createGroupPanelList();
+    } else this.#panel = undefined;
     this.#error = undefined;
     this.#syncFocus();
   }
@@ -983,14 +1035,29 @@ export class ChatView implements Component, Focusable {
   #createGroupPanelList(): SelectList {
     const settings = this.#snapshot?.groupSettings;
     const isOwner = this.#snapshot?.isOwner === true;
-    const members = [...this.#members.values()]
+    const members: SelectItem[] = [...this.#members.values()]
       .filter((member) => member.type === "user")
-      .map((member) => ({
-        value: `member:${member.memberId}`,
-        label: `${member.displayName}${member.isOwner ? " [群主]" : ""}`,
-        description: member.removed ? "已移出" : member.online ? "在线" : "离线",
-      }));
-    const ownerItems: SelectItem[] = !isOwner || settings === undefined ? [
+      .sort((a, b) =>
+        memberOrder(a) - memberOrder(b) ||
+        a.displayName.localeCompare(b.displayName, "zh-CN")
+      )
+      .map((member) => {
+        const agent = [...this.#members.values()].find(
+          (candidate) =>
+            candidate.type === "agent" &&
+            candidate.stableSessionKey === member.stableSessionKey,
+        );
+        const state = member.removed ? "已移出" : member.online ? "在线" : "离线";
+        const lastActive = member.lastActiveAt === undefined
+          ? ""
+          : ` · 最后活跃 ${formatDateTime(member.lastActiveAt)}`;
+        return {
+          value: `member:${member.memberId}`,
+          label: `${state} · ${member.displayName}${member.isOwner ? " [群主]" : ""}`,
+          description: `Agent：${agent?.displayName ?? "未命名"}${lastActive}`,
+        };
+      });
+    const items: SelectItem[] = !isOwner || settings === undefined ? [
       ...(this.#snapshot?.ownerRecoveryAvailable ? [{
         value: "recover-owner",
         label: "恢复群主管理权",
@@ -1001,12 +1068,29 @@ export class ChatView implements Component, Focusable {
       label: "退出群组",
       description: "以后需要重新使用邀请码加入",
       },
-    ] : [
+      ...members,
+    ] : this.#groupSection === "root" ? [
+      { value: "section:settings", label: "群组设置", description: "名称等基本设置" },
+      { value: "section:nearby", label: "附近加入", description: "邀请、网络和后台开放" },
+      { value: "section:members", label: "成员管理", description: "在线、离线和已移出成员" },
+      { value: "section:danger", label: "危险操作", description: "改为仅本机或解散群组" },
+    ] : this.#groupSection === "settings" ? [
       {
         value: "rename",
         label: "修改群组名称",
         description: settings.groupName,
       },
+    ] : this.#groupSection === "nearby" ? [
+      {
+        value: "network-status",
+        label: networkStatusLabel(this.#networkStatus.state),
+        description: this.#networkStatus.name ?? "普通网络",
+      },
+      ...(settings.visibility === "nearby" ? [{
+        value: "show-invitation",
+        label: "显示群组邀请",
+        description: "复制后可发给其他成员",
+      }] : []),
       {
         value: "visibility",
         label: settings.visibility === "nearby"
@@ -1033,17 +1117,28 @@ export class ChatView implements Component, Focusable {
           : "登录后自动开放",
         description: settings.openAtLogin ? "当前已开启" : "默认关闭",
       }] : [])] : []),
+    ] : this.#groupSection === "members" ? members : [
+      ...(settings.visibility === "nearby" ? [{
+        value: "local-only",
+        label: "改为仅这台电脑",
+        description: "停止附近加入，但保留成员和聊天记录",
+      }] : []),
       {
         value: "delete",
         label: "解散群组",
         description: "删除成员和聊天记录",
       },
     ];
-    const list = this.#createSelectList([
-      ...ownerItems,
-      ...members,
-    ]);
+    const list = this.#createSelectList(items);
     list.onSelect = (item) => {
+      if (item.value.startsWith("section:")) {
+        this.#groupSection = item.value.slice("section:".length) as
+          "settings" | "nearby" | "members" | "danger";
+        this.#groupPanelList = this.#createGroupPanelList();
+        this.#syncFocus();
+        this.#tui.requestRender();
+        return;
+      }
       if (item.value.startsWith("member:")) {
         if (!isOwner) return;
         const memberId = item.value.slice("member:".length);
@@ -1056,6 +1151,11 @@ export class ChatView implements Component, Focusable {
         this.#panel = "member-action";
         this.#syncFocus();
         this.#tui.requestRender();
+        return;
+      }
+      if (item.value === "network-status") return;
+      if (item.value === "show-invitation") {
+        this.#actions.showGroupInvitation?.();
         return;
       }
       if (item.value === "leave") {
@@ -1073,8 +1173,12 @@ export class ChatView implements Component, Focusable {
       if (settings === undefined || !isOwner) return;
       let id: string | undefined;
       if (item.value === "visibility") {
+        if (settings.visibility === "local") {
+          void this.#confirmAndEnableNearby();
+          return;
+        }
         id = this.#actions.updateGroupVisibility?.(
-          settings.visibility === "nearby" ? "local" : "nearby",
+          "local",
         );
       } else if (item.value === "rotate") {
         id = this.#actions.rotateGroupInvite?.();
@@ -1084,10 +1188,17 @@ export class ChatView implements Component, Focusable {
           false,
         );
       } else if (item.value === "autostart") {
-        id = this.#actions.updateGroupAvailability?.(
-          true,
-          !settings.openAtLogin,
-        );
+        if (!settings.openAtLogin) {
+          void this.#confirmAndUpdateAutostart(settings);
+          return;
+        }
+        id = this.#actions.updateGroupAvailability?.(true, false);
+      } else if (item.value === "local-only") {
+        this.#panel = "local-confirm";
+        this.#groupDeleteList = this.#createGroupDeleteList();
+        this.#syncFocus();
+        this.#tui.requestRender();
+        return;
       } else if (item.value === "delete") {
         this.#groupInput.setValue("");
         this.#panel = "delete-name";
@@ -1109,13 +1220,25 @@ export class ChatView implements Component, Focusable {
   }
 
   #createGroupDeleteList(): SelectList {
+    const localOnly = this.#panel === "local-confirm";
     const list = this.#createSelectList([
       { value: "back", label: "取消", description: "保留群组" },
-      { value: "delete", label: "确认解散", description: "此操作不可撤销" },
+      {
+        value: localOnly ? "local-only" : "delete",
+        label: localOnly ? "确认改为仅这台电脑" : "确认解散",
+        description: localOnly
+          ? "远程成员会断开，长期身份和聊天记录保留"
+          : "此操作不可撤销",
+      },
     ]);
     list.onSelect = (item) => {
       if (item.value === "back") {
         this.#panel = "group";
+      } else if (item.value === "local-only") {
+        const id = this.#actions.updateGroupVisibility?.("local");
+        this.#error = id === undefined ? "操作尚未发送，请检查连接" : "正在停止附近加入…";
+        this.#panel = "group";
+        this.#groupSection = "danger";
       } else {
         const id = this.#actions.deleteGroup?.();
         this.#error = id === undefined ? "操作尚未发送，请检查连接" : "正在解散群组…";
@@ -1126,6 +1249,23 @@ export class ChatView implements Component, Focusable {
     };
     list.onCancel = () => this.#closePanel();
     return list;
+  }
+
+  async #confirmAndUpdateAutostart(settings: GroupSettings): Promise<void> {
+    if (await this.#actions.confirmAutostart?.() !== true) return;
+    const id = this.#actions.updateGroupAvailability?.(
+      settings.keepAvailableWhenEmpty,
+      true,
+    );
+    this.#error = id === undefined ? "操作尚未发送，请检查连接" : "正在开启登录后自动开放…";
+    this.#tui.requestRender();
+  }
+
+  async #confirmAndEnableNearby(): Promise<void> {
+    if (await this.#actions.confirmNearbyAccess?.() !== true) return;
+    const id = this.#actions.updateGroupVisibility?.("nearby");
+    this.#error = id === undefined ? "操作尚未发送，请检查连接" : "正在开放附近加入…";
+    this.#tui.requestRender();
   }
 
   #createMemberActionList(): SelectList {
@@ -1312,6 +1452,13 @@ function permissionLabel(permission: AgentPermission): string {
   return "自动";
 }
 
+function networkStatusLabel(status: NetworkStatus): string {
+  if (status === "available") return "附近设备可以加入";
+  if (status === "paused") return "已停止向附近设备开放";
+  if (status === "restoring") return "正在重新开放…";
+  return "当前网络无法连接附近设备";
+}
+
 function dedupeMessages(messages: HistoryMessage[]): HistoryMessage[] {
   return [...new Map(messages.map((message) => [message.messageId, { ...message }])).values()];
 }
@@ -1346,6 +1493,32 @@ function formatDate(timestamp: number): string {
 function formatTime(timestamp: number): string {
   const date = new Date(timestamp);
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function formatDateTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function memberOrder(member: Member): number {
+  if (member.online && !member.removed) return 0;
+  if (!member.removed) return 1;
+  return 2;
+}
+
+function groupSectionTitle(
+  section: "root" | "settings" | "nearby" | "members" | "danger",
+): string {
+  if (section === "settings") return "群组设置";
+  if (section === "nearby") return "附近加入";
+  if (section === "members") return "成员管理";
+  if (section === "danger") return "危险操作";
+  return "群组管理";
 }
 
 function isContinuousMessage(previous: HistoryMessage, current: HistoryMessage): boolean {

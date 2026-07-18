@@ -1,5 +1,6 @@
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import type { PiCommsBuildChannel } from "../protocol.js";
 
 export type BrokerMode = "local" | "lan-host";
 
@@ -10,6 +11,8 @@ export interface BrokerRuntimeMetadata {
   host: string;
   port: number;
   mode: BrokerMode;
+  appVersion?: string;
+  buildChannel?: PiCommsBuildChannel;
   startedAt: number;
 }
 

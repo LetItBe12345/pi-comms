@@ -18,6 +18,8 @@ export type BrokerProbeResult =
       brokerId: string;
       brokerInstanceId: string;
       brokerMode: "local" | "lan-host";
+      appVersion: string;
+      buildChannel: "release" | "development";
     }
   | { status: "unreachable" }
   | { status: "incompatible"; reason: string };
@@ -80,6 +82,11 @@ export function probeBroker(
           (
             message.payload.brokerMode !== "local" &&
             message.payload.brokerMode !== "lan-host"
+          ) ||
+          typeof message.payload.appVersion !== "string" ||
+          (
+            message.payload.buildChannel !== "release" &&
+            message.payload.buildChannel !== "development"
           )
         ) {
           finish({ status: "incompatible", reason: "Pi Comms 协议版本不兼容" });
@@ -90,6 +97,8 @@ export function probeBroker(
           brokerId: message.payload.brokerId,
           brokerInstanceId: message.payload.brokerInstanceId,
           brokerMode: message.payload.brokerMode,
+          appVersion: message.payload.appVersion,
+          buildChannel: message.payload.buildChannel,
         });
       }
     });
