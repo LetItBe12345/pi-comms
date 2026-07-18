@@ -26,6 +26,7 @@ export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 15_000;
 
 export interface BrokerClientOptions {
   endpoint: TcpConnectEndpoint;
+  expectedBrokerId?: string;
   reconnectIntervalMs?: number;
   connectTimeoutMs?: number;
   handshakeTimeoutMs?: number;
@@ -39,6 +40,7 @@ export interface BrokerClientOptions {
 
 export class BrokerClient {
   #endpoint: TcpConnectEndpoint;
+  #expectedBrokerId: string | undefined;
   readonly #reconnectIntervalMs: number;
   readonly #connectTimeoutMs: number;
   readonly #handshakeTimeoutMs: number;
@@ -52,6 +54,7 @@ export class BrokerClient {
   #clientId: string | undefined;
   #resumeToken: string | undefined;
   #brokerInstanceId: string | undefined;
+  #brokerId: string | undefined;
   #socket: Socket | undefined;
   #connectTask: Promise<boolean> | undefined;
   #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -66,6 +69,7 @@ export class BrokerClient {
 
   constructor(options: BrokerClientOptions) {
     this.#endpoint = validateConnectEndpoint(options.endpoint);
+    this.#expectedBrokerId = options.expectedBrokerId;
     this.#reconnectIntervalMs =
       options.reconnectIntervalMs ?? DEFAULT_RECONNECT_INTERVAL_MS;
     this.#connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
@@ -91,6 +95,10 @@ export class BrokerClient {
     return this.#lastError;
   }
 
+  get brokerId(): string | undefined {
+    return this.#brokerId;
+  }
+
   async start(sessionId: string, permission: AgentPermission = "auto"): Promise<boolean> {
     this.#sessionId = sessionId;
     this.#permission = permission;
@@ -106,8 +114,18 @@ export class BrokerClient {
   }
 
   async setEndpoint(endpoint: TcpConnectEndpoint): Promise<boolean> {
-    const next = validateConnectEndpoint(endpoint);
-    if (sameEndpoint(this.#endpoint, next)) return this.#connected;
+    return this.setConnection({ endpoint });
+  }
+
+  async setConnection(options: {
+    endpoint: TcpConnectEndpoint;
+    expectedBrokerId?: string;
+  }): Promise<boolean> {
+    const next = validateConnectEndpoint(options.endpoint);
+    if (
+      sameEndpoint(this.#endpoint, next) &&
+      this.#expectedBrokerId === options.expectedBrokerId
+    ) return this.#connected;
 
     if (this.#reconnectTimer !== undefined) {
       clearTimeout(this.#reconnectTimer);
@@ -125,6 +143,11 @@ export class BrokerClient {
       this.#reconnectTimer = undefined;
     }
     this.#endpoint = next;
+    this.#expectedBrokerId = options.expectedBrokerId;
+    this.#brokerId = undefined;
+    this.#brokerInstanceId = undefined;
+    this.#clientId = undefined;
+    this.#resumeToken = undefined;
     this.#connected = false;
     this.#lastError = undefined;
     this.#permanentError = false;
@@ -205,7 +228,7 @@ export class BrokerClient {
         protocolVersion: BROKER_PROTOCOL_VERSION,
       });
       let timer = setTimeout(() => {
-        this.#lastError = "连接 Broker 超时";
+        this.#lastError = "连接群聊超时";
         socket.destroy();
         settle(false);
       }, this.#connectTimeoutMs);
@@ -230,7 +253,13 @@ export class BrokerClient {
           const message = result.value as BrokerEnvelope;
           if (message.type === "error" && !reachedSnapshot) {
             this.#lastError = message.payload.message;
-            if (message.payload.code === "protocol_mismatch") {
+            if (
+              message.payload.code === "protocol_mismatch" ||
+              message.payload.code === "invite_required" ||
+              message.payload.code === "invite_invalid" ||
+              message.payload.code === "invite_rate_limited" ||
+              message.payload.code === "broker_changed"
+            ) {
               this.#permanentError = true;
             }
             if (message.payload.code === "resume_rejected") {
@@ -245,7 +274,13 @@ export class BrokerClient {
             if (message.payload.requestId !== probe.id) continue;
             if (
               message.payload.service !== BROKER_SERVICE ||
-              message.payload.protocolVersion !== BROKER_PROTOCOL_VERSION
+              message.payload.protocolVersion !== BROKER_PROTOCOL_VERSION ||
+              typeof message.payload.brokerId !== "string" ||
+              message.payload.brokerId.length === 0 ||
+              (
+                message.payload.brokerMode !== "local" &&
+                message.payload.brokerMode !== "lan-host"
+              )
             ) {
               this.#lastError = "Pi Comms 协议版本不兼容";
               this.#permanentError = true;
@@ -253,6 +288,17 @@ export class BrokerClient {
               settle(false);
               return;
             }
+            if (
+              this.#expectedBrokerId !== undefined &&
+              this.#expectedBrokerId !== message.payload.brokerId
+            ) {
+              this.#lastError = "附近设备信息已变化，请重新查找";
+              this.#permanentError = true;
+              socket.destroy();
+              settle(false);
+              return;
+            }
+            this.#brokerId = message.payload.brokerId;
             if (
               this.#brokerInstanceId !== undefined &&
               this.#brokerInstanceId !== message.payload.brokerInstanceId
@@ -305,7 +351,7 @@ export class BrokerClient {
         clearTimeout(timer);
         socket.setKeepAlive(true, this.#keepAliveInitialDelayMs);
         timer = setTimeout(() => {
-          this.#lastError = "端口上的服务不是兼容的 Pi Comms Broker（握手超时）";
+          this.#lastError = "附近设备上的 Pi Comms 无法连接";
           socket.destroy();
           settle(false);
         }, this.#handshakeTimeoutMs);
@@ -352,7 +398,7 @@ export class BrokerClient {
     this.#lastPongAt = Date.now();
     this.#heartbeatTimer = setInterval(() => {
       if (Date.now() - this.#lastPongAt >= this.#heartbeatTimeoutMs) {
-        this.#lastError = "Broker 心跳超时";
+        this.#lastError = "群聊连接超时";
         socket.destroy();
         return;
       }

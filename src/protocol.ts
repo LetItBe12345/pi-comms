@@ -7,6 +7,8 @@ import type {
   OnlineMember,
   AgentActivityStatus,
   AgentPermission,
+  GroupSettings,
+  GroupVisibility,
 } from "./types.js";
 
 export interface Envelope<T = unknown> {
@@ -17,7 +19,8 @@ export interface Envelope<T = unknown> {
 }
 
 export const BROKER_SERVICE = "pi-comms";
-export const BROKER_PROTOCOL_VERSION = 2;
+export const PI_COMMS_VERSION = "0.1.0";
+export const BROKER_PROTOCOL_VERSION = 4;
 export const MAX_JSONL_FRAME_BYTES = 8 * 1024 * 1024;
 
 export interface BrokerProbePayload {
@@ -28,7 +31,9 @@ export interface BrokerProbePayload {
 export interface BrokerReadyPayload {
   service: string;
   protocolVersion: number;
+  brokerId: string;
   brokerInstanceId: string;
+  brokerMode: "local" | "lan-host";
   requestId: string;
 }
 
@@ -40,6 +45,9 @@ export interface SnapshotPayload {
   members: Member[];
   messages: HistoryMessage[];
   pausedChains?: PausedChainPayload[];
+  groupSettings?: GroupSettings;
+  isOwner?: boolean;
+  ownerRecoveryAvailable?: boolean;
 }
 
 export interface ClientHelloPayload {
@@ -67,12 +75,65 @@ export interface GroupCreatePayload {
   groupName: string;
   userName: string;
   agentName: string;
+  visibility?: GroupVisibility;
 }
 
 export interface GroupJoinPayload {
   groupId: string;
-  userName: string;
-  agentName: string;
+  userName?: string;
+  agentName?: string;
+  inviteCode?: string;
+  membershipCredential?: string;
+}
+
+export interface GroupCatalogPayload {
+  brokerId: string;
+}
+
+export interface MembershipWelcomePayload {
+  groupId: string;
+  membershipCredential: string;
+  ownerCredential?: string;
+  inviteCode?: string;
+}
+
+export interface GroupInviteUpdatedPayload {
+  groupId: string;
+  inviteCode?: string;
+  visibility: GroupVisibility;
+}
+
+export interface GroupRenamePayload {
+  groupId: string;
+  groupName: string;
+  ownerCredential: string;
+}
+
+export interface GroupVisibilityUpdatePayload {
+  groupId: string;
+  visibility: GroupVisibility;
+  ownerCredential: string;
+}
+
+export interface GroupAvailabilityUpdatePayload {
+  groupId: string;
+  keepAvailableWhenEmpty: boolean;
+  openAtLogin: boolean;
+  ownerCredential: string;
+}
+
+export interface GroupOwnerActionPayload {
+  groupId: string;
+  ownerCredential: string;
+}
+
+export interface GroupOwnerRecoverPayload {
+  groupId: string;
+  membershipCredential: string;
+}
+
+export interface GroupMemberActionPayload extends GroupOwnerActionPayload {
+  sessionKey: string;
 }
 
 export interface PresenceChangedPayload extends Member {}
@@ -249,7 +310,15 @@ export type ProtocolErrorCode =
   | "frame_too_large"
   | "resume_rejected"
   | "session_in_use"
-  | "heartbeat_timeout";
+  | "heartbeat_timeout"
+  | "invite_required"
+  | "invite_invalid"
+  | "invite_rate_limited"
+  | "membership_invalid"
+  | "owner_required"
+  | "owner_cannot_leave"
+  | "member_removed"
+  | "broker_changed";
 
 export interface ErrorPayload {
   code: ProtocolErrorCode;
@@ -263,6 +332,9 @@ export type ClientHelloEnvelope = Envelope<ClientHelloPayload> & {
 export type BrokerProbeEnvelope = Envelope<BrokerProbePayload> & {
   type: "broker.probe";
 };
+export type BrokerShutdownEnvelope = Envelope<Record<string, never>> & {
+  type: "broker.shutdown";
+};
 export type ClientGoodbyeEnvelope = Envelope<ClientGoodbyePayload> & {
   type: "client.goodbye";
 };
@@ -272,11 +344,34 @@ export type PingEnvelope = Envelope<Record<string, never>> & {
 export type GroupCreateEnvelope = Envelope<GroupCreatePayload> & {
   type: "group.create";
 };
+export type GroupCatalogEnvelope = Envelope<GroupCatalogPayload> & {
+  type: "group.catalog";
+};
 export type GroupJoinEnvelope = Envelope<GroupJoinPayload> & {
   type: "group.join";
 };
 export type GroupLeaveEnvelope = Envelope<Record<string, never>> & {
   type: "group.leave";
+};
+export type GroupRenameEnvelope = Envelope<GroupRenamePayload> & {
+  type: "group.rename";
+};
+export type GroupVisibilityUpdateEnvelope =
+  Envelope<GroupVisibilityUpdatePayload> & {
+    type: "group.visibility.update";
+  };
+export type GroupAvailabilityUpdateEnvelope =
+  Envelope<GroupAvailabilityUpdatePayload> & {
+    type: "group.availability.update";
+  };
+export type GroupOwnerActionEnvelope = Envelope<GroupOwnerActionPayload> & {
+  type: "group.invite.rotate" | "group.delete";
+};
+export type GroupOwnerRecoverEnvelope = Envelope<GroupOwnerRecoverPayload> & {
+  type: "group.owner.recover";
+};
+export type GroupMemberActionEnvelope = Envelope<GroupMemberActionPayload> & {
+  type: "group.member.remove" | "group.member.allow";
 };
 export type ChatSendEnvelope = Envelope<ChatSendPayload> & {
   type: "chat.send";
@@ -308,12 +403,20 @@ export type AgentResultEnvelope = Envelope<AgentResultPayload> & {
 
 export type ClientEnvelope =
   | BrokerProbeEnvelope
+  | BrokerShutdownEnvelope
+  | GroupCatalogEnvelope
   | ClientHelloEnvelope
   | ClientGoodbyeEnvelope
   | PingEnvelope
   | GroupCreateEnvelope
   | GroupJoinEnvelope
   | GroupLeaveEnvelope
+  | GroupRenameEnvelope
+  | GroupVisibilityUpdateEnvelope
+  | GroupAvailabilityUpdateEnvelope
+  | GroupOwnerActionEnvelope
+  | GroupOwnerRecoverEnvelope
+  | GroupMemberActionEnvelope
   | ChatSendEnvelope
   | AgentStatusEnvelope
   | PermissionUpdateEnvelope
@@ -326,8 +429,15 @@ export type ClientEnvelope =
 
 export type BrokerEnvelope =
   | (Envelope<BrokerReadyPayload> & { type: "broker.ready" })
+  | (Envelope<{ requestId: string }> & { type: "broker.stopping" })
   | (Envelope<ClientWelcomePayload> & { type: "client.welcome" })
   | (Envelope<PongPayload> & { type: "pong" })
+  | (Envelope<GroupsChangedPayload> & { type: "group.catalog.result" })
+  | (Envelope<MembershipWelcomePayload> & { type: "membership.welcome" })
+  | (Envelope<GroupInviteUpdatedPayload> & { type: "group.invite.updated" })
+  | (Envelope<{ groupId: string; ownerCredential: string }> & {
+      type: "group.owner.welcome";
+    })
   | (Envelope<SnapshotPayload> & { type: "snapshot" })
   | (Envelope<GroupsChangedPayload> & { type: "groups.changed" })
   | (Envelope<PresenceChangedPayload> & { type: "presence.changed" })
@@ -452,23 +562,90 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
         ? result
         : invalid("invalid_payload", "client.hello permission 无效", requestId);
     }
+    case "broker.shutdown":
     case "client.goodbye":
     case "ping":
       return { ok: true, envelope: value as unknown as ClientEnvelope };
+    case "group.catalog":
+      return requireStrings(value, requestId, ["brokerId"]);
     case "group.create":
-      return requireStrings(value, requestId, [
+      {
+        const result = requireStrings(value, requestId, [
         "groupName",
         "userName",
         "agentName",
-      ]);
-    case "group.join":
-      return requireStrings(value, requestId, [
-        "groupId",
-        "userName",
-        "agentName",
-      ]);
+        ]);
+        if (!result.ok) return result;
+        return value.payload.visibility === undefined ||
+          value.payload.visibility === "local" ||
+          value.payload.visibility === "nearby"
+          ? result
+          : invalid("invalid_payload", "group.create visibility 无效", requestId);
+      }
+    case "group.join": {
+      const payload = value.payload;
+      if (typeof payload.groupId !== "string" || !payload.groupId.trim()) {
+        return invalid("invalid_payload", "group.join groupId 无效", requestId);
+      }
+      const hasInvite = typeof payload.inviteCode === "string" &&
+        payload.inviteCode.trim().length > 0;
+      const hasCredential = typeof payload.membershipCredential === "string" &&
+        payload.membershipCredential.trim().length > 0;
+      const hasNames = typeof payload.userName === "string" &&
+        payload.userName.trim().length > 0 &&
+        typeof payload.agentName === "string" &&
+        payload.agentName.trim().length > 0;
+      if (hasInvite && hasCredential) {
+        return invalid(
+          "invalid_payload",
+          "group.join 不能同时提供邀请码和长期成员凭证",
+          requestId,
+        );
+      }
+      if (hasInvite || !hasCredential) {
+        if (!hasNames) {
+          return invalid(
+            "invalid_payload",
+            "group.join 首次加入时必须提供用户和 Agent 名称",
+            requestId,
+          );
+        }
+        return requireStrings(value, requestId, ["groupId", "userName", "agentName"]);
+      }
+      return { ok: true, envelope: value as unknown as GroupJoinEnvelope };
+    }
     case "group.leave":
       return { ok: true, envelope: value as unknown as GroupLeaveEnvelope };
+    case "group.rename":
+      return requireStrings(value, requestId, ["groupId", "groupName", "ownerCredential"]);
+    case "group.visibility.update": {
+      const result = requireStrings(value, requestId, ["groupId", "ownerCredential"]);
+      if (!result.ok) return result;
+      return value.payload.visibility === "local" ||
+        value.payload.visibility === "nearby"
+        ? result
+        : invalid("invalid_payload", "group.visibility.update visibility 无效", requestId);
+    }
+    case "group.availability.update": {
+      const result = requireStrings(value, requestId, ["groupId", "ownerCredential"]);
+      if (!result.ok) return result;
+      return typeof value.payload.keepAvailableWhenEmpty === "boolean" &&
+        typeof value.payload.openAtLogin === "boolean"
+        ? result
+        : invalid("invalid_payload", "group.availability.update 开关无效", requestId);
+    }
+    case "group.invite.rotate":
+    case "group.delete":
+      return requireStrings(value, requestId, ["groupId", "ownerCredential"]);
+    case "group.owner.recover":
+      return requireStrings(value, requestId, ["groupId", "membershipCredential"]);
+    case "group.member.remove":
+    case "group.member.allow":
+      return requireStrings(value, requestId, [
+        "groupId",
+        "sessionKey",
+        "ownerCredential",
+      ]);
     case "chat.send":
       return requireStrings(value, requestId, ["text"]);
     case "agent.status":

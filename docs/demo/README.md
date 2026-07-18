@@ -1,6 +1,10 @@
 # 三 Session 视频 Demo
 
-## 最新：TRACE RELAY 分布式代码协作
+## 最新：《银盾接力》银行隐私协作
+
+全中文银行业务 Demo 已放在 [`privacy-shield/`](./privacy-shield/README.md)：银行隐私 Agent 先生成零 PII 的最小复现契约，外包 Agent 只修自己的规则引擎，补丁最后回到银行私有环境验收。包含 MP4、WebM、封面和四张关键截图。
+
+## TRACE RELAY 分布式代码协作
 
 新的代码场景 Demo 已放在 [`trace-relay/`](./trace-relay/README.md)：三个用户、三个隔离的私有 Git 仓和三个 Pi Session，通过事件契约自动接力修复同一条分布式链路。包含 MP4、WebM、封面和三张关键截图。
 

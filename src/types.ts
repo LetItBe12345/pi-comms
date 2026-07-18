@@ -11,6 +11,24 @@ export interface GroupSummary extends Group {
   onlineSessionCount: number;
 }
 
+export type GroupVisibility = "local" | "nearby";
+
+export interface GroupSettings extends Group {
+  visibility: GroupVisibility;
+  keepAvailableWhenEmpty: boolean;
+  openAtLogin: boolean;
+}
+
+export interface GroupMembership {
+  groupId: string;
+  sessionKey: string;
+  userName: string;
+  agentName: string;
+  isOwner: boolean;
+  removed: boolean;
+  lastActiveAt: number;
+}
+
 export interface Member {
   memberId: string;
   clientId: string;
@@ -21,6 +39,9 @@ export interface Member {
   agentStatus?: AgentActivityStatus;
   agentPermission?: AgentPermission;
   pendingApprovalCount?: number;
+  isOwner?: boolean;
+  stableSessionKey?: string;
+  removed?: boolean;
 }
 
 export interface OnlineMember {

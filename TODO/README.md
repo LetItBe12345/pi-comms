@@ -27,13 +27,13 @@
 | 11 | [聊天时间线与消息布局](./done/11-chat-timeline-layout.md) | 使用完整追加式时间线和标准聊天布局 | done | 阶段 10 |
 | 12 | [跨平台 TCP 传输](./done/12-cross-platform-tcp.md) | 统一三平台通信入口 | done | 阶段 11 |
 | 13 | [跨设备身份与连接可靠性](./done/13-device-identity-reliability.md) | 解决跨设备身份冲突和失联 | done | 阶段 12 |
-| 14 | [局域网 Broker 生命周期与准入](./in-progress/14-lan-broker-lifecycle.md) | 保证单 Broker 并限制接入 | in-progress | 阶段 13 |
-| 15 | [mDNS 自动发现与 Broker 选择](./in-progress/15-mdns-discovery-tui.md) | 自动列出并选择局域网 Broker | in-progress | 阶段 14 |
-| 16 | [跨平台测试与局域网验收](./in-progress/16-cross-platform-acceptance.md) | 验证三平台和三设备链路 | in-progress | 阶段 15 |
+| 14 | [局域网 Broker 生命周期与准入](./done/14-lan-broker-lifecycle.md) | 保证单 Broker 并限制接入 | done | 阶段 13 |
+| 15 | [mDNS 自动发现、附近群组与群主管理](./in-progress/15-mdns-discovery-tui.md) | 自动发现群组并管理群主、成员与后台可用性 | in-progress | 阶段 14 |
+| 16 | [跨平台测试与局域网验收](./in-progress/16-cross-platform-acceptance.md) | 验证双平台和三设备链路 | in-progress | 阶段 15 |
 
 ## 当前里程碑
 
-阶段 0～13 已完成。阶段 14～16 待实施，当前下一步是阶段 14。
+阶段 0～14 已完成。阶段 15～16 待实施，当前下一步是阶段 15。
 
 ## 维护规则
 

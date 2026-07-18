@@ -1,8 +1,7 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer, type AddressInfo, type Socket } from "node:net";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { join } from "node:path";
 import { loadOrCreateDeviceId } from "../device-identity.js";
 import {
   BROKER_PROTOCOL_VERSION,
@@ -19,19 +18,23 @@ import {
   type ClientHelloEnvelope,
   type Envelope,
   type ErrorPayload,
+  type GroupJoinPayload,
   type HistoryMessage,
   type PausedChainPayload,
   type SendFailedPayload,
 } from "../protocol.js";
 import { createSessionKey, type SessionKey } from "../session-key.js";
 import {
+  publishBrokerMdns,
+  type MdnsPublisher,
+} from "../discovery/mdns.js";
+import { primaryOrdinaryNetwork } from "../discovery/network.js";
+import {
   DEFAULT_BROKER_ENDPOINT,
   formatEndpoint,
-  validateConnectEndpoint,
   validateListenEndpoint,
   type TcpListenEndpoint,
 } from "../transport/tcp-endpoint.js";
-import { probeBroker } from "../transport/broker-probe.js";
 import type { AgentPermission, Member } from "../types.js";
 import {
   BrokerDatabase,
@@ -40,12 +43,15 @@ import {
   type StoredPausedChain,
 } from "./database.js";
 import { GroupState, GroupStateError } from "./group-state.js";
+import { generateInviteCode, normalizeInviteCode } from "./invite-code.js";
 import { assertNoLiveLegacyBroker } from "./legacy-migration.js";
+import { acquireBrokerProcessLock, type BrokerProcessLock } from "./process-lock.js";
+import { configureBrokerAutostart } from "./autostart.js";
 import {
-  acquireBrokerProcessLock,
-  BrokerLockBusyError,
-  type BrokerProcessLock,
-} from "./process-lock.js";
+  removeBrokerRuntimeMetadata,
+  writeBrokerRuntimeMetadata,
+  type BrokerMode,
+} from "./runtime-metadata.js";
 
 export const DEFAULT_DATABASE_PATH = join(
   homedir(),
@@ -58,6 +64,10 @@ export const DEFAULT_LOCAL_DISCONNECT_GRACE_MS = 3_000;
 export const DEFAULT_LAN_DISCONNECT_GRACE_MS = 15_000;
 export const DEFAULT_HELLO_TIMEOUT_MS = 3_000;
 export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 15_000;
+export const DEFAULT_INVITE_FAILURE_WINDOW_MS = 60_000;
+export const DEFAULT_INVITE_FAILURE_LIMIT = 5;
+export const DEFAULT_INVITE_COOLDOWN_MS = 30_000;
+export const DEFAULT_IDLE_SHUTDOWN_MS = 5 * 60_000;
 
 export interface BrokerServerOptions {
   listen?: TcpListenEndpoint;
@@ -69,12 +79,21 @@ export interface BrokerServerOptions {
   heartbeatTimeoutMs?: number;
   maxFrameBytes?: number;
   deviceId?: string;
+  mode?: BrokerMode;
+  inviteFailureWindowMs?: number;
+  inviteFailureLimit?: number;
+  inviteCooldownMs?: number;
+  isLoopback?: (address: string | undefined) => boolean;
+  idleShutdownMs?: number;
+  mdnsPublisherFactory?: typeof publishBrokerMdns;
 }
 
 export interface BrokerServer {
   readonly endpoint: TcpListenEndpoint;
   readonly dbPath: string;
   readonly instanceId: string;
+  readonly brokerId: string;
+  readonly mode: BrokerMode;
   start(): Promise<void>;
   close(): Promise<void>;
 }
@@ -99,6 +118,12 @@ interface PendingRequest {
   context: AgentChainContext;
 }
 
+interface InviteFailureState {
+  failures: number;
+  windowStartedAt: number;
+  cooldownUntil: number;
+}
+
 export function createBrokerServer(
   options: BrokerServerOptions = {},
 ): BrokerServer {
@@ -114,6 +139,18 @@ export function createBrokerServer(
   const maxFrameBytes = options.maxFrameBytes;
   const deviceId = options.deviceId ?? loadOrCreateDeviceId();
   const instanceId = randomUUID();
+  const mode = options.mode ?? (listen.host === "127.0.0.1" ? "local" : "lan-host");
+  const inviteFailureWindowMs =
+    options.inviteFailureWindowMs ?? DEFAULT_INVITE_FAILURE_WINDOW_MS;
+  const inviteFailureLimit = options.inviteFailureLimit ?? DEFAULT_INVITE_FAILURE_LIMIT;
+  const inviteCooldownMs = options.inviteCooldownMs ?? DEFAULT_INVITE_COOLDOWN_MS;
+  const isLoopback = options.isLoopback ?? isLoopbackAddress;
+  const idleShutdownMs = options.idleShutdownMs ?? DEFAULT_IDLE_SHUTDOWN_MS;
+  const mdnsPublisherFactory =
+    options.mdnsPublisherFactory ?? publishBrokerMdns;
+  const publishMdns =
+    options.mdnsPublisherFactory !== undefined ||
+    process.env.PI_COMMS_DISABLE_MDNS !== "1";
   const clients = new Map<string, Socket>();
   const sessions = new Map<SessionKey, ClientSession>();
   let groups = new GroupState();
@@ -123,10 +160,14 @@ export function createBrokerServer(
   const resolvedApprovalRequests = new Map<string, string>();
   const completedRequests = new Map<string, string>();
   const closedRequestIds = new Set<string>();
+  const inviteFailures = new Map<string, InviteFailureState>();
   const server = createServer(handleConnection);
   let started = false;
   let closing = false;
   let processLock: BrokerProcessLock | undefined;
+  let stableBrokerId = "";
+  let mdnsPublisher: MdnsPublisher | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
   function handleConnection(socket: Socket): void {
     const decoder = new JsonlDecoder(maxFrameBytes);
@@ -176,10 +217,47 @@ export function createBrokerServer(
           send(socket, createEnvelope("broker.ready", {
             service: BROKER_SERVICE,
             protocolVersion: BROKER_PROTOCOL_VERSION,
+            brokerId: stableBrokerId,
             brokerInstanceId: instanceId,
+            brokerMode: mode,
             requestId: parsed.envelope.id,
           }) as BrokerEnvelope);
           continue;
+        }
+
+        if (parsed.envelope.type === "broker.shutdown") {
+          if (!acceptedProbe || !isLoopback(socket.remoteAddress)) {
+            sendError(socket, {
+              code: "invalid_payload",
+              message: "只能从本机停止协作空间",
+              requestId: parsed.envelope.id,
+            });
+            socket.end();
+            return;
+          }
+          send(socket, createEnvelope("broker.stopping", {
+            requestId: parsed.envelope.id,
+          }) as BrokerEnvelope);
+          socket.end();
+          setImmediate(() => void close());
+          return;
+        }
+
+        if (parsed.envelope.type === "group.catalog") {
+          if (!acceptedProbe || parsed.envelope.payload.brokerId !== stableBrokerId) {
+            sendError(socket, {
+              code: "broker_changed",
+              message: "附近设备信息已变化，请刷新后重试",
+              requestId: parsed.envelope.id,
+            });
+            socket.end();
+            return;
+          }
+          send(socket, createEnvelope("group.catalog.result", {
+            groups: nearbyGroupSummaries(),
+          }) as BrokerEnvelope);
+          socket.end();
+          return;
         }
 
         if (parsed.envelope.type === "client.hello") {
@@ -232,7 +310,7 @@ export function createBrokerServer(
           continue;
         }
 
-        handleClientMessage(clientId, socket, parsed.envelope);
+        handleClientMessage(sessionKey, clientId, socket, parsed.envelope);
       }
     });
 
@@ -243,6 +321,39 @@ export function createBrokerServer(
         handleUnexpectedDisconnect(sessionKey, clientId, socket);
       }
     });
+  }
+
+  function rejectInvite(
+    socket: Socket,
+    requestId: string,
+    supplied: boolean,
+  ): void {
+    const source = socket.remoteAddress ?? "unknown";
+    const now = Date.now();
+    const previous = inviteFailures.get(source);
+    if (previous !== undefined && previous.cooldownUntil > now) {
+      sendError(socket, {
+        code: "invite_rate_limited",
+        message: "尝试过多，请稍后再试",
+        requestId,
+      });
+      socket.end();
+      return;
+    }
+    const current = previous === undefined ||
+        now - previous.windowStartedAt >= inviteFailureWindowMs
+      ? { failures: 1, windowStartedAt: now, cooldownUntil: 0 }
+      : { ...previous, failures: previous.failures + 1 };
+    if (current.failures >= inviteFailureLimit) {
+      current.cooldownUntil = now + inviteCooldownMs;
+    }
+    inviteFailures.set(source, current);
+    sendError(socket, {
+      code: supplied ? "invite_invalid" : "invite_required",
+      message: supplied ? "邀请码不正确" : "请输入群组邀请码",
+      requestId,
+    });
+    socket.end();
   }
 
   function registerClient(
@@ -287,6 +398,7 @@ export function createBrokerServer(
     permissions.set(clientId, hello.payload.permission);
     session.socket = socket;
     clients.set(clientId, socket);
+    clearIdleShutdown();
     armHeartbeat(sessionKey, session, socket);
     groups.setAgentPermission(clientId, hello.payload.permission);
     const reconnectedMembers = groups.setOnline(clientId, true);
@@ -362,6 +474,7 @@ export function createBrokerServer(
           failRequestsForTarget(clientId, "target_offline");
           permissions.delete(clientId);
           sessions.delete(sessionKey);
+          scheduleIdleShutdown();
         }
       }, graceMs);
     }
@@ -384,9 +497,11 @@ export function createBrokerServer(
     }
     leaveClientGroup(clientId);
     clients.delete(clientId);
+    scheduleIdleShutdown();
   }
 
   function handleClientMessage(
+    sessionKey: SessionKey,
     clientId: string,
     socket: Socket,
     envelope: Exclude<ClientEnvelope, ClientHelloEnvelope>,
@@ -433,15 +548,233 @@ export function createBrokerServer(
       return;
     }
     if (envelope.type === "group.create") {
-      handleGroupCreate(clientId, socket, envelope.id, envelope.payload);
+      handleGroupCreate(sessionKey, clientId, socket, envelope.id, envelope.payload);
       return;
     }
     if (envelope.type === "group.join") {
-      handleGroupJoin(clientId, socket, envelope.id, envelope.payload);
+      handleGroupJoin(sessionKey, clientId, socket, envelope.id, envelope.payload);
       return;
     }
     if (envelope.type === "group.leave") {
-      handleGroupLeave(clientId, socket, envelope.id);
+      handleGroupLeave(sessionKey, clientId, socket, envelope.id);
+      return;
+    }
+    if (envelope.type === "group.rename") {
+      if (!requireOwner(sessionKey, socket, envelope.id, envelope.payload)) return;
+      try {
+        const previousName = groups.groupForClient(clientId)?.groupName ??
+          db().storedGroup(envelope.payload.groupId)?.groupName;
+        groups.renameGroup(envelope.payload.groupId, envelope.payload.groupName);
+        db().updateGroupName(envelope.payload.groupId, envelope.payload.groupName);
+        const notice = createEnvelope("chat.message", {
+          groupId: envelope.payload.groupId,
+          senderId: "system",
+          senderName: "系统",
+          senderType: "user" as const,
+          text: `群组已从「${previousName ?? "未命名"}」改名为「${envelope.payload.groupName}」`,
+          mentionIds: [],
+          status: "sent" as const,
+        });
+        db().insertMessage(
+          historyMessage(
+            notice.id,
+            notice.timestamp,
+            notice.payload,
+            "sent",
+          ),
+        );
+        broadcastToGroup(envelope.payload.groupId, notice as BrokerEnvelope);
+        sendSnapshotsForGroup(envelope.payload.groupId);
+        broadcastGroupsChanged();
+      } catch (error) {
+        sendGroupError(socket, envelope.id, error);
+      }
+      return;
+    }
+    if (envelope.type === "group.visibility.update") {
+      if (!requireOwner(sessionKey, socket, envelope.id, envelope.payload)) return;
+      const inviteCode = envelope.payload.visibility === "nearby"
+        ? generateInviteCode()
+        : undefined;
+      db().updateGroupInvite(
+        envelope.payload.groupId,
+        envelope.payload.visibility,
+        inviteCode === undefined ? undefined : hashSecret(inviteCode),
+      );
+      if (envelope.payload.visibility === "local") {
+        disconnectRemoteGroupMembers(envelope.payload.groupId);
+      }
+      send(socket, createEnvelope("group.invite.updated", {
+        groupId: envelope.payload.groupId,
+        visibility: envelope.payload.visibility,
+        ...(inviteCode === undefined ? {} : { inviteCode }),
+      }) as BrokerEnvelope);
+      sendSnapshotsForGroup(envelope.payload.groupId);
+      return;
+    }
+    if (envelope.type === "group.availability.update") {
+      if (!requireOwner(sessionKey, socket, envelope.id, envelope.payload)) return;
+      const group = db().storedGroup(envelope.payload.groupId)!;
+      if (
+        group.visibility !== "nearby" ||
+        (envelope.payload.openAtLogin && !envelope.payload.keepAvailableWhenEmpty)
+      ) {
+        sendError(socket, {
+          code: "invalid_payload",
+          message: "请先开放附近加入；登录后自动开放依赖后台可加入",
+          requestId: envelope.id,
+        });
+        return;
+      }
+      db().updateGroupAvailability(
+        envelope.payload.groupId,
+        envelope.payload.keepAvailableWhenEmpty,
+        envelope.payload.openAtLogin,
+      );
+      const shouldAutostart = db().storedGroups().some(
+        (stored) => stored.openAtLogin,
+      );
+      void configureBrokerAutostart(shouldAutostart, dbPath).catch((error) => {
+        sendError(socket, {
+          code: "database_error",
+          message: `登录后自动开放设置失败：${error instanceof Error ? error.message : String(error)}`,
+          requestId: envelope.id,
+        });
+      });
+      sendSnapshotsForGroup(envelope.payload.groupId);
+      scheduleIdleShutdown();
+      return;
+    }
+    if (envelope.type === "group.invite.rotate") {
+      if (!requireOwner(sessionKey, socket, envelope.id, envelope.payload)) return;
+      const group = db().storedGroup(envelope.payload.groupId)!;
+      if (group.visibility !== "nearby") {
+        sendError(socket, {
+          code: "invalid_payload",
+          message: "该群组尚未开放附近加入",
+          requestId: envelope.id,
+        });
+        return;
+      }
+      const inviteCode = generateInviteCode();
+      db().updateGroupInvite(group.groupId, "nearby", hashSecret(inviteCode));
+      send(socket, createEnvelope("group.invite.updated", {
+        groupId: group.groupId,
+        visibility: "nearby",
+        inviteCode,
+      }) as BrokerEnvelope);
+      return;
+    }
+    if (envelope.type === "group.member.remove") {
+      if (!requireOwner(sessionKey, socket, envelope.id, envelope.payload)) return;
+      const group = db().storedGroup(envelope.payload.groupId)!;
+      if (group.ownerSessionKey === envelope.payload.sessionKey) {
+        sendError(socket, {
+          code: "invalid_payload",
+          message: "不能移出群主",
+          requestId: envelope.id,
+        });
+        return;
+      }
+      const member = db().membership(
+        envelope.payload.groupId,
+        envelope.payload.sessionKey as SessionKey,
+      );
+      if (member === undefined) {
+        sendError(socket, {
+          code: "request_invalid",
+          message: "成员不存在",
+          requestId: envelope.id,
+        });
+        return;
+      }
+      db().setMembershipStatus(
+        envelope.payload.groupId,
+        envelope.payload.sessionKey as SessionKey,
+        "removed",
+      );
+      const targetClientId = groups.clientIdForSessionMember(
+        envelope.payload.groupId,
+        member.userName,
+      );
+      if (targetClientId !== undefined) {
+        const removed = groups.removeIfJoined(targetClientId);
+        if (removed !== undefined) {
+          broadcastPresenceRemoved(removed.groupId, [
+            removed.user.memberId,
+            removed.agent.memberId,
+          ]);
+          const targetSocket = clients.get(targetClientId);
+          if (targetSocket !== undefined) {
+            sendError(targetSocket, {
+              code: "member_removed",
+              message: "你已被群主移出该群组",
+            });
+            sendSnapshot(targetClientId, targetSocket);
+          }
+        }
+      }
+      sendSnapshotsForGroup(envelope.payload.groupId);
+      return;
+    }
+    if (envelope.type === "group.member.allow") {
+      if (!requireOwner(sessionKey, socket, envelope.id, envelope.payload)) return;
+      db().deleteMembership(
+        envelope.payload.groupId,
+        envelope.payload.sessionKey as SessionKey,
+      );
+      sendSnapshotsForGroup(envelope.payload.groupId);
+      return;
+    }
+    if (envelope.type === "group.delete") {
+      if (!requireOwner(sessionKey, socket, envelope.id, envelope.payload)) return;
+      const removed = groups.removeGroupAndMemberships(envelope.payload.groupId);
+      db().deleteGroup(envelope.payload.groupId);
+      for (const membership of removed) {
+        const targetSocket = clients.get(membership.user.clientId);
+        if (targetSocket !== undefined) sendSnapshot(membership.user.clientId, targetSocket);
+      }
+      broadcastGroupsChanged();
+      scheduleIdleShutdown();
+      return;
+    }
+    if (envelope.type === "group.owner.recover") {
+      if (!isLoopback(socket.remoteAddress)) {
+        sendError(socket, {
+          code: "owner_required",
+          message: "只能在群组所在设备恢复群主管理权",
+          requestId: envelope.id,
+        });
+        return;
+      }
+      const membership = db().membershipByCredential(
+        envelope.payload.groupId,
+        hashSecret(envelope.payload.membershipCredential),
+      );
+      if (
+        membership === undefined ||
+        membership.status !== "active" ||
+        membership.sessionKey !== sessionKey
+      ) {
+        sendError(socket, {
+          code: "membership_invalid",
+          message: "请先以长期成员身份进入该群组",
+          requestId: envelope.id,
+        });
+        return;
+      }
+      const ownerCredential = createCredential();
+      db().updateOwner(
+        envelope.payload.groupId,
+        sessionKey,
+        hashSecret(ownerCredential),
+      );
+      groups.setOwnerSession(envelope.payload.groupId, sessionKey);
+      send(socket, createEnvelope("group.owner.welcome", {
+        groupId: envelope.payload.groupId,
+        ownerCredential,
+      }) as BrokerEnvelope);
+      sendSnapshotsForGroup(envelope.payload.groupId);
       return;
     }
     if (envelope.type === "chat.send") {
@@ -450,11 +783,25 @@ export function createBrokerServer(
   }
 
   function handleGroupCreate(
+    sessionKey: SessionKey,
     clientId: string,
     socket: Socket,
     requestId: string,
-    payload: { groupName: string; userName: string; agentName: string },
+    payload: {
+      groupName: string;
+      userName: string;
+      agentName: string;
+      visibility?: "local" | "nearby";
+    },
   ): void {
+    if (!isLoopback(socket.remoteAddress)) {
+      sendError(socket, {
+        code: "owner_required",
+        message: "只能在自己的设备上创建群组",
+        requestId,
+      });
+      return;
+    }
     let groupId: string | undefined;
     try {
       const membership = groups.createGroup(
@@ -462,10 +809,35 @@ export function createBrokerServer(
         payload.groupName,
         payload.userName,
         payload.agentName,
+        undefined,
+        sessionKey,
       );
       groupId = membership.groupId;
       groups.setAgentPermission(clientId, permissions.get(clientId) ?? "auto");
-      db().insertGroup({ groupId, groupName: payload.groupName });
+      const visibility = payload.visibility ?? "local";
+      const ownerCredential = createCredential();
+      const membershipCredential = createCredential();
+      const inviteCode = visibility === "nearby" ? generateInviteCode() : undefined;
+      db().insertOwnedGroup(
+        { groupId, groupName: payload.groupName },
+        {
+          ownerSessionKey: sessionKey,
+          ownerCredentialHash: hashSecret(ownerCredential),
+          visibility,
+          ...(inviteCode === undefined
+            ? {}
+            : { inviteCodeHash: hashSecret(normalizeInviteCode(inviteCode)) }),
+          userName: payload.userName,
+          agentName: payload.agentName,
+          membershipCredentialHash: hashSecret(membershipCredential),
+        },
+      );
+      send(socket, createEnvelope("membership.welcome", {
+        groupId,
+        membershipCredential,
+        ownerCredential,
+        ...(inviteCode === undefined ? {} : { inviteCode }),
+      }) as BrokerEnvelope);
       sendSnapshot(clientId, socket);
       broadcastGroupsChanged();
     } catch (error) {
@@ -478,19 +850,102 @@ export function createBrokerServer(
   }
 
   function handleGroupJoin(
+    sessionKey: SessionKey,
     clientId: string,
     socket: Socket,
     requestId: string,
-    payload: { groupId: string; userName: string; agentName: string },
+    payload: GroupJoinPayload,
   ): void {
     try {
+      const storedGroup = db().storedGroup(payload.groupId);
+      if (storedGroup === undefined) {
+        throw new GroupStateError("group_not_found", "群组不存在");
+      }
+      let userName: string;
+      let agentName: string;
+      let membershipCredential: string | undefined;
+      let isOwner = false;
+      if (payload.membershipCredential !== undefined) {
+        if (
+          storedGroup.visibility !== "nearby" &&
+          !isLoopback(socket.remoteAddress)
+        ) {
+          sendError(socket, {
+            code: "invite_invalid",
+            message: "该群组目前仅这台电脑可以使用",
+            requestId,
+          });
+          return;
+        }
+        const stored = db().membershipByCredential(
+          payload.groupId,
+          hashSecret(payload.membershipCredential),
+        );
+        if (stored === undefined || stored.sessionKey !== sessionKey) {
+          sendError(socket, {
+            code: "membership_invalid",
+            message: "成员身份已失效，请重新加入群组",
+            requestId,
+          });
+          return;
+        }
+        if (stored.status === "removed") {
+          sendError(socket, {
+            code: "member_removed",
+            message: "你已被移出该群组",
+            requestId,
+          });
+          return;
+        }
+        userName = stored.userName;
+        agentName = stored.agentName;
+        isOwner = storedGroup.ownerSessionKey === sessionKey;
+        db().touchMembership(payload.groupId, sessionKey);
+      } else {
+        const normalizedInvite = payload.inviteCode === undefined
+          ? undefined
+          : normalizeInviteCode(payload.inviteCode);
+        const localEnrollment = normalizedInvite === undefined &&
+          isLoopback(socket.remoteAddress);
+        if (!localEnrollment && (
+          storedGroup.visibility !== "nearby" ||
+          storedGroup.inviteCodeHash === undefined ||
+          normalizedInvite === undefined ||
+          hashSecret(normalizedInvite) !== storedGroup.inviteCodeHash
+        )) {
+          rejectInvite(socket, requestId, normalizedInvite !== undefined);
+          return;
+        }
+        inviteFailures.delete(socket.remoteAddress ?? "unknown");
+        userName = payload.userName!;
+        agentName = payload.agentName!;
+        if (!db().isMemberNameAvailable(payload.groupId, userName, agentName)) {
+          throw new GroupStateError("member_name_conflict", "群组内名称已被使用");
+        }
+        membershipCredential = createCredential();
+        db().insertMembership({
+          groupId: payload.groupId,
+          sessionKey,
+          userName,
+          agentName,
+          credentialHash: hashSecret(membershipCredential),
+        });
+      }
       const membership = groups.joinGroup(
         clientId,
         payload.groupId,
-        payload.userName,
-        payload.agentName,
+        userName,
+        agentName,
+        isOwner,
+        sessionKey,
       );
       groups.setAgentPermission(clientId, permissions.get(clientId) ?? "auto");
+      if (membershipCredential !== undefined) {
+        send(socket, createEnvelope("membership.welcome", {
+          groupId: payload.groupId,
+          membershipCredential,
+        }) as BrokerEnvelope);
+      }
       sendSnapshot(clientId, socket);
       broadcastPresence([membership.user, membership.agent], clientId);
       broadcastGroupsChanged();
@@ -500,19 +955,33 @@ export function createBrokerServer(
   }
 
   function handleGroupLeave(
+    sessionKey: SessionKey,
     clientId: string,
     socket: Socket,
     requestId: string,
   ): void {
     try {
-      leaveClientGroup(clientId, true);
+      const group = groups.groupForClient(clientId);
+      if (group !== undefined && db().storedGroup(group.groupId)?.ownerSessionKey === sessionKey) {
+        sendError(socket, {
+          code: "owner_cannot_leave",
+          message: "群主不能退出自己的群组，请在群组管理中解散",
+          requestId,
+        });
+        return;
+      }
+      leaveClientGroup(clientId, true, sessionKey);
       sendSnapshot(clientId, socket);
     } catch (error) {
       sendGroupError(socket, requestId, error);
     }
   }
 
-  function leaveClientGroup(clientId: string, required = false): void {
+  function leaveClientGroup(
+    clientId: string,
+    required = false,
+    deleteSessionKey?: SessionKey,
+  ): void {
     const membership = groups.membershipForClient(clientId);
     if (membership === undefined) {
       if (required) {
@@ -523,6 +992,9 @@ export function createBrokerServer(
     const offlineMembers = groups.setOnline(clientId, false);
     broadcastPresence(offlineMembers, clientId);
     const removed = groups.leaveGroup(clientId);
+    if (deleteSessionKey !== undefined) {
+      db().deleteMembership(removed.groupId, deleteSessionKey);
+    }
     broadcastPresenceRemoved(removed.groupId, [
       removed.user.memberId,
       removed.agent.memberId,
@@ -1288,14 +1760,32 @@ export function createBrokerServer(
   function sendSnapshot(clientId: string, socket: Socket): void {
     const group = groups.groupForClient(clientId);
     const sessionKey = sessionKeyForClient(clientId);
+    const storedGroup = group === undefined ? undefined : db().storedGroup(group.groupId);
     send(
       socket,
       createEnvelope("snapshot", {
         brokerInstanceId: instanceId,
         clientId,
-        groups: groups.summaries(),
+        groups: isLoopback(socket.remoteAddress)
+          ? groups.summaries()
+          : nearbyGroupSummaries(),
         ...(group === undefined ? {} : { group }),
-        members: group === undefined ? [] : groups.members(group.groupId),
+        ...(storedGroup === undefined
+          ? {}
+          : {
+              groupSettings: {
+                groupId: storedGroup.groupId,
+                groupName: storedGroup.groupName,
+                visibility: storedGroup.visibility,
+                keepAvailableWhenEmpty: storedGroup.keepAvailableWhenEmpty,
+                openAtLogin: storedGroup.openAtLogin,
+              },
+              isOwner: storedGroup.ownerSessionKey === sessionKey,
+              ownerRecoveryAvailable:
+                isLoopback(socket.remoteAddress) &&
+                storedGroup.ownerSessionKey !== sessionKey,
+            }),
+        members: group === undefined ? [] : snapshotMembers(group.groupId),
         messages:
           group === undefined ? [] : db().recentMessages(group.groupId),
         pausedChains:
@@ -1310,6 +1800,111 @@ export function createBrokerServer(
     );
   }
 
+  function nearbyGroupSummaries() {
+    const nearbyIds = new Set(
+      db().storedGroups()
+        .filter((group) => group.visibility === "nearby")
+        .map((group) => group.groupId),
+    );
+    return groups.summaries().filter((group) => nearbyIds.has(group.groupId));
+  }
+
+  function snapshotMembers(groupId: string): Member[] {
+    const online = groups.members(groupId);
+    const result: Member[] = [];
+    for (const stored of db().memberships(groupId)) {
+      const currentUser = online.find(
+        (member) =>
+          member.type === "user" &&
+          member.displayName.toLocaleLowerCase("en-US") ===
+            stored.userName.toLocaleLowerCase("en-US"),
+      );
+      const currentAgent = currentUser === undefined
+        ? undefined
+        : online.find(
+            (member) =>
+              member.type === "agent" &&
+              member.clientId === currentUser.clientId,
+          );
+      result.push(
+        {
+          ...(currentUser ?? {
+            memberId: `user:${stored.sessionKey}`,
+            clientId: stored.sessionKey,
+            type: "user" as const,
+            displayName: stored.userName,
+            groupId,
+            online: false,
+          }),
+          stableSessionKey: stored.sessionKey,
+          isOwner: db().storedGroup(groupId)?.ownerSessionKey === stored.sessionKey,
+          ...(stored.status === "removed" ? { removed: true, online: false } : {}),
+        },
+        {
+          ...(currentAgent ?? {
+            memberId: `agent:${stored.sessionKey}`,
+            clientId: stored.sessionKey,
+            type: "agent" as const,
+            displayName: stored.agentName,
+            groupId,
+            online: false,
+            agentStatus: "idle" as const,
+            agentPermission: "auto" as const,
+            pendingApprovalCount: 0,
+          }),
+          stableSessionKey: stored.sessionKey,
+          ...(stored.status === "removed" ? { removed: true, online: false } : {}),
+        },
+      );
+    }
+    return result;
+  }
+
+  function requireOwner(
+    sessionKey: SessionKey,
+    socket: Socket,
+    requestId: string,
+    payload: { groupId: string; ownerCredential: string },
+  ): boolean {
+    const group = db().storedGroup(payload.groupId);
+    if (
+      group === undefined ||
+      group.ownerSessionKey !== sessionKey ||
+      group.ownerCredentialHash !== hashSecret(payload.ownerCredential)
+    ) {
+      sendError(socket, {
+        code: "owner_required",
+        message: "只有群主可以执行此操作",
+        requestId,
+      });
+      return false;
+    }
+    return true;
+  }
+
+  function sendSnapshotsForGroup(groupId: string): void {
+    for (const targetClientId of groups.onlineClientIds(groupId)) {
+      const targetSocket = clients.get(targetClientId);
+      if (targetSocket !== undefined) sendSnapshot(targetClientId, targetSocket);
+    }
+  }
+
+  function disconnectRemoteGroupMembers(groupId: string): void {
+    for (const targetClientId of groups.onlineClientIds(groupId)) {
+      const targetSocket = clients.get(targetClientId);
+      if (targetSocket === undefined || isLoopback(targetSocket.remoteAddress)) continue;
+      const removed = groups.removeIfJoined(targetClientId);
+      if (removed === undefined) continue;
+      sendError(targetSocket, {
+        code: "invite_invalid",
+        message: "群主已停止向附近设备开放这个群组",
+      });
+      sendSnapshot(targetClientId, targetSocket);
+    }
+    broadcastGroupsChanged();
+    scheduleIdleShutdown();
+  }
+
   function broadcastPresence(members: Member[], excludeClientId?: string): void {
     for (const member of members) {
       broadcastToGroup(
@@ -1321,11 +1916,12 @@ export function createBrokerServer(
   }
 
   function broadcastGroupsChanged(): void {
-    const envelope = createEnvelope("groups.changed", {
-      groups: groups.summaries(),
-    }) as BrokerEnvelope;
     for (const socket of clients.values()) {
-      send(socket, envelope);
+      send(socket, createEnvelope("groups.changed", {
+        groups: isLoopback(socket.remoteAddress)
+          ? groups.summaries()
+          : nearbyGroupSummaries(),
+      }) as BrokerEnvelope);
     }
   }
 
@@ -1393,6 +1989,7 @@ export function createBrokerServer(
     processLock = await acquireBrokerProcessLock(dbPath);
     try {
       database = new BrokerDatabase(dbPath, deviceId);
+      stableBrokerId = database.brokerId();
       groups = new GroupState(database.groups());
       await new Promise<void>((resolveStart, rejectStart) => {
         const onError = (error: NodeJS.ErrnoException) => {
@@ -1411,11 +2008,33 @@ export function createBrokerServer(
         server.once("listening", onListening);
         server.listen({ ...listen, exclusive: true });
       });
+      await writeBrokerRuntimeMetadata(dbPath, {
+        brokerId: stableBrokerId,
+        brokerInstanceId: instanceId,
+        pid: process.pid,
+        host: endpoint.host,
+        port: endpoint.port,
+        mode,
+        startedAt: Date.now(),
+      });
+      if (mode === "lan-host" && publishMdns) {
+        mdnsPublisher = mdnsPublisherFactory({
+          brokerId: stableBrokerId,
+          port: endpoint.port,
+          interfaceAddress: primaryOrdinaryNetwork()?.address,
+        });
+      }
       started = true;
       closing = false;
+      scheduleIdleShutdown();
     } catch (error) {
+      if (server.listening) {
+        await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      }
       database?.close();
       database = undefined;
+      await mdnsPublisher?.stop();
+      mdnsPublisher = undefined;
       await processLock.release();
       processLock = undefined;
       throw error;
@@ -1423,10 +2042,11 @@ export function createBrokerServer(
   }
 
   async function close(): Promise<void> {
-    if (!started) {
+    if (!started || closing) {
       return;
     }
     closing = true;
+    clearIdleShutdown();
     for (const session of sessions.values()) {
       if (session.disconnectTimer !== undefined) {
         clearTimeout(session.disconnectTimer);
@@ -1439,12 +2059,15 @@ export function createBrokerServer(
     clients.clear();
     sessions.clear();
     pendingRequests.clear();
+    await mdnsPublisher?.stop();
+    mdnsPublisher = undefined;
     await new Promise<void>((resolveClose, rejectClose) => {
       server.close((error) => (error ? rejectClose(error) : resolveClose()));
     });
     started = false;
     database?.close();
     database = undefined;
+    await removeBrokerRuntimeMetadata(dbPath, instanceId);
     await processLock?.release();
     processLock = undefined;
   }
@@ -1456,10 +2079,38 @@ export function createBrokerServer(
     return database;
   }
 
+  function clearIdleShutdown(): void {
+    if (idleTimer !== undefined) {
+      clearTimeout(idleTimer);
+      idleTimer = undefined;
+    }
+  }
+
+  function scheduleIdleShutdown(): void {
+    clearIdleShutdown();
+    if (
+      closing ||
+      clients.size > 0 ||
+      db().storedGroups().some((group) => group.keepAvailableWhenEmpty)
+    ) return;
+    idleTimer = setTimeout(() => {
+      idleTimer = undefined;
+      if (
+        clients.size === 0 &&
+        !db().storedGroups().some((group) => group.keepAvailableWhenEmpty)
+      ) {
+        void close();
+      }
+    }, idleShutdownMs);
+    idleTimer.unref?.();
+  }
+
   return {
     get endpoint() { return endpoint; },
     dbPath,
     instanceId,
+    get brokerId() { return stableBrokerId; },
+    mode,
     start,
     close,
   };
@@ -1490,79 +2141,10 @@ function isLoopbackAddress(address: string | undefined): boolean {
     address.startsWith("::ffff:127.");
 }
 
-async function runBroker(): Promise<void> {
-  const { listen, dbPath } = parseBrokerArgs(process.argv.slice(2));
-  if (listen.host !== "127.0.0.1") {
-    console.warn("警告：当前局域网监听尚未启用准入控制，仅供开发测试");
-  }
-  const broker = createBrokerServer({ listen, dbPath });
-  try {
-    await broker.start();
-  } catch (error) {
-    if (listen.port === 0) throw error;
-    const target = validateConnectEndpoint({
-      host: listen.host === "0.0.0.0" ? "127.0.0.1" : listen.host,
-      port: listen.port,
-    });
-    const result = await waitForCompatibleBroker(target, 8_000);
-    if (result === "compatible") {
-      console.log(`复用现有 Pi Comms Broker：${formatEndpoint(target)}`);
-      return;
-    }
-    if (result === "incompatible") {
-      throw new Error(`端口上的服务不是兼容的 Pi Comms Broker：${formatEndpoint(target)}`);
-    }
-    if (error instanceof BrokerLockBusyError) {
-      throw new Error(`等待现有 Broker 就绪超时：${formatEndpoint(target)}`);
-    }
-    throw error;
-  }
-  console.log(`Pi Comms Broker 正在监听 ${formatEndpoint(broker.endpoint)}`);
-  const shutdown = async () => broker.close();
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+function createCredential(): string {
+  return randomBytes(32).toString("base64url");
 }
 
-function parseBrokerArgs(args: string[]): {
-  listen: TcpListenEndpoint;
-  dbPath: string;
-} {
-  let host = DEFAULT_BROKER_ENDPOINT.host;
-  let port = DEFAULT_BROKER_ENDPOINT.port;
-  let dbPath = DEFAULT_DATABASE_PATH;
-  for (let index = 0; index < args.length; index += 2) {
-    const name = args[index];
-    const value = args[index + 1];
-    if (value === undefined) throw new Error(`缺少参数值：${name}`);
-    if (name === "--host") host = value;
-    else if (name === "--port") port = Number(value);
-    else if (name === "--db") dbPath = resolve(value);
-    else throw new Error(`未知参数：${name}`);
-  }
-  return { listen: validateListenEndpoint({ host, port }), dbPath };
-}
-
-async function waitForCompatibleBroker(
-  endpoint: TcpListenEndpoint,
-  timeoutMs: number,
-): Promise<"compatible" | "incompatible" | "unreachable"> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const result = await probeBroker(endpoint);
-    if (result.status === "compatible") return "compatible";
-    if (result.status === "incompatible") return "incompatible";
-    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-  }
-  return "unreachable";
-}
-
-const isMainModule =
-  process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
-
-if (isMainModule) {
-  void runBroker().catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : error);
-    process.exitCode = 1;
-  });
+function hashSecret(value: string): string {
+  return createHash("sha256").update(value).digest("base64url");
 }

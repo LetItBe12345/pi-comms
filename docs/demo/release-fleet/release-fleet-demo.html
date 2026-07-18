@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Release Fleet · Distributed Validation</title>
+<style>
+  :root{
+    color-scheme:dark;
+    --bg:#071019;--panel:#0b1622;--panel2:#0e1b29;--line:#213447;
+    --text:#edf5fb;--muted:#8194a8;--cyan:#49d6ff;--blue:#5b8cff;
+    --green:#45e39a;--amber:#ffca62;--red:#ff657a;--violet:#ad8cff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;width:1920px;height:1080px;overflow:hidden;background:var(--bg);color:var(--text);font-family:Inter,"Noto Sans SC","Microsoft YaHei",system-ui,sans-serif}
+  body:before{content:"";position:fixed;inset:0;background:
+    radial-gradient(circle at 14% 0%,rgba(55,127,177,.22),transparent 34%),
+    radial-gradient(circle at 92% 100%,rgba(73,214,255,.09),transparent 34%),
+    linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px),
+    linear-gradient(rgba(255,255,255,.014) 1px,transparent 1px);
+    background-size:auto,auto,42px 42px,42px 42px}
+  .shell{position:relative;height:100%;padding:28px 42px 26px;display:grid;grid-template-rows:84px 104px 1fr 34px;gap:14px}
+  header{display:flex;justify-content:space-between;align-items:center}
+  .brand{display:flex;align-items:center;gap:17px}.brandmark{width:49px;height:49px;border-radius:15px;display:grid;place-items:center;
+    font:900 27px Georgia;color:#071019;background:linear-gradient(145deg,var(--cyan),#9ff2ff);box-shadow:0 0 34px rgba(73,214,255,.2)}
+  .eyebrow{font:800 12px ui-monospace,monospace;letter-spacing:.18em;color:var(--cyan);text-transform:uppercase}
+  h1{margin:5px 0 0;font-size:30px;letter-spacing:-.025em}.topright{display:flex;align-items:center;gap:10px}
+  .pill{padding:8px 12px;border-radius:99px;border:1px solid #294157;background:rgba(11,25,38,.88);font:700 12px ui-monospace,monospace;color:#a7b9c9}
+  .pill.live{color:var(--green);border-color:#236047}.clock{margin-left:6px;color:#62778b;font:13px ui-monospace,monospace}
+
+  .pipeline{position:relative;border:1px solid #1d3042;border-radius:17px;background:rgba(8,19,29,.82);padding:15px 25px;display:grid;grid-template-columns:repeat(5,1fr);align-items:center}
+  .pipeline:before{content:"";position:absolute;left:11%;right:11%;top:43px;height:2px;background:#203448}
+  .flow{position:absolute;left:11%;top:43px;height:2px;width:0;background:linear-gradient(90deg,var(--cyan),var(--violet),var(--green));box-shadow:0 0 15px rgba(73,214,255,.45);transition:width .4s}
+  .node{position:relative;text-align:center;z-index:1}.node .icon{margin:auto;width:34px;height:34px;border-radius:10px;border:1px solid #2c4358;background:#0d1b28;display:grid;place-items:center;color:#71869b;font-weight:900}
+  .node.active .icon{color:var(--cyan);border-color:#347b94;background:#102b38;box-shadow:0 0 24px rgba(73,214,255,.17)}
+  .node.done .icon{color:#05140e;border-color:var(--green);background:var(--green)}
+  .node strong{display:block;margin-top:8px;font-size:12px}.node span{display:block;color:#65798d;font:10px ui-monospace,monospace;margin-top:2px}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:14px;min-height:0}
+  .session{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:17px;background:linear-gradient(180deg,rgba(14,28,42,.98),rgba(8,18,28,.98));box-shadow:0 16px 45px rgba(0,0,0,.21);display:grid;grid-template-rows:54px 1fr}
+  .session.active{border-color:#3d7796;box-shadow:0 0 0 1px rgba(73,214,255,.12),0 16px 48px rgba(0,0,0,.28)}
+  .session.pass{border-color:#245e48}.session.fail{border-color:#79404c}
+  .bar{padding:0 17px;border-bottom:1px solid #1b3042;background:rgba(15,29,44,.88);display:flex;align-items:center;justify-content:space-between}
+  .identity{display:flex;align-items:center;gap:11px}.os{width:33px;height:33px;border-radius:10px;display:grid;place-items:center;background:#122638;font-size:18px}
+  .name{font-size:14px;font-weight:800}.sid{color:#61768b;font:10px ui-monospace,monospace;margin-top:3px}
+  .state{display:flex;align-items:center;gap:7px;color:#7f92a5;font:800 10px ui-monospace,monospace;letter-spacing:.08em}
+  .state i{width:7px;height:7px;border-radius:50%;background:#4f6577}.active .state{color:var(--cyan)}.active .state i{background:var(--cyan);box-shadow:0 0 12px var(--cyan)}
+  .pass .state{color:var(--green)}.pass .state i{background:var(--green)}.fail .state{color:var(--red)}.fail .state i{background:var(--red)}
+  .body{padding:14px 16px;min-height:0;display:grid;grid-template-columns:1.12fr .88fr;gap:12px}
+  .body.single{grid-template-columns:1fr}.pane{min-width:0;border:1px solid #1d3043;border-radius:11px;background:#07111b;overflow:hidden}
+  .panehead{height:31px;padding:0 11px;border-bottom:1px solid #1c2d3e;background:#0c1926;display:flex;align-items:center;justify-content:space-between;color:#718498;font:700 10px ui-monospace,monospace}
+  .terminal{padding:11px 12px;color:#aebdcc;font:11px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap}
+  .terminal .prompt{color:var(--cyan)}.terminal .dim{color:#53677b}.terminal .ok{color:var(--green)}.terminal .warn{color:var(--amber)}.terminal .err{color:var(--red)}.terminal .violet{color:var(--violet)}
+  .feed{padding:9px;display:flex;flex-direction:column;gap:7px}.message{border-left:2px solid #3a566f;border-radius:2px 8px 8px 2px;padding:8px 9px;background:#0d1c2a;color:#b6c5d2;font-size:11px;line-height:1.42}
+  .message b{display:block;color:#e7f2fa;font-size:10px;margin-bottom:3px}.message.agent{border-left-color:var(--cyan);background:#0d2432}.message.success{border-left-color:var(--green);background:#0b251c}.message.error{border-left-color:var(--red);background:#28131b}
+  .matrix{display:grid;grid-template-columns:1.3fr repeat(3,.7fr);gap:1px;background:#203244;border:1px solid #203244;border-radius:7px;overflow:hidden;font:10px ui-monospace,monospace;margin-top:5px}
+  .matrix div{background:#0a1621;padding:6px 7px}.matrix .ok{color:var(--green)}.matrix .run{color:var(--amber)}.matrix .bad{color:var(--red)}
+  .artifact{padding:7px 8px;border:1px solid #274056;background:#0b1c29;border-radius:7px;font:10px ui-monospace,monospace;color:#a8bbcb;margin-top:5px}
+  .screenshot{height:91px;border-radius:8px;border:1px solid #294055;background:linear-gradient(145deg,#e9f4fa,#c9dbe5);padding:9px;color:#213141;font-size:10px}
+  .browserbar{height:16px;background:#b8cad5;border-radius:4px;margin-bottom:8px;display:flex;gap:3px;padding:5px}.browserbar i{width:4px;height:4px;border-radius:50%;background:#697f8d}.pagecard{height:45px;border-left:4px solid #4198c2;background:white;border-radius:4px;padding:7px;box-shadow:0 3px 9px #758d9e55}.pagecard strong{display:block;font-size:9px}.pagecard span{color:#60727e;font-size:8px}
+  .resultbig{height:100%;display:grid;place-items:center;text-align:center}.resultbig .symbol{font-size:38px;line-height:1}.resultbig strong{display:block;font-size:17px;margin:6px}.resultbig span{color:#7f94a7;font:11px ui-monospace,monospace}
+  .toast{position:absolute;right:14px;bottom:14px;padding:8px 10px;border:1px solid #2f5168;background:#0e2635;border-radius:8px;color:#bfeaff;font:10px ui-monospace,monospace;box-shadow:0 8px 22px #0007}
+  footer{display:flex;align-items:center;justify-content:space-between;color:#61758a;font:11px ui-monospace,monospace}.caption{color:#d6e5ef;font:700 15px Inter,"Noto Sans SC",sans-serif}.caption em{font-style:normal;color:var(--cyan)}
+
+  .cover{position:fixed;inset:0;z-index:20;display:none;place-items:center;text-align:center;background:
+    radial-gradient(circle at 50% 38%,rgba(46,133,181,.29),transparent 35%),#071019}
+  .cover:before{content:"";position:absolute;width:700px;height:700px;border:1px solid rgba(73,214,255,.08);border-radius:50%;box-shadow:0 0 0 90px rgba(73,214,255,.025),0 0 0 180px rgba(73,214,255,.018)}
+  .coverinner{position:relative}.cover .tag{display:inline-block;padding:8px 14px;border:1px solid #32617a;border-radius:99px;color:var(--cyan);font:800 12px ui-monospace,monospace;letter-spacing:.17em;text-transform:uppercase}
+  .cover h2{font-size:76px;margin:25px 0 10px;letter-spacing:-.055em}.cover p{font-size:22px;color:#91a7b9;margin:0}.route{margin-top:42px;color:#c3d1dc;font:700 15px ui-monospace,monospace}.route span{color:var(--cyan);padding:0 12px}
+  body[data-stage="0"] .cover{display:grid}
+</style>
+</head>
+<body data-stage="0">
+<div class="cover"><div class="coverinner"><div class="tag">Workflow Demo</div><h2>RELEASE FLEET</h2><p>一次提交，穿过三种真实用户环境</p><div class="route">CODE <span>→</span> RELEASE <span>→</span> WINDOWS · LINUX · macOS <span>→</span> VERIFIED</div></div></div>
+<main class="shell">
+  <header>
+    <div class="brand"><div class="brandmark">π</div><div><div class="eyebrow">Distributed Release Validation</div><h1>Release Fleet Control</h1></div></div>
+    <div class="topright"><div class="pill live">● 4 PI SESSIONS ONLINE</div><div class="pill" id="release">release / pending</div><div class="clock" id="clock">09:41:02</div></div>
+  </header>
+  <section class="pipeline">
+    <div class="flow" id="flow"></div>
+    <div class="node" data-node="0"><div class="icon">⌘</div><strong>CODE</strong><span>local workspace</span></div>
+    <div class="node" data-node="1"><div class="icon">PR</div><strong>PULL REQUEST</strong><span>review + merge</span></div>
+    <div class="node" data-node="2"><div class="icon">CI</div><strong>CI / CD</strong><span>3 platform builds</span></div>
+    <div class="node" data-node="3"><div class="icon">⇢</div><strong>DISTRIBUTE</strong><span>release artifacts</span></div>
+    <div class="node" data-node="4"><div class="icon">✓</div><strong>VALIDATE</strong><span>user environments</span></div>
+  </section>
+  <section class="grid" id="grid"></section>
+  <footer><div id="stageCounter">01 / 11</div><div class="caption" id="caption">开发完成，准备进入发布链路</div><div>PI COMMS · RELEASE CHANNEL</div></footer>
+</main>
+<script>
+const sessions={
+  dev:{os:"⌘",name:"主开发 Session",sid:"PI-DEV-SHANGHAI · repository / clipmark",state:"CODING"},
+  win:{os:"⊞",name:"Windows 用户 Session",sid:"PI-USER-WIN11 · private device",state:"WAITING"},
+  linux:{os:"◆",name:"Linux 用户 Session",sid:"PI-USER-UBUNTU · private device",state:"WAITING"},
+  mac:{os:"●",name:"macOS 用户 Session",sid:"PI-USER-MACBOOK · private device",state:"WAITING"}
+};
+const T=(title,content)=>`<div class="pane"><div class="panehead"><span>${title}</span><span>TERMINAL</span></div><div class="terminal">${content}</div></div>`;
+const F=(items)=>`<div class="pane"><div class="panehead"><span>PI COMMS</span><span>SECURE CHANNEL</span></div><div class="feed">${items.join("")}</div></div>`;
+const M=(type,who,text)=>`<div class="message ${type}"><b>${who}</b>${text}</div>`;
+const shot=(title,sub)=>`<div class="screenshot"><div class="browserbar"><i></i><i></i><i></i></div><div class="pagecard"><strong>${title}</strong><span>${sub}</span></div></div>`;
+function card(key,mode,left,right,toast=""){
+  const s=sessions[key], body=right?left+right:left;
+  const stateLabel=mode==="pass"?"PASS":mode==="fail"?"FAIL":mode==="active"?"ACTIVE":s.state;
+  return `<article class="session ${mode}"><div class="bar"><div class="identity"><div class="os">${s.os}</div><div><div class="name">${s.name}</div><div class="sid">${s.sid}</div></div></div><div class="state"><i></i>${stateLabel}</div></div><div class="body ${right?"":"single"}">${body}</div>${toast?`<div class="toast">${toast}</div>`:""}</article>`;
+}
+const waiting=(platform)=>T("LOCAL ENVIRONMENT",`<span class="dim">platform</span>  ${platform}
+<span class="dim">channel </span>  release-validation
+<span class="dim">status  </span>  <span class="warn">awaiting task</span>`);
+const stages=[
+  {cap:"",pipe:0,release:"release / pending",cards:""},
+  {cap:"主开发 Session 完成功能并创建提交",pipe:0,release:"branch / feature/web-to-md",cards:()=>[
+    card("dev","active",T("src/export/markdown.ts",`<span class="dim">export async function savePage(page) {</span>
+  const markdown = <span class="violet">await convert(page)</span>
+  await workspace.write(markdown)
+<span class="dim">}</span>
+
+<span class="prompt">❯</span> npm test
+<span class="ok">✓ 48 tests passed</span>
+<span class="prompt">❯</span> git commit -m "feat: web to markdown"
+<span class="ok">[feature/web-to-md 8f27c1a]</span>`),F([M("agent","PI","实现完成。本地测试通过，准备提交 Pull Request。")])),
+    card("win","",waiting("Windows 11 · Chrome 132"),F([M("","SYSTEM","设备在线，保留私有浏览器配置。")])),
+    card("linux","",waiting("Ubuntu 24.04 · Chromium"),F([M("","SYSTEM","设备在线，工作区与主仓库隔离。")])),
+    card("mac","",waiting("macOS 15 · Safari 18"),F([M("","SYSTEM","设备在线，等待正式 Release。")]))
+  ]},
+  {cap:"PR #128 触发 GitHub Actions，三平台并行构建",pipe:2,release:"PR #128 / checks running",cards:()=>[
+    card("dev","active",T("GITHUB / PULL REQUEST",`<span class="prompt">PR #128</span>  feat: save any page as Markdown
+<span class="dim">commit</span>   8f27c1a
+<span class="dim">review</span>   approved
+<span class="dim">merge</span>    queued
+
+<div class="matrix"><div>CHECK</div><div>WIN</div><div>LINUX</div><div>MAC</div><div>unit tests</div><div class="ok">✓</div><div class="ok">✓</div><div class="ok">✓</div><div>package</div><div class="run">●</div><div class="run">●</div><div class="run">●</div></div>`),F([M("agent","PI","PR 已通过评审。正在跟踪跨平台 CI/CD。")])),
+    card("win","",waiting("Windows 11 · Chrome 132"),F([M("","SYSTEM","未安装开发工作区内容。")])),
+    card("linux","",waiting("Ubuntu 24.04 · Chromium"),F([M("","SYSTEM","仅接受已发布的 Linux artifact。")])),
+    card("mac","",waiting("macOS 15 · Safari 18"),F([M("","SYSTEM","仅接受已签名的 macOS artifact。")]))
+  ]},
+  {cap:"CI/CD 生成正式 Release v1.4.0",pipe:3,release:"release / v1.4.0",cards:()=>[
+    card("dev","pass",T("GITHUB ACTIONS / RELEASE",`<span class="ok">✓ lint + unit tests</span>
+<span class="ok">✓ build / windows-x64</span>
+<span class="ok">✓ build / linux-x64</span>
+<span class="ok">✓ build / macos-arm64</span>
+<span class="ok">✓ sign + checksum</span>
+<span class="ok">✓ publish Release v1.4.0</span>`),F([M("success","RELEASE BOT","v1.4.0 已发布，3 个平台 artifact 可用。")]),"RELEASE v1.4.0 PUBLISHED"),
+    card("win","",T("ARTIFACT",`<div class="artifact">clipmark-v1.4.0-win-x64.zip<br><span class="dim">sha256 · 7e42…b19c</span></div>`),F([M("agent","INCOMING","新的发行版测试任务正在路由。")])),
+    card("linux","",T("ARTIFACT",`<div class="artifact">clipmark-v1.4.0-linux-x64.tar.gz<br><span class="dim">sha256 · d990…40a2</span></div>`),F([M("agent","INCOMING","新的发行版测试任务正在路由。")])),
+    card("mac","",T("ARTIFACT",`<div class="artifact">clipmark-v1.4.0-macos-arm64.zip<br><span class="dim">sha256 · 64a1…9f03</span></div>`),F([M("agent","INCOMING","新的发行版测试任务正在路由。")]))
+  ]},
+  {cap:"主 Session 将同一测试任务发送到三个独立用户设备",pipe:3,release:"release / v1.4.0",cards:()=>[
+    card("dev","active",T("TASK / RV-140",`target: <span class="violet">Release v1.4.0</span>
+install: platform artifact
+scenario: save product page as Markdown
+evidence: screenshot + logs + result
+return_to: <span class="prompt">PI-DEV-SHANGHAI</span>`),F([M("agent","PI","@Windows @Linux @macOS 下载并安装 v1.4.0，执行真实浏览器与 Computer Use 端到端测试。")]),"TASK SENT TO 3 SESSIONS"),
+    card("win","active",T("TASK QUEUE",`<span class="prompt">● received RV-140</span>
+source  PI-DEV-SHANGHAI
+release v1.4.0
+policy  local computer + browser use`),F([M("agent","PI","收到。将在 Windows 私有环境安装并测试。")])),
+    card("linux","active",T("TASK QUEUE",`<span class="prompt">● received RV-140</span>
+source  PI-DEV-SHANGHAI
+release v1.4.0
+policy  local computer + browser use`),F([M("agent","PI","收到。将在 Ubuntu 私有环境安装并测试。")])),
+    card("mac","active",T("TASK QUEUE",`<span class="prompt">● received RV-140</span>
+source  PI-DEV-SHANGHAI
+release v1.4.0
+policy  local computer + browser use`),F([M("agent","PI","收到。将在 macOS 私有环境安装并测试。")]))
+  ]},
+  {cap:"三个用户 Session 分别下载并安装对应的 Release artifact",pipe:3,release:"release / v1.4.0",cards:()=>[
+    card("dev","",T("FLEET / RV-140",`Windows  <span class="warn">INSTALLING</span>  72%
+Linux    <span class="warn">INSTALLING</span>  88%
+macOS    <span class="warn">VERIFYING</span>   61%`),F([M("","SYSTEM","等待三个私有设备回传执行证据。")])),
+    card("win","active",T("POWERSHELL",`<span class="prompt">PS›</span> download release/v1.4.0/win-x64
+<span class="ok">████████████████████ 100%</span>
+<span class="prompt">PS›</span> pi extension install .\\clipmark.zip
+<span class="ok">✓ installed Clipmark 1.4.0</span>`),F([M("agent","PI","校验 checksum 后完成本地安装。")])),
+    card("linux","active",T("BASH",`<span class="prompt">$</span> gh release download v1.4.0 -p '*linux*'
+<span class="ok">████████████████████ 100%</span>
+<span class="prompt">$</span> pi extension install ./clipmark.tar.gz
+<span class="ok">✓ installed Clipmark 1.4.0</span>`),F([M("agent","PI","发行包已安装到隔离的用户目录。")])),
+    card("mac","active",T("ZSH",`<span class="prompt">%</span> download release/v1.4.0/macos-arm64
+<span class="ok">████████████████████ 100%</span>
+<span class="prompt">%</span> pi extension install ./clipmark.zip
+<span class="ok">✓ signature verified · installed</span>`),F([M("agent","PI","签名验证通过，准备启动 Safari。")]))
+  ]},
+  {cap:"Browser Use 与 Computer Use 在三种本地环境中并行执行",pipe:4,release:"validation / RV-140",cards:()=>[
+    card("dev","",T("LIVE FLEET",`Windows  <span class="prompt">BROWSER USE</span>
+Linux    <span class="prompt">COMPUTER USE</span>
+macOS    <span class="prompt">COMPUTER USE</span>
+
+evidence stream: <span class="ok">connected</span>`),F([M("","SYSTEM","3 个端到端测试正在并行执行。")])),
+    card("win","active",T("CHROME / BROWSER USE",`${shot("Aurora Headphones","Save page → Markdown · step 4 / 5")}
+<span class="prompt">click</span>  #save-markdown
+<span class="ok">✓ download detected</span>`),F([M("agent","PI","正在验证标题、图片链接和文件下载。")])),
+    card("linux","active",T("CHROMIUM / COMPUTER USE",`${shot("Aurora Headphones","Keyboard flow · export dialog")}
+<span class="prompt">press</span>  Ctrl+Shift+S
+<span class="ok">✓ export dialog opened</span>`),F([M("agent","PI","正在使用桌面文件管理器验证输出。")])),
+    card("mac","active",T("SAFARI / COMPUTER USE",`${shot("Aurora Headphones","Save button selected")}
+<span class="prompt">click</span>  Save as Markdown
+<span class="warn">… waiting for clipboard permission</span>`),F([M("agent","PI","Safari 操作进行中，等待系统反馈。")]))
+  ]},
+  {cap:"两个平台通过；macOS 返回可复现的 Safari 兼容性失败",pipe:4,release:"validation / 2 passed · 1 failed",cards:()=>[
+    card("dev","fail",T("RESULTS / RV-140",`Windows 11 · Chrome     <span class="ok">PASS</span>
+Ubuntu 24 · Chromium   <span class="ok">PASS</span>
+macOS 15 · Safari      <span class="err">FAIL</span>
+
+<span class="err">distributed validation incomplete</span>`),F([M("error","MACOS RESULT","步骤 4 失败：Export 按钮无响应。已附日志与截图。")])),
+    card("win","pass",`<div class="pane resultbig"><div><div class="symbol" style="color:var(--green)">✓</div><strong>END-TO-END PASS</strong><span>artifact + screenshot + trace returned</span></div></div>`,""),
+    card("linux","pass",`<div class="pane resultbig"><div><div class="symbol" style="color:var(--green)">✓</div><strong>END-TO-END PASS</strong><span>filesystem output verified</span></div></div>`,""),
+    card("mac","fail",T("SAFARI CONSOLE",`<span class="err">NotAllowedError:</span>
+Clipboard API requires a user gesture
+
+at saveMarkdown (export.ts:48)
+Safari 18.0 · macOS 15.1`),F([M("error","PI","复现稳定。返回 console、屏幕截图和环境信息。")]),"FAILURE EVIDENCE RETURNED")
+  ]},
+  {cap:"主开发 Session 使用失败证据定位根因并生成兼容性修复",pipe:1,release:"hotfix / safari-clipboard",cards:()=>[
+    card("dev","active",T("src/export/clipboard.ts",`<span class="dim">- await navigator.clipboard.writeText(md)</span>
+<span class="ok">+ if (platform.isSafari) {</span>
+<span class="ok">+   await nativeClipboard.write(md)</span>
+<span class="ok">+ } else {</span>
+<span class="ok">+   await navigator.clipboard.writeText(md)</span>
+<span class="ok">+ }</span>
+
+<span class="prompt">❯</span> npm test
+<span class="ok">✓ 51 tests passed</span>`),F([M("agent","PI","失败不是测试噪声：Safari Clipboard API 缺少兼容路径。修复与回归测试已完成。")]),"PATCH READY"),
+    card("win","pass",T("RESULT CACHE",`RV-140-WIN
+<span class="ok">PASS · evidence retained</span>`),F([M("success","PI","等待增量复测任务。")])),
+    card("linux","pass",T("RESULT CACHE",`RV-140-LINUX
+<span class="ok">PASS · evidence retained</span>`),F([M("success","PI","等待增量复测任务。")])),
+    card("mac","fail",T("REPRODUCTION",`Safari 18.0
+scenario WEB-TO-MD-01
+failure <span class="err">100% reproducible</span>
+evidence bundle 3 files`),F([M("agent","PI","环境保持不变，可立即验证修复版。")]))
+  ]},
+  {cap:"修复 PR #129 通过 CI/CD，正式发布 v1.4.1",pipe:3,release:"release / v1.4.1",cards:()=>[
+    card("dev","pass",T("GITHUB / PR #129",`fix: Safari clipboard fallback
+<span class="dim">commit</span>  31ac8de
+<span class="ok">✓ review approved</span>
+<span class="ok">✓ Windows build</span>
+<span class="ok">✓ Linux build</span>
+<span class="ok">✓ macOS build</span>
+<span class="ok">✓ published Release v1.4.1</span>`),F([M("success","RELEASE BOT","Hotfix v1.4.1 已发布。新的签名 artifacts 可用。")]),"RELEASE v1.4.1 PUBLISHED"),
+    card("win","active",T("INCOMING",`release v1.4.1
+delta    31ac8de
+task     RV-141`),F([M("agent","PI","收到复测任务。")])),
+    card("linux","active",T("INCOMING",`release v1.4.1
+delta    31ac8de
+task     RV-141`),F([M("agent","PI","收到复测任务。")])),
+    card("mac","active",T("INCOMING",`release v1.4.1
+delta    31ac8de
+task     RV-141 · priority`),F([M("agent","PI","在原失败环境下载并安装修复版。")]))
+  ]},
+  {cap:"三个用户设备安装 v1.4.1，并在原始环境中重新验证",pipe:4,release:"validation / RV-141",cards:()=>[
+    card("dev","active",T("LIVE FLEET / RV-141",`Windows  <span class="warn">VERIFYING</span>
+Linux    <span class="warn">VERIFYING</span>
+macOS    <span class="warn">VERIFYING</span>
+
+version pin: <span class="violet">v1.4.1</span>`),F([M("agent","PI","所有复测必须从正式 Release 安装，不复用开发工作区。")])),
+    card("win","active",T("CHROME",`${shot("Aurora Headphones","v1.4.1 · Markdown saved")}
+<span class="ok">✓ assertions 12 / 12</span>`),F([M("agent","PI","浏览器回归测试通过。")])),
+    card("linux","active",T("CHROMIUM",`${shot("Aurora Headphones","v1.4.1 · file verified")}
+<span class="ok">✓ assertions 12 / 12</span>`),F([M("agent","PI","Computer Use 回归测试通过。")])),
+    card("mac","active",T("SAFARI",`${shot("Aurora Headphones","v1.4.1 · export complete")}
+<span class="ok">✓ native clipboard fallback used</span>`),F([M("success","PI","原失败步骤已通过，Markdown 文件正确生成。")]),"SAFARI FIX VERIFIED")
+  ]},
+  {cap:"Release v1.4.1 在 Windows、Linux、macOS 用户环境中全部通过",pipe:5,release:"release / v1.4.1 · verified",cards:()=>[
+    card("dev","pass",`<div class="pane resultbig"><div><div class="symbol" style="color:var(--green)">✓</div><strong>RELEASE VERIFIED</strong><span>3 devices · 3 environments · 36 assertions</span></div></div>`,""),
+    card("win","pass",`<div class="pane resultbig"><div><div class="symbol" style="color:var(--green)">✓</div><strong>WINDOWS PASS</strong><span>Chrome · Browser Use · v1.4.1</span></div></div>`,""),
+    card("linux","pass",`<div class="pane resultbig"><div><div class="symbol" style="color:var(--green)">✓</div><strong>LINUX PASS</strong><span>Chromium · Computer Use · v1.4.1</span></div></div>`,""),
+    card("mac","pass",`<div class="pane resultbig"><div><div class="symbol" style="color:var(--green)">✓</div><strong>macOS PASS</strong><span>Safari · Computer Use · v1.4.1</span></div></div>`,"")
+  ]}
+];
+function render(){
+  const n=Math.max(0,Math.min(stages.length-1,Number(location.hash.slice(1))||0)),s=stages[n];
+  document.body.dataset.stage=n;
+  document.getElementById("caption").innerHTML=s.cap?`<em>${s.cap.split("，")[0]}</em>${s.cap.includes("，")?"，"+s.cap.split("，").slice(1).join("，"):""}`:"";
+  document.getElementById("stageCounter").textContent=`${String(Math.max(1,n)).padStart(2,"0")} / ${String(stages.length-1).padStart(2,"0")}`;
+  document.getElementById("release").textContent=s.release;
+  document.getElementById("grid").innerHTML=typeof s.cards==="function"?s.cards().join(""):"";
+  const progress=Math.max(0,Math.min(4,s.pipe));document.getElementById("flow").style.width=`${progress*19.5}%`;
+  document.querySelectorAll(".node").forEach((el,i)=>{el.classList.toggle("done",s.pipe>=5||i<progress);el.classList.toggle("active",s.pipe<5&&i===progress)});
+  document.getElementById("clock").textContent=`09:${String(41+n*2).padStart(2,"0")}:${String((n*7)%60).padStart(2,"0")}`;
+}
+addEventListener("hashchange",render);render();
+</script>
+</body>
+</html>

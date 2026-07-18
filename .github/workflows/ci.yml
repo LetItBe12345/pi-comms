@@ -25,8 +25,15 @@ jobs:
         uses: actions/dependency-review-action@v4
 
   check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -41,5 +48,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Check
-        run: npm run check
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit and integration tests
+        run: npm run test:unit
+
+      - name: Launcher and multi-session E2E
+        run: npm run test:e2e

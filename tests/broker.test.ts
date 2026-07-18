@@ -289,14 +289,14 @@ describe("Local Broker 群组与成员", () => {
       "Bob-Pi",
     ]);
     const bClientId = joined.payload.clientId;
-    expect(joined.payload.members).toContainEqual({
+    expect(joined.payload.members).toContainEqual(expect.objectContaining({
       memberId: `user:${bClientId}`,
       clientId: bClientId,
       type: "user",
       displayName: "Bob",
       groupId,
       online: true,
-    });
+    }));
     const online = await a.waitFor(
       "presence.changed",
       (message) => message.payload.displayName === "Bob-Pi",
@@ -365,12 +365,13 @@ describe("Local Broker 群组与成员", () => {
     ).toMatchObject({ payload: { code: "already_in_group" } });
   });
 
-  it("群名唯一，空群保留且离群后可以加入其他群", async () => {
+  it("群名唯一，群主不能退出且离线群仍保留", async () => {
     const a = await connect();
     const first = await createGroup(a, "Team-A");
-    const firstId = first.payload.group!.groupId;
     a.send("group.leave", {}, "leave-a");
-    await a.waitFor("snapshot", (message) => message.payload.group === undefined && message.payload.groups.length === 1);
+    expect(
+      await a.waitFor("error", (message) => message.payload.requestId === "leave-a"),
+    ).toMatchObject({ payload: { code: "owner_cannot_leave" } });
 
     const b = await connect();
     b.send("group.create", {
@@ -381,9 +382,7 @@ describe("Local Broker 群组与成员", () => {
     expect(
       await b.waitFor("error", (message) => message.payload.requestId === "duplicate-group"),
     ).toMatchObject({ payload: { code: "group_name_conflict" } });
-
-    const rejoined = await joinGroup(a, firstId, "Alice2", "Alice2-Pi");
-    expect(rejoined.payload.group?.groupId).toBe(firstId);
+    expect(first.payload.groups).toHaveLength(1);
   });
 
   it("群聊和成员事件严格按群隔离", async () => {

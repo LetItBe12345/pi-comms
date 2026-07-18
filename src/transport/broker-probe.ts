@@ -13,7 +13,12 @@ export const DEFAULT_CONNECT_TIMEOUT_MS = 1_000;
 export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 1_500;
 
 export type BrokerProbeResult =
-  | { status: "compatible"; brokerInstanceId: string }
+  | {
+      status: "compatible";
+      brokerId: string;
+      brokerInstanceId: string;
+      brokerMode: "local" | "lan-host";
+    }
   | { status: "unreachable" }
   | { status: "incompatible"; reason: string };
 
@@ -69,12 +74,23 @@ export function probeBroker(
         }
         if (
           message.payload.service !== BROKER_SERVICE ||
-          message.payload.protocolVersion !== BROKER_PROTOCOL_VERSION
+          message.payload.protocolVersion !== BROKER_PROTOCOL_VERSION ||
+          typeof message.payload.brokerId !== "string" ||
+          message.payload.brokerId.length === 0 ||
+          (
+            message.payload.brokerMode !== "local" &&
+            message.payload.brokerMode !== "lan-host"
+          )
         ) {
           finish({ status: "incompatible", reason: "Pi Comms 协议版本不兼容" });
           return;
         }
-        finish({ status: "compatible", brokerInstanceId: message.payload.brokerInstanceId });
+        finish({
+          status: "compatible",
+          brokerId: message.payload.brokerId,
+          brokerInstanceId: message.payload.brokerInstanceId,
+          brokerMode: message.payload.brokerMode,
+        });
       }
     });
     socket.once("error", (error: NodeJS.ErrnoException) => {

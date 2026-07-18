@@ -50,6 +50,7 @@ export class GroupState {
     userName: string,
     agentName: string,
     groupId = randomUUID(),
+    stableSessionKey?: string,
   ): Membership {
     this.#ensureNotJoined(clientId);
     validateDisplayName(groupName);
@@ -68,7 +69,14 @@ export class GroupState {
       memberships: new Map(),
     };
     this.#groups.set(group.groupId, group);
-    return this.#join(group, clientId, userName, agentName);
+    return this.#join(
+      group,
+      clientId,
+      userName,
+      agentName,
+      true,
+      stableSessionKey,
+    );
   }
 
   removeGroup(groupId: string): void {
@@ -78,11 +86,61 @@ export class GroupState {
     }
   }
 
+  renameGroup(groupId: string, groupName: string): void {
+    validateDisplayName(groupName);
+    const group = this.#groups.get(groupId);
+    if (group === undefined) {
+      throw new GroupStateError("group_not_found", "群组不存在");
+    }
+    if (
+      [...this.#groups.values()].some(
+        (candidate) =>
+          candidate.groupId !== groupId &&
+          normalizeName(candidate.groupName) === normalizeName(groupName),
+      )
+    ) {
+      throw new GroupStateError("group_name_conflict", "群组名称已存在");
+    }
+    group.groupName = groupName;
+  }
+
+  clientIdForSessionMember(groupId: string, userName: string): string | undefined {
+    const expected = normalizeName(userName);
+    for (const membership of this.#groups.get(groupId)?.memberships.values() ?? []) {
+      if (normalizeName(membership.user.displayName) === expected) {
+        return membership.user.clientId;
+      }
+    }
+    return undefined;
+  }
+
+  removeGroupAndMemberships(groupId: string): Membership[] {
+    const group = this.#groups.get(groupId);
+    if (group === undefined) return [];
+    const memberships = [...group.memberships.values()];
+    for (const membership of memberships) {
+      this.#memberships.delete(membership.user.clientId);
+    }
+    this.#groups.delete(groupId);
+    return memberships;
+  }
+
+  setOwnerSession(groupId: string, stableSessionKey: string): void {
+    const group = this.#groups.get(groupId);
+    if (group === undefined) return;
+    for (const membership of group.memberships.values()) {
+      membership.user.isOwner =
+        membership.user.stableSessionKey === stableSessionKey;
+    }
+  }
+
   joinGroup(
     clientId: string,
     groupId: string,
     userName: string,
     agentName: string,
+    isOwner = false,
+    stableSessionKey?: string,
   ): Membership {
     this.#ensureNotJoined(clientId);
     const group = this.#groups.get(groupId);
@@ -102,7 +160,14 @@ export class GroupState {
     if (existingNames.has(normalizeName(agentName))) {
       throw new GroupStateError("member_name_conflict", "Agent 名称已被使用");
     }
-    return this.#join(group, clientId, userName, agentName);
+    return this.#join(
+      group,
+      clientId,
+      userName,
+      agentName,
+      isOwner,
+      stableSessionKey,
+    );
   }
 
   leaveGroup(clientId: string): Membership {
@@ -253,6 +318,8 @@ export class GroupState {
     clientId: string,
     userName: string,
     agentName: string,
+    isOwner: boolean,
+    stableSessionKey?: string,
   ): Membership {
     const membership: Membership = {
       groupId: group.groupId,
@@ -263,6 +330,8 @@ export class GroupState {
         displayName: userName,
         groupId: group.groupId,
         online: true,
+        ...(isOwner ? { isOwner: true } : {}),
+        ...(stableSessionKey === undefined ? {} : { stableSessionKey }),
       },
       agent: {
         memberId: `agent:${clientId}`,
@@ -274,6 +343,7 @@ export class GroupState {
         agentStatus: "idle",
         agentPermission: "auto",
         pendingApprovalCount: 0,
+        ...(stableSessionKey === undefined ? {} : { stableSessionKey }),
       },
     };
     group.memberships.set(clientId, membership);
