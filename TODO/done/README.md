@@ -18,3 +18,4 @@
 - [阶段 11：聊天时间线与消息布局](./11-chat-timeline-layout.md)
 - [阶段 12：跨平台 TCP 传输](./12-cross-platform-tcp.md)
 - [阶段 13：跨设备身份与连接可靠性](./13-device-identity-reliability.md)
+- [阶段 14：局域网 Broker 生命周期与准入](./14-lan-broker-lifecycle.md)

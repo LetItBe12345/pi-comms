@@ -150,6 +150,34 @@ beforeAll(() => {
 });
 
 describe("最小群聊 TUI", () => {
+  it("群主与普通成员显示清楚的 Ctrl+G 和快捷键帮助", () => {
+    const { view } = createView();
+    const ownerSnapshot = snapshot();
+    ownerSnapshot.isOwner = true;
+    ownerSnapshot.groupSettings = {
+      groupId: "group-a",
+      groupName: "开发组",
+      visibility: "nearby",
+      keepAvailableWhenEmpty: false,
+      openAtLogin: false,
+    };
+    ownerSnapshot.members[0]!.isOwner = true;
+    view.applySnapshot(ownerSnapshot);
+    view.setConnection("connected");
+
+    expect(view.render(80).join("\n")).toContain("Ctrl+G 群组管理");
+    view.handleInput("\x07");
+    const management = view.render(80).join("\n");
+    expect(management).toContain("群组管理");
+    expect(management).toContain("Alice [群主]");
+    expect(management).toContain("生成新的邀请码");
+
+    view.handleInput("\x1b");
+    view.handleInput("?");
+    expect(view.render(40).join("\n")).toContain("Ctrl+P  Agent 控制");
+    expect(view.render(40).join("\n")).toContain("Esc     返回或退出");
+  });
+
   it("按用户、Agent、操作和群组列表完成加入流程", () => {
     const { view, actions } = createView();
     view.setGroups([
@@ -170,6 +198,35 @@ describe("最小群聊 TUI", () => {
 
     expect(actions.joinGroup).toHaveBeenCalledWith("active", "Alice", "Alice-Pi");
     expect(view.render(80).join("\n")).toContain("正在加入群组");
+  });
+
+  it("邀请码错误后停留在输入框并允许直接重试", () => {
+    const joinGroup = vi.fn(() => "join-1");
+    const { view } = createView({ joinGroup });
+    view.setGroups([
+      { groupId: "nearby", groupName: "附近开发组", onlineSessionCount: 1 },
+    ]);
+    type(view, "Alice");
+    view.handleInput("\r");
+    view.handleInput("\r");
+    view.handleInput("\x1b[B");
+    view.handleInput("\r");
+    view.handleInput("\r");
+    view.receiveError({
+      code: "invite_invalid",
+      message: "邀请码不正确",
+      requestId: "join-1",
+    });
+    expect(view.render(80).join("\n")).toContain("输入群组邀请码");
+
+    type(view, "ABCDE-FGHJK");
+    view.handleInput("\r");
+    expect(joinGroup).toHaveBeenLastCalledWith(
+      "nearby",
+      "Alice",
+      "Alice-Pi",
+      "ABCDEFGHJK",
+    );
   });
 
   it("将当前用户放右侧，其余用户和所有 Agent 放左侧", () => {

@@ -18,6 +18,7 @@ import {
   createCommsExtension,
   formatAgentRequest,
 } from "../src/extension/index.js";
+import type { ConnectionConfig } from "../src/extension/connection-config.js";
 
 type EventHandler = (event: any, ctx: ExtensionContext) => Promise<any> | any;
 type CommandHandler = (
@@ -144,6 +145,7 @@ describe("Pi Extension 群组接入", () => {
     sessionId: string,
     branch: unknown[] = [],
     startBroker: () => Promise<void> | void = () => {},
+    connectionConfig?: ConnectionConfig,
   ) {
     const pi = new FakePi();
     const context = createFakeContext(sessionId, branch);
@@ -153,6 +155,7 @@ describe("Pi Extension 群组接入", () => {
       resultRetryIntervalMs: 20,
       registerTestCommands: true,
       startBroker,
+      connectionConfig,
     })(pi.api);
     return { pi, ...context };
   }
@@ -281,6 +284,27 @@ describe("Pi Extension 群组接入", () => {
     ]);
     await Promise.all(candidates.map((candidate) => candidate.close()));
     broker = undefined;
+  });
+
+  it("远程模式连接失败后绝不启动本机 Broker", async () => {
+    endpoint = { host: "127.0.0.1", port: await freePort() };
+    let starts = 0;
+    const remote = setup(
+      "remote-session",
+      [],
+      () => { starts += 1; },
+      {
+        mode: "lan-client",
+        endpoint,
+        groupId: "group-a",
+        inviteCode: "ABCDEFGHJK",
+      },
+    );
+    await start(remote);
+    await command(remote, "comms-members");
+    expect(starts).toBe(0);
+    expect(remote.notices.at(-1)?.type).toBe("error");
+    await remote.pi.emit("session_shutdown", remote.ctx);
   });
 
   it("@Agent 只注入目标，并使用确定的群聊上下文格式", async () => {
@@ -431,8 +455,8 @@ describe("Pi Extension 群组接入", () => {
     await launchBroker(endpoint);
     await waitFor(
       () =>
-        a.notices.some((notice) => notice.message.includes("Broker 已重启")) &&
-        b.notices.some((notice) => notice.message.includes("Broker 已重启")),
+        a.notices.some((notice) => notice.message.includes("群聊服务已重启")) &&
+        b.notices.some((notice) => notice.message.includes("群聊服务已重启")),
       "重启后未恢复连接",
     );
     expect(b.aborted()).toBe(1);

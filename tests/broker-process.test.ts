@@ -5,6 +5,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { brokerLockPath } from "../src/broker/process-lock.js";
+import {
+  startLanHostBroker,
+  startLocalBroker,
+  stopBroker,
+} from "../src/extension/broker-process.js";
 import { probeBroker } from "../src/transport/broker-probe.js";
 
 interface ChildRecord {
@@ -51,15 +56,47 @@ describe("Broker 跨进程竞争", () => {
     await expect(owner?.exit).resolves.toBe(0);
     await expect(access(brokerLockPath(dbPath))).rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  it("使用统一 launcher 从本机模式优雅切换为局域网主机", async () => {
+    directory = await mkdtemp(join(tmpdir(), "pi-comms-switch-"));
+    const dbPath = join(directory, "comms.db");
+    const endpoint = { host: "127.0.0.1", port: await freePort() };
+    const originalCwd = process.cwd();
+    process.chdir(directory);
+    try {
+      await startLocalBroker(endpoint, dbPath);
+      const local = await probeBroker(endpoint);
+      expect(local).toMatchObject({
+        status: "compatible",
+        brokerMode: "local",
+      });
+      if (local.status !== "compatible") throw new Error("本机 Broker 未启动");
+
+      await startLanHostBroker(endpoint, dbPath);
+      const host = await probeBroker(endpoint);
+      expect(host).toMatchObject({
+        status: "compatible",
+        brokerId: local.brokerId,
+        brokerMode: "lan-host",
+      });
+      if (host.status !== "compatible") throw new Error("局域网 Broker 未启动");
+      expect(host.brokerInstanceId).not.toBe(local.brokerInstanceId);
+    } finally {
+      if ((await probeBroker(endpoint)).status === "compatible") {
+        await stopBroker(endpoint);
+      }
+      process.chdir(originalCwd);
+    }
+  }, 20_000);
 });
 
 function startBrokerProcess(port: number, dbPath: string): ChildRecord {
   const child = spawn(process.execPath, [
     "--import",
     "tsx",
-    resolve("src/broker/server.ts"),
-    "--host",
-    "127.0.0.1",
+    resolve("src/broker/launcher.ts"),
+    "--mode",
+    "local",
     "--port",
     String(port),
     "--db",

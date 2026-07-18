@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
@@ -10,7 +11,7 @@ import type {
   MessageStatus,
   PausedChainPayload,
 } from "../protocol.js";
-import type { Group } from "../types.js";
+import type { Group, GroupSettings, GroupVisibility } from "../types.js";
 import { createSessionKey, type SessionKey } from "../session-key.js";
 import { loadOrCreateDeviceId } from "../device-identity.js";
 
@@ -54,6 +55,23 @@ export interface StoredPausedChain extends PausedChainPayload {
   targetAgentId: string;
 }
 
+export interface StoredGroup extends GroupSettings {
+  ownerSessionKey: string;
+  ownerCredentialHash: string;
+  inviteCodeHash?: string;
+}
+
+export interface StoredMembership {
+  groupId: string;
+  sessionKey: SessionKey;
+  userName: string;
+  agentName: string;
+  credentialHash: string;
+  status: "active" | "removed";
+  createdAt: number;
+  lastActiveAt: number;
+}
+
 export class BrokerDatabase {
   readonly #db: Database.Database;
 
@@ -91,12 +109,53 @@ export class BrokerDatabase {
     };
   }
 
+  brokerId(): string {
+    const row = this.#db
+      .prepare("SELECT value FROM broker_metadata WHERE key = 'broker_id'")
+      .get() as { value: string } | undefined;
+    if (row !== undefined) return row.value;
+    const brokerId = randomUUID();
+    this.#db
+      .prepare("INSERT INTO broker_metadata (key, value) VALUES ('broker_id', ?)")
+      .run(brokerId);
+    return brokerId;
+  }
+
   groups(): Group[] {
     return this.#db
       .prepare(
         "SELECT group_id AS groupId, group_name AS groupName FROM groups ORDER BY created_at",
       )
       .all() as Group[];
+  }
+
+  storedGroups(): StoredGroup[] {
+    return this.#db.prepare(
+      `SELECT group_id AS groupId, group_name AS groupName,
+              owner_session_key AS ownerSessionKey,
+              owner_credential_hash AS ownerCredentialHash,
+              invite_code_hash AS inviteCodeHash,
+              visibility,
+              keep_available_when_empty AS keepAvailableWhenEmpty,
+              open_at_login AS openAtLogin
+         FROM groups
+        ORDER BY created_at`,
+    ).all().map((row) => mapStoredGroup(row as StoredGroupRow));
+  }
+
+  storedGroup(groupId: string): StoredGroup | undefined {
+    const row = this.#db.prepare(
+      `SELECT group_id AS groupId, group_name AS groupName,
+              owner_session_key AS ownerSessionKey,
+              owner_credential_hash AS ownerCredentialHash,
+              invite_code_hash AS inviteCodeHash,
+              visibility,
+              keep_available_when_empty AS keepAvailableWhenEmpty,
+              open_at_login AS openAtLogin
+         FROM groups
+        WHERE group_id = ?`,
+    ).get(groupId) as StoredGroupRow | undefined;
+    return row === undefined ? undefined : mapStoredGroup(row);
   }
 
   insertGroup(group: Group): void {
@@ -111,6 +170,234 @@ export class BrokerDatabase {
         normalizeName(group.groupName),
         Date.now(),
       );
+  }
+
+  insertOwnedGroup(
+    group: Group,
+    options: {
+      ownerSessionKey: SessionKey;
+      ownerCredentialHash: string;
+      visibility: GroupVisibility;
+      inviteCodeHash?: string;
+      userName: string;
+      agentName: string;
+      membershipCredentialHash: string;
+    },
+  ): void {
+    const now = Date.now();
+    this.#db.transaction(() => {
+      this.#db.prepare(
+        `INSERT INTO groups (
+           group_id, group_name, normalized_name, owner_session_key,
+           owner_credential_hash, invite_code_hash, visibility,
+           keep_available_when_empty, open_at_login, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`,
+      ).run(
+        group.groupId,
+        group.groupName,
+        normalizeName(group.groupName),
+        options.ownerSessionKey,
+        options.ownerCredentialHash,
+        options.inviteCodeHash ?? null,
+        options.visibility,
+        now,
+        now,
+      );
+      this.#insertMembership({
+        groupId: group.groupId,
+        sessionKey: options.ownerSessionKey,
+        userName: options.userName,
+        agentName: options.agentName,
+        credentialHash: options.membershipCredentialHash,
+        status: "active",
+        createdAt: now,
+        lastActiveAt: now,
+      });
+    })();
+  }
+
+  membership(groupId: string, sessionKey: SessionKey): StoredMembership | undefined {
+    const row = this.#db.prepare(
+      `SELECT group_id AS groupId, session_key AS sessionKey,
+              user_name AS userName, agent_name AS agentName,
+              credential_hash AS credentialHash, status,
+              created_at AS createdAt, last_active_at AS lastActiveAt
+         FROM group_memberships
+        WHERE group_id = ? AND session_key = ?`,
+    ).get(groupId, sessionKey) as StoredMembership | undefined;
+    return row;
+  }
+
+  membershipByCredential(
+    groupId: string,
+    credentialHash: string,
+  ): StoredMembership | undefined {
+    return this.#db.prepare(
+      `SELECT group_id AS groupId, session_key AS sessionKey,
+              user_name AS userName, agent_name AS agentName,
+              credential_hash AS credentialHash, status,
+              created_at AS createdAt, last_active_at AS lastActiveAt
+         FROM group_memberships
+        WHERE group_id = ? AND credential_hash = ?`,
+    ).get(groupId, credentialHash) as StoredMembership | undefined;
+  }
+
+  memberships(groupId: string): StoredMembership[] {
+    return this.#db.prepare(
+      `SELECT group_id AS groupId, session_key AS sessionKey,
+              user_name AS userName, agent_name AS agentName,
+              credential_hash AS credentialHash, status,
+              created_at AS createdAt, last_active_at AS lastActiveAt
+         FROM group_memberships
+        WHERE group_id = ?
+        ORDER BY created_at`,
+    ).all(groupId) as StoredMembership[];
+  }
+
+  insertMembership(
+    membership: Omit<StoredMembership, "createdAt" | "lastActiveAt" | "status">,
+  ): void {
+    const now = Date.now();
+    this.#insertMembership({
+      ...membership,
+      status: "active",
+      createdAt: now,
+      lastActiveAt: now,
+    });
+  }
+
+  touchMembership(groupId: string, sessionKey: SessionKey): void {
+    this.#db.prepare(
+      `UPDATE group_memberships
+          SET last_active_at = ?
+        WHERE group_id = ? AND session_key = ? AND status = 'active'`,
+    ).run(Date.now(), groupId, sessionKey);
+  }
+
+  deleteMembership(groupId: string, sessionKey: SessionKey): void {
+    this.#db.prepare(
+      "DELETE FROM group_memberships WHERE group_id = ? AND session_key = ?",
+    ).run(groupId, sessionKey);
+  }
+
+  setMembershipStatus(
+    groupId: string,
+    sessionKey: SessionKey,
+    status: "active" | "removed",
+  ): void {
+    this.#db.prepare(
+      "UPDATE group_memberships SET status = ?, last_active_at = ? WHERE group_id = ? AND session_key = ?",
+    ).run(status, Date.now(), groupId, sessionKey);
+  }
+
+  isMemberNameAvailable(
+    groupId: string,
+    userName: string,
+    agentName: string,
+    exceptSessionKey?: SessionKey,
+  ): boolean {
+    const names = [normalizeName(userName), normalizeName(agentName)];
+    const row = this.#db.prepare(
+      `SELECT 1
+         FROM group_memberships
+        WHERE group_id = ?
+          AND status = 'active'
+          AND session_key <> ?
+          AND (
+            normalized_user_name IN (?, ?)
+            OR normalized_agent_name IN (?, ?)
+          )
+        LIMIT 1`,
+    ).get(groupId, exceptSessionKey ?? "", ...names, ...names);
+    return row === undefined;
+  }
+
+  updateGroupInvite(
+    groupId: string,
+    visibility: GroupVisibility,
+    inviteCodeHash?: string,
+  ): void {
+    this.#db.prepare(
+      `UPDATE groups
+          SET visibility = ?, invite_code_hash = ?,
+              keep_available_when_empty = CASE WHEN ? = 'local' THEN 0 ELSE keep_available_when_empty END,
+              open_at_login = CASE WHEN ? = 'local' THEN 0 ELSE open_at_login END,
+              updated_at = ?
+        WHERE group_id = ?`,
+    ).run(
+      visibility,
+      inviteCodeHash ?? null,
+      visibility,
+      visibility,
+      Date.now(),
+      groupId,
+    );
+  }
+
+  updateGroupAvailability(
+    groupId: string,
+    keepAvailableWhenEmpty: boolean,
+    openAtLogin: boolean,
+  ): void {
+    this.#db.prepare(
+      `UPDATE groups
+          SET keep_available_when_empty = ?, open_at_login = ?, updated_at = ?
+        WHERE group_id = ?`,
+    ).run(
+      keepAvailableWhenEmpty ? 1 : 0,
+      openAtLogin ? 1 : 0,
+      Date.now(),
+      groupId,
+    );
+  }
+
+  updateGroupName(groupId: string, groupName: string): void {
+    this.#db.prepare(
+      "UPDATE groups SET group_name = ?, normalized_name = ?, updated_at = ? WHERE group_id = ?",
+    ).run(groupName, normalizeName(groupName), Date.now(), groupId);
+  }
+
+  updateOwner(
+    groupId: string,
+    ownerSessionKey: SessionKey,
+    ownerCredentialHash: string,
+  ): void {
+    this.#db.prepare(
+      `UPDATE groups
+          SET owner_session_key = ?, owner_credential_hash = ?, updated_at = ?
+        WHERE group_id = ?`,
+    ).run(ownerSessionKey, ownerCredentialHash, Date.now(), groupId);
+  }
+
+  deleteGroup(groupId: string): void {
+    this.#db.transaction(() => {
+      this.#db.prepare("DELETE FROM paused_chains WHERE group_id = ?").run(groupId);
+      this.#db.prepare("DELETE FROM agent_requests WHERE group_id = ?").run(groupId);
+      this.#db.prepare("DELETE FROM messages WHERE group_id = ?").run(groupId);
+      this.#db.prepare("DELETE FROM group_memberships WHERE group_id = ?").run(groupId);
+      this.#db.prepare("DELETE FROM groups WHERE group_id = ?").run(groupId);
+    })();
+  }
+
+  #insertMembership(membership: StoredMembership): void {
+    this.#db.prepare(
+      `INSERT INTO group_memberships (
+         group_id, session_key, user_name, normalized_user_name,
+         agent_name, normalized_agent_name, credential_hash, status,
+         created_at, last_active_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      membership.groupId,
+      membership.sessionKey,
+      membership.userName,
+      normalizeName(membership.userName),
+      membership.agentName,
+      normalizeName(membership.agentName),
+      membership.credentialHash,
+      membership.status,
+      membership.createdAt,
+      membership.lastActiveAt,
+    );
   }
 
   hasMessage(messageId: string): boolean {
@@ -588,10 +875,61 @@ export class BrokerDatabase {
 
   #migrate(): void {
     const version = this.#db.pragma("user_version", { simple: true }) as number;
-    if (version > 4) {
+    if (version > 6) {
       throw new Error(`数据库版本不受支持：${version}`);
     }
+    if (version === 6) {
+      return;
+    }
+    if (version === 5) {
+      const groupColumns = this.#db.prepare("PRAGMA table_info(groups)").all() as Array<{
+        name: string;
+      }>;
+      if (groupColumns.some((column) => column.name === "owner_session_key")) {
+        this.#db.pragma("user_version = 6");
+        return;
+      }
+      this.#db.exec(`
+        BEGIN;
+        ALTER TABLE groups ADD COLUMN owner_session_key TEXT NOT NULL DEFAULT '';
+        ALTER TABLE groups ADD COLUMN owner_credential_hash TEXT NOT NULL DEFAULT '';
+        ALTER TABLE groups ADD COLUMN invite_code_hash TEXT;
+        ALTER TABLE groups ADD COLUMN visibility TEXT NOT NULL DEFAULT 'local'
+          CHECK (visibility IN ('local', 'nearby'));
+        ALTER TABLE groups ADD COLUMN keep_available_when_empty INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE groups ADD COLUMN open_at_login INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE groups ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE group_memberships (
+          group_id TEXT NOT NULL REFERENCES groups(group_id),
+          session_key TEXT NOT NULL,
+          user_name TEXT NOT NULL,
+          normalized_user_name TEXT NOT NULL,
+          agent_name TEXT NOT NULL,
+          normalized_agent_name TEXT NOT NULL,
+          credential_hash TEXT NOT NULL UNIQUE,
+          status TEXT NOT NULL CHECK (status IN ('active', 'removed')),
+          created_at INTEGER NOT NULL,
+          last_active_at INTEGER NOT NULL,
+          PRIMARY KEY (group_id, session_key)
+        );
+        CREATE INDEX group_memberships_group_status_idx
+          ON group_memberships(group_id, status, last_active_at DESC);
+        PRAGMA user_version = 6;
+        COMMIT;
+      `);
+      return;
+    }
     if (version === 4) {
+      this.#db.exec(`
+        BEGIN;
+        CREATE TABLE IF NOT EXISTS broker_metadata (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        PRAGMA user_version = 5;
+        COMMIT;
+      `);
+      this.#migrate();
       return;
     }
     if (version === 3) {
@@ -625,6 +963,7 @@ export class BrokerDatabase {
         }
         this.#db.pragma("user_version = 4");
       })();
+      this.#migrate();
       return;
     }
     if (version === 2) {
@@ -729,7 +1068,29 @@ export class BrokerDatabase {
         group_id TEXT PRIMARY KEY,
         group_name TEXT NOT NULL,
         normalized_name TEXT NOT NULL UNIQUE,
-        created_at INTEGER NOT NULL
+        owner_session_key TEXT NOT NULL DEFAULT '',
+        owner_credential_hash TEXT NOT NULL DEFAULT '',
+        invite_code_hash TEXT,
+        visibility TEXT NOT NULL DEFAULT 'local'
+          CHECK (visibility IN ('local', 'nearby')),
+        keep_available_when_empty INTEGER NOT NULL DEFAULT 0,
+        open_at_login INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE TABLE group_memberships (
+        group_id TEXT NOT NULL REFERENCES groups(group_id),
+        session_key TEXT NOT NULL,
+        user_name TEXT NOT NULL,
+        normalized_user_name TEXT NOT NULL,
+        agent_name TEXT NOT NULL,
+        normalized_agent_name TEXT NOT NULL,
+        credential_hash TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL CHECK (status IN ('active', 'removed')),
+        created_at INTEGER NOT NULL,
+        last_active_at INTEGER NOT NULL,
+        PRIMARY KEY (group_id, session_key)
       );
 
       CREATE TABLE messages (
@@ -797,6 +1158,11 @@ export class BrokerDatabase {
         paused_at INTEGER NOT NULL
       );
 
+      CREATE TABLE broker_metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
       CREATE INDEX messages_group_time_idx
         ON messages(group_id, timestamp DESC);
       CREATE INDEX agent_requests_group_status_idx
@@ -805,7 +1171,9 @@ export class BrokerDatabase {
         ON agent_requests(chain_id, round);
       CREATE INDEX paused_chains_owner_group_idx
         ON paused_chains(initiator_session_key, group_id, paused_at DESC);
-      PRAGMA user_version = 4;
+      CREATE INDEX group_memberships_group_status_idx
+        ON group_memberships(group_id, status, last_active_at DESC);
+      PRAGMA user_version = 6;
       COMMIT;
     `);
   }
@@ -828,5 +1196,29 @@ export function historyMessage(
 }
 
 function normalizeName(name: string): string {
-  return name.toLocaleLowerCase();
+  return name.toLocaleLowerCase("en-US");
+}
+
+interface StoredGroupRow {
+  groupId: string;
+  groupName: string;
+  ownerSessionKey: string;
+  ownerCredentialHash: string;
+  inviteCodeHash: string | null;
+  visibility: GroupVisibility;
+  keepAvailableWhenEmpty: number;
+  openAtLogin: number;
+}
+
+function mapStoredGroup(row: StoredGroupRow): StoredGroup {
+  return {
+    groupId: row.groupId,
+    groupName: row.groupName,
+    ownerSessionKey: row.ownerSessionKey,
+    ownerCredentialHash: row.ownerCredentialHash,
+    ...(row.inviteCodeHash === null ? {} : { inviteCodeHash: row.inviteCodeHash }),
+    visibility: row.visibility,
+    keepAvailableWhenEmpty: row.keepAvailableWhenEmpty === 1,
+    openAtLogin: row.openAtLogin === 1,
+  };
 }

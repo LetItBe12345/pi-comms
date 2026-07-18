@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createBrokerServer, type BrokerServer } from "../src/broker/server.js";
+import {
+  readBrokerRuntimeMetadata,
+  writeBrokerRuntimeMetadata,
+} from "../src/broker/runtime-metadata.js";
 import { BrokerClient } from "../src/extension/broker-client.js";
 import {
   BROKER_PROTOCOL_VERSION,
@@ -60,8 +64,142 @@ describe("TCP Broker 握手", () => {
 
     await expect(probeBroker(broker.endpoint)).resolves.toEqual({
       status: "compatible",
+      brokerId: broker.brokerId,
       brokerInstanceId: broker.instanceId,
+      brokerMode: "local",
     });
+  });
+
+  it("连接握手不再使用设备级共享邀请码", async () => {
+    directory = await mkdtemp(join(tmpdir(), "pi-comms-invite-"));
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath: join(directory, "comms.db"),
+      mode: "lan-host",
+    });
+    await broker.start();
+    const received: BrokerEnvelope[] = [];
+    const missing = new BrokerClient({
+      endpoint: broker.endpoint,
+      deviceId: "00000000-0000-4000-8000-000000000010",
+      onMessage: (message) => received.push(message),
+      onDisconnected() {},
+    });
+    await expect(missing.start("missing-invite")).resolves.toBe(true);
+    await missing.stop();
+
+    const wrong = new BrokerClient({
+      endpoint: broker.endpoint,
+      deviceId: "00000000-0000-4000-8000-000000000011",
+      onMessage: (message) => received.push(message),
+      onDisconnected() {},
+    });
+    await expect(wrong.start("wrong-invite")).resolves.toBe(true);
+    expect(received.some((message) => message.type === "snapshot")).toBe(true);
+    await wrong.stop();
+
+    const correct = new BrokerClient({
+      endpoint: broker.endpoint,
+      deviceId: "00000000-0000-4000-8000-000000000012",
+      onMessage() {},
+      onDisconnected() {},
+    });
+    await expect(correct.start("correct-invite")).resolves.toBe(true);
+    await correct.stop();
+  });
+
+  it("主机本机连接免邀请码", async () => {
+    directory = await mkdtemp(join(tmpdir(), "pi-comms-loopback-"));
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath: join(directory, "comms.db"),
+      mode: "lan-host",
+    });
+    await broker.start();
+    const local = new BrokerClient({
+      endpoint: broker.endpoint,
+      deviceId: "00000000-0000-4000-8000-000000000013",
+      onMessage() {},
+      onDisconnected() {},
+    });
+    await expect(local.start("host-local")).resolves.toBe(true);
+    await local.stop();
+  });
+
+  it("旧设备邀请码不会影响连接结果", async () => {
+    directory = await mkdtemp(join(tmpdir(), "pi-comms-rate-"));
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath: join(directory, "comms.db"),
+      mode: "lan-host",
+    });
+    await broker.start();
+    const client = new BrokerClient({
+      endpoint: broker.endpoint,
+      deviceId: "00000000-0000-4000-8000-000000000020",
+      onMessage() {},
+      onDisconnected() {},
+    });
+    await expect(client.start("old-device-invite")).resolves.toBe(true);
+    expect(client.lastError).toBeUndefined();
+    await client.stop();
+  });
+
+  it("保存的 brokerId 不匹配时拒绝连接", async () => {
+    directory = await mkdtemp(join(tmpdir(), "pi-comms-identity-"));
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath: join(directory, "comms.db"),
+    });
+    await broker.start();
+    const client = new BrokerClient({
+      endpoint: broker.endpoint,
+      expectedBrokerId: "00000000-0000-4000-8000-000000000099",
+      deviceId: "00000000-0000-4000-8000-000000000014",
+      onMessage() {},
+      onDisconnected() {},
+    });
+    await expect(client.start("wrong-space")).resolves.toBe(false);
+    expect(client.lastError).toBe("附近设备信息已变化，请重新查找");
+    await client.stop();
+  });
+
+  it("brokerId 跨重启稳定，并安全覆盖和清理运行元数据", async () => {
+    directory = await mkdtemp(join(tmpdir(), "pi-comms-runtime-"));
+    const dbPath = join(directory, "comms.db");
+    await writeBrokerRuntimeMetadata(dbPath, {
+      brokerId: "stale",
+      brokerInstanceId: "stale",
+      pid: 999_999,
+      host: "127.0.0.1",
+      port: 1,
+      mode: "local",
+      startedAt: 1,
+    });
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath,
+    });
+    await broker.start();
+    const brokerId = broker.brokerId;
+    await expect(readBrokerRuntimeMetadata(dbPath)).resolves.toMatchObject({
+      brokerId,
+      brokerInstanceId: broker.instanceId,
+      pid: process.pid,
+      host: "127.0.0.1",
+      port: broker.endpoint.port,
+      mode: "local",
+    });
+    await broker.close();
+    broker = undefined;
+    await expect(readBrokerRuntimeMetadata(dbPath)).resolves.toBeUndefined();
+
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath,
+    });
+    await broker.start();
+    expect(broker.brokerId).toBe(brokerId);
   });
 
   it("拒绝未先完成 probe 的 client.hello", async () => {

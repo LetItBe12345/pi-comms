@@ -11,6 +11,7 @@
 - [进行中的 TODO](./TODO/in-progress/README.md)：存放尚未完成或正在实施的任务。
 - [已完成的 TODO](./TODO/done/README.md)：存放已经满足完成条件的任务，作为实施记录。
 - [发布](./RELEASE.md)：说明 Pi Package 的发布路线、安装命令和 `package.json` 发布要求。
+- [领域语言](./docs/CONTEXT.md)：统一群组、群主、长期成员、附近加入和 Broker 的产品术语。
 - [旧 TODO 入口](./TODO(1).md)：仅用于兼容旧链接，并导航到 Specification 和 TODO 总览；不要在这里新增任务。
 
 ### TODO 状态规则
