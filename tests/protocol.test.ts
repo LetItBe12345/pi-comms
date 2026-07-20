@@ -203,6 +203,27 @@ describe("客户端消息校验", () => {
     ).toBe(true);
     expect(
       parseClientEnvelope(
+        createEnvelope("group.create", {
+          groupName: "受限开发组",
+          userName: "Alice",
+          agentName: "Alice-Pi",
+          visibility: "nearby",
+          inviteRequired: true,
+        }),
+      ).ok,
+    ).toBe(true);
+    expect(
+      parseClientEnvelope(
+        createEnvelope("group.create", {
+          groupName: "错误开发组",
+          userName: "Alice",
+          agentName: "Alice-Pi",
+          inviteRequired: "yes",
+        }),
+      ).ok,
+    ).toBe(false);
+    expect(
+      parseClientEnvelope(
         createEnvelope("group.join", {
           groupId: "group-a",
           userName: "Bob",

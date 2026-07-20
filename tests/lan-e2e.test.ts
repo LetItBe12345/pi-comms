@@ -108,25 +108,20 @@ describe("单机网络栈三 Session 模拟", () => {
         throw new Error("未获得群组快照");
       }
       const groupId = aliceSnapshot.payload.group.groupId;
-      const welcome = await alice.waitFor(
+      await alice.waitFor(
         (message) => message.type === "membership.welcome" &&
           message.payload.groupId === groupId,
-        "Alice 获得群组邀请",
+        "Alice 获得群组身份",
       );
-      if (welcome.type !== "membership.welcome" || welcome.payload.inviteCode === undefined) {
-        throw new Error("未获得群组邀请码");
-      }
       bob.send("group.join", {
         groupId,
         userName: "Bob",
         agentName: "Bob-Pi",
-        inviteCode: welcome.payload.inviteCode,
       });
       carol.send("group.join", {
         groupId,
         userName: "Carol",
         agentName: "Carol-Pi",
-        inviteCode: welcome.payload.inviteCode,
       });
       await Promise.all([
         bob.waitFor(

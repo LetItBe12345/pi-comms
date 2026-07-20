@@ -21,31 +21,37 @@ export type ConnectionConfig =
 export function parseInvitation(value: string): {
   endpoint: TcpConnectEndpoint;
   groupId: string;
-  inviteCode: string;
+  inviteCode?: string;
 } {
   const match = value.trim().match(
-    /^([^\s:]+):(\d+)\s+([^\s]+)\s+([A-Za-z2-9-]+)$/,
+    /^([^\s:]+):(\d+)\s+([^\s]+)(?:\s+([A-Za-z2-9-]+))?$/,
   );
   if (match === null) {
     throw new Error(
-      "请粘贴完整群组邀请，例如 192.168.1.23:43127 群组ID ABCDE-FGHIJ",
+      "请粘贴完整加入信息，例如 192.168.1.23:43127 群组ID [邀请码]",
     );
   }
-  const inviteCode = normalizeInviteCode(match[4]);
-  if (inviteCode.length !== 10) throw new Error("邀请码应为 10 位");
+  const inviteCode = match[4] === undefined
+    ? undefined
+    : normalizeInviteCode(match[4]);
+  if (inviteCode !== undefined && inviteCode.length !== 10) {
+    throw new Error("邀请码应为 10 位");
+  }
   return {
     endpoint: validateConnectEndpoint({ host: match[1], port: Number(match[2]) }),
     groupId: match[3],
-    inviteCode,
+    ...(inviteCode === undefined ? {} : { inviteCode }),
   };
 }
 
 export function formatInvitation(
   endpoint: TcpConnectEndpoint,
   groupId: string,
-  inviteCode: string,
+  inviteCode?: string,
 ): string {
-  return `${endpoint.host}:${endpoint.port} ${groupId} ${formatInviteCode(inviteCode)}`;
+  return `${endpoint.host}:${endpoint.port} ${groupId}${
+    inviteCode === undefined ? "" : ` ${formatInviteCode(inviteCode)}`
+  }`;
 }
 
 export function restoreConnectionConfig(entries: unknown[]): ConnectionConfig | undefined {

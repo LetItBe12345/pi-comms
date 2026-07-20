@@ -9,12 +9,14 @@ export interface Group {
 
 export interface GroupSummary extends Group {
   onlineSessionCount: number;
+  inviteRequired?: boolean;
 }
 
 export type GroupVisibility = "local" | "nearby";
 
 export interface GroupSettings extends Group {
   visibility: GroupVisibility;
+  inviteRequired: boolean;
   keepAvailableWhenEmpty: boolean;
   openAtLogin: boolean;
 }
