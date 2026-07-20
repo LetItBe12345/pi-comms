@@ -233,5 +233,5 @@
 
 ## 下一阶段
 
-- [阶段 16A：跨平台自动化与局域网验收准备](../in-progress/16a-cross-platform-automation.md)
+- [阶段 16A：跨平台自动化与局域网验收准备](./16a-cross-platform-automation.md)
 - [阶段 16B：三台真实设备局域网验收](../in-progress/16b-real-lan-acceptance.md)
