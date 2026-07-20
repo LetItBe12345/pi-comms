@@ -217,15 +217,35 @@ function createBonjour(
   interfaceAddress?: string,
   onError?: (error: Error) => void,
 ): Bonjour {
-  const options = interfaceAddress === undefined
-    ? {}
-    : { interface: interfaceAddress };
-  return new Bonjour(
-    options as never,
-    (error: unknown) => onError?.(
-      error instanceof Error ? error : new Error(String(error)),
-    ),
+  const reportError = (error: unknown) => onError?.(
+    error instanceof Error ? error : new Error(String(error)),
   );
+  const bonjour = new Bonjour(
+    mdnsSocketOptions(interfaceAddress) as never,
+    reportError,
+  );
+  const internals = bonjour as unknown as {
+    server: {
+      mdns: {
+        on(event: "error", listener: (error: unknown) => void): void;
+      };
+    };
+  };
+  internals.server.mdns.on("error", reportError);
+  return bonjour;
+}
+
+export function mdnsSocketOptions(interfaceAddress?: string): {
+  interface?: string;
+  bind?: string;
+  reuseAddr?: boolean;
+} {
+  if (interfaceAddress === undefined) return {};
+  return {
+    interface: interfaceAddress,
+    bind: "0.0.0.0",
+    reuseAddr: true,
+  };
 }
 
 function txtString(value: unknown): string | undefined {

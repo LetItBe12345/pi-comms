@@ -12,6 +12,10 @@ async function main(): Promise<void> {
     return;
   }
   const brokerId = randomUUID();
+  let diagnosticError: Error | undefined;
+  const onError = (error: Error) => {
+    diagnosticError = error;
+  };
   let discovery: BrokerDiscovery | undefined;
   let publisher: ReturnType<typeof publishBrokerMdns> | undefined;
   try {
@@ -19,11 +23,13 @@ async function main(): Promise<void> {
       brokerId,
       port: 43_127,
       interfaceAddress: network.address,
+      onError,
     });
     const found = await new Promise<boolean>((resolveFound) => {
       const timer = setTimeout(() => resolveFound(false), 5_000);
       discovery = new BrokerDiscovery({
         interfaceAddress: network.address,
+        onError,
         onChanged: (brokers) => {
           if (brokers.some((broker) => broker.brokerId === brokerId)) {
             clearTimeout(timer);
@@ -34,6 +40,10 @@ async function main(): Promise<void> {
     });
     if (found) {
       console.log("mDNS 本机发布/浏览诊断通过。");
+    } else if (diagnosticError !== undefined) {
+      warning(
+        `mDNS 诊断跳过：${diagnosticError.message}；真实发现由阶段 16B 验证。`,
+      );
     } else {
       warning("mDNS 诊断跳过：runner 未回送组播；真实发现由阶段 16B 验证。");
     }
