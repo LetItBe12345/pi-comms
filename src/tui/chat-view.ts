@@ -1066,7 +1066,9 @@ export class ChatView implements Component, Focusable {
       {
       value: "leave",
       label: "退出群组",
-      description: "以后需要重新使用邀请码加入",
+      description: settings?.inviteRequired
+        ? "以后需要重新使用邀请码加入"
+        : "以后可以从附近群组重新加入",
       },
       ...members,
     ] : this.#groupSection === "root" ? [
@@ -1088,8 +1090,10 @@ export class ChatView implements Component, Focusable {
       },
       ...(settings.visibility === "nearby" ? [{
         value: "show-invitation",
-        label: "显示群组邀请",
-        description: "复制后可发给其他成员",
+        label: settings.inviteRequired ? "显示群组邀请" : "复制加入信息",
+        description: settings.inviteRequired
+          ? "包含这个群的邀请码"
+          : "对方可以直接加入",
       }] : []),
       {
         value: "visibility",
@@ -1098,13 +1102,14 @@ export class ChatView implements Component, Focusable {
           : "允许附近加入",
         description: settings.visibility === "nearby"
           ? "已有成员以后仍可恢复"
-          : "生成这个群专属的邀请码",
+          : "附近用户可以直接加入",
       },
-      ...(settings.visibility === "nearby" ? [{
+      ...(settings.visibility === "nearby" && settings.inviteRequired ? [{
         value: "rotate",
         label: "生成新的邀请码",
         description: "已有成员不受影响",
-      }, {
+      }] : []),
+      ...(settings.visibility === "nearby" ? [{
         value: "background",
         label: settings.keepAvailableWhenEmpty
           ? "无人在线时暂停附近加入"
@@ -1276,7 +1281,9 @@ export class ChatView implements Component, Focusable {
         value: member.removed ? "allow" : "remove",
         label: member.removed ? "允许重新加入" : "移出并阻止",
         description: member.removed
-          ? "对方仍需使用当前邀请码"
+          ? this.#snapshot?.groupSettings?.inviteRequired
+            ? "对方仍需使用当前邀请码"
+            : "对方之后可以直接重新加入"
           : `同时移出 ${member.displayName} 和其 Agent`,
       },
     ]);

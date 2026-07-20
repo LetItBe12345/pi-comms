@@ -1274,6 +1274,7 @@ function mapStoredGroup(row: StoredGroupRow): StoredGroup {
     ownerCredentialHash: row.ownerCredentialHash,
     ...(row.inviteCodeHash === null ? {} : { inviteCodeHash: row.inviteCodeHash }),
     visibility: row.visibility,
+    inviteRequired: row.inviteCodeHash !== null,
     keepAvailableWhenEmpty: row.keepAvailableWhenEmpty === 1,
     openAtLogin: row.openAtLogin === 1,
   };

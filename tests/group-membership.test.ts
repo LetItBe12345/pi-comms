@@ -92,6 +92,7 @@ describe("每群邀请与长期成员", () => {
       userName: "Alice",
       agentName: "Alice-Pi",
       visibility: "nearby",
+      inviteRequired: true,
     });
     const welcome = await owner.waitFor(
       (message) => message.type === "membership.welcome",
@@ -151,6 +152,74 @@ describe("每群邀请与长期成员", () => {
         expect.objectContaining({ displayName: "Bob" }),
         expect.objectContaining({ displayName: "Bob-Pi" }),
       ]));
+  });
+
+  it("创建时启用邀请码后，远程首次加入不能省略邀请码", async () => {
+    await startBroker();
+    const created = await createNearbyGroup();
+    local = false;
+    const member = new Session(
+      broker!.endpoint,
+      "00000000-0000-4000-8000-000000000219",
+    );
+    sessions.push(member);
+    await member.start("missing-invite");
+    member.send("group.join", {
+      groupId: created.groupId,
+      userName: "Bob",
+      agentName: "Bob-Pi",
+    });
+    const error = await member.waitFor(
+      (message) => message.type === "error" &&
+        message.payload.code === "invite_required",
+    );
+    expect(error.type === "error" && error.payload.message)
+      .toBe("请输入群组邀请码");
+  });
+
+  it("附近群组默认允许直接加入，创建时可明确要求邀请码", async () => {
+    await startBroker();
+    const owner = new Session(
+      broker!.endpoint,
+      "00000000-0000-4000-8000-000000000220",
+    );
+    sessions.push(owner);
+    await owner.start("open-owner");
+    owner.send("group.create", {
+      groupName: "开放开发组",
+      userName: "Alice",
+      agentName: "Alice-Pi",
+      visibility: "nearby",
+    });
+    const created = await owner.waitFor(
+      (message) => message.type === "membership.welcome",
+    );
+    if (created.type !== "membership.welcome") throw new Error("群组创建失败");
+    expect(created.payload.inviteCode).toBeUndefined();
+
+    await expect(fetchGroupCatalog(broker!.endpoint, broker!.brokerId)).resolves
+      .toEqual([
+        expect.objectContaining({
+          groupId: created.payload.groupId,
+          inviteRequired: false,
+        }),
+      ]);
+
+    local = false;
+    const member = new Session(
+      broker!.endpoint,
+      "00000000-0000-4000-8000-000000000221",
+    );
+    sessions.push(member);
+    await member.start("open-member");
+    member.send("group.join", {
+      groupId: created.payload.groupId,
+      userName: "Bob",
+      agentName: "Bob-Pi",
+    });
+    await expect(member.waitFor(
+      (message) => message.type === "membership.welcome",
+    )).resolves.toBeDefined();
   });
 
   it("轮换邀请码不影响已有成员，错误邀请码会进入冷却", async () => {

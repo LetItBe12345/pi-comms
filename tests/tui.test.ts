@@ -9,7 +9,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { ChatView, type ChatViewActions } from "../src/tui/chat-view.js";
-import { GroupPicker } from "../src/tui/group-picker.js";
+import { GroupPicker, RequiredChoice } from "../src/tui/group-picker.js";
 import type { HistoryMessage, SnapshotPayload } from "../src/protocol.js";
 
 class TestTerminal implements Terminal {
@@ -159,6 +159,7 @@ describe("最小群聊 TUI", () => {
       groupId: "group-a",
       groupName: "开发组",
       visibility: "nearby",
+      inviteRequired: false,
       keepAvailableWhenEmpty: false,
       openAtLogin: false,
     };
@@ -176,7 +177,7 @@ describe("最小群聊 TUI", () => {
     view.handleInput("\x1b");
     view.handleInput("\x1b[B");
     view.handleInput("\r");
-    expect(view.render(80).join("\n")).toContain("生成新的邀请码");
+    expect(view.render(80).join("\n")).toContain("复制加入信息");
 
     view.handleInput("\x1b");
     view.handleInput("\x1b");
@@ -630,6 +631,7 @@ describe("群组首屏", () => {
     expect(screen).toContain("已加入");
     expect(screen).toContain("附近群组");
     expect(screen).toContain("R 重新查找");
+    expect(screen).toContain("可直接加入");
 
     picker.handleInput("\x1b[A");
     picker.setNearby([
@@ -650,5 +652,27 @@ describe("群组首屏", () => {
 
     picker.handleInput("r");
     expect(refresh).toHaveBeenCalled();
+  });
+
+  it("创建附近群组时默认选择直接加入", () => {
+    const terminal = new TestTerminal();
+    const tui = new TUI(terminal);
+    const done = vi.fn();
+    const choice = new RequiredChoice({
+      tui,
+      theme,
+      done,
+      initialValue: "open",
+      title: "其他人如何加入？",
+      choices: [
+        { value: "open", label: "直接加入", description: "默认" },
+        { value: "invite", label: "使用邀请码", description: "需要验证" },
+      ],
+    });
+    choice.focused = true;
+
+    expect(choice.render(80).join("\n")).toContain("› 直接加入");
+    choice.handleInput("\r");
+    expect(done).toHaveBeenCalledWith("open");
   });
 });

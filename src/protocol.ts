@@ -89,6 +89,7 @@ export interface GroupCreatePayload {
   userName: string;
   agentName: string;
   visibility?: GroupVisibility;
+  inviteRequired?: boolean;
 }
 
 export interface GroupJoinPayload {
@@ -114,6 +115,7 @@ export interface GroupInviteUpdatedPayload {
   groupId: string;
   inviteCode?: string;
   visibility: GroupVisibility;
+  inviteRequired: boolean;
 }
 
 export interface GroupRenamePayload {
@@ -599,11 +601,16 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
         "agentName",
         ]);
         if (!result.ok) return result;
-        return value.payload.visibility === undefined ||
+        const visibilityValid = value.payload.visibility === undefined ||
           value.payload.visibility === "local" ||
-          value.payload.visibility === "nearby"
+          value.payload.visibility === "nearby";
+        if (!visibilityValid) {
+          return invalid("invalid_payload", "group.create visibility 无效", requestId);
+        }
+        return value.payload.inviteRequired === undefined ||
+            typeof value.payload.inviteRequired === "boolean"
           ? result
-          : invalid("invalid_payload", "group.create visibility 无效", requestId);
+          : invalid("invalid_payload", "group.create inviteRequired 无效", requestId);
       }
     case "group.join": {
       const payload = value.payload;

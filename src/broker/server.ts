@@ -20,6 +20,7 @@ import {
   type ClientHelloEnvelope,
   type Envelope,
   type ErrorPayload,
+  type GroupCreatePayload,
   type GroupJoinPayload,
   type HistoryMessage,
   type PausedChainPayload,
@@ -654,13 +655,10 @@ export function createBrokerServer(
     }
     if (envelope.type === "group.visibility.update") {
       if (!requireOwner(sessionKey, socket, envelope.id, envelope.payload)) return;
-      const inviteCode = envelope.payload.visibility === "nearby"
-        ? generateInviteCode()
-        : undefined;
       db().updateGroupInvite(
         envelope.payload.groupId,
         envelope.payload.visibility,
-        inviteCode === undefined ? undefined : hashSecret(inviteCode),
+        undefined,
       );
       if (envelope.payload.visibility === "local") {
         disconnectRemoteGroupMembers(envelope.payload.groupId);
@@ -668,7 +666,7 @@ export function createBrokerServer(
       send(socket, createEnvelope("group.invite.updated", {
         groupId: envelope.payload.groupId,
         visibility: envelope.payload.visibility,
-        ...(inviteCode === undefined ? {} : { inviteCode }),
+        inviteRequired: false,
       }) as BrokerEnvelope);
       sendSnapshotsForGroup(envelope.payload.groupId);
       void refreshNetworkAccess();
@@ -722,11 +720,20 @@ export function createBrokerServer(
         });
         return;
       }
+      if (!group.inviteRequired) {
+        sendError(socket, {
+          code: "invalid_payload",
+          message: "这个群组允许直接加入，没有启用邀请码",
+          requestId: envelope.id,
+        });
+        return;
+      }
       const inviteCode = generateInviteCode();
       db().updateGroupInvite(group.groupId, "nearby", hashSecret(inviteCode));
       send(socket, createEnvelope("group.invite.updated", {
         groupId: group.groupId,
         visibility: "nearby",
+        inviteRequired: true,
         inviteCode,
       }) as BrokerEnvelope);
       return;
@@ -855,12 +862,7 @@ export function createBrokerServer(
     clientId: string,
     socket: Socket,
     requestId: string,
-    payload: {
-      groupName: string;
-      userName: string;
-      agentName: string;
-      visibility?: "local" | "nearby";
-    },
+    payload: GroupCreatePayload,
   ): void {
     if (!isLoopback(socket.remoteAddress)) {
       sendError(socket, {
@@ -885,7 +887,9 @@ export function createBrokerServer(
       const visibility = payload.visibility ?? "local";
       const ownerCredential = createCredential();
       const membershipCredential = createCredential();
-      const inviteCode = visibility === "nearby" ? generateInviteCode() : undefined;
+      const inviteCode = visibility === "nearby" && payload.inviteRequired === true
+        ? generateInviteCode()
+        : undefined;
       db().insertOwnedGroup(
         { groupId, groupName: payload.groupName },
         {
@@ -988,12 +992,20 @@ export function createBrokerServer(
           : normalizeInviteCode(payload.inviteCode);
         const localEnrollment = normalizedInvite === undefined &&
           isLoopback(socket.remoteAddress);
-        if (!localEnrollment && (
-          storedGroup.visibility !== "nearby" ||
-          storedGroup.inviteCodeHash === undefined ||
-          normalizedInvite === undefined ||
-          hashSecret(normalizedInvite) !== storedGroup.inviteCodeHash
-        )) {
+        const remoteEnrollment = !localEnrollment;
+        if (remoteEnrollment && storedGroup.visibility !== "nearby") {
+          rejectInvite(socket, requestId, normalizedInvite !== undefined);
+          return;
+        }
+        if (
+          remoteEnrollment &&
+          storedGroup.inviteRequired &&
+          (
+            normalizedInvite === undefined ||
+            storedGroup.inviteCodeHash === undefined ||
+            hashSecret(normalizedInvite) !== storedGroup.inviteCodeHash
+          )
+        ) {
           rejectInvite(socket, requestId, normalizedInvite !== undefined);
           return;
         }
@@ -1858,6 +1870,7 @@ export function createBrokerServer(
                 groupId: storedGroup.groupId,
                 groupName: storedGroup.groupName,
                 visibility: storedGroup.visibility,
+                inviteRequired: storedGroup.inviteRequired,
                 keepAvailableWhenEmpty: storedGroup.keepAvailableWhenEmpty,
                 openAtLogin: storedGroup.openAtLogin,
               },
@@ -1882,12 +1895,17 @@ export function createBrokerServer(
   }
 
   function nearbyGroupSummaries() {
-    const nearbyIds = new Set(
+    const nearby = new Map(
       db().storedGroups()
         .filter((group) => group.visibility === "nearby")
-        .map((group) => group.groupId),
+        .map((group) => [group.groupId, group] as const),
     );
-    return groups.summaries().filter((group) => nearbyIds.has(group.groupId));
+    return groups.summaries()
+      .filter((group) => nearby.has(group.groupId))
+      .map((group) => ({
+        ...group,
+        inviteRequired: nearby.get(group.groupId)!.inviteRequired,
+      }));
   }
 
   function snapshotMembers(groupId: string): Member[] {

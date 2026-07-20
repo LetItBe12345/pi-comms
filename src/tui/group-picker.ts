@@ -197,7 +197,9 @@ export class GroupPicker implements Component, Focusable {
       .map((group) => ({
         key: `nearby:${group.brokerId}:${group.groupId}`,
         label: group.groupName,
-        description: `${group.onlineSessionCount} 人在线`,
+        description: `${group.onlineSessionCount} 人在线 · ${
+          group.inviteRequired === true ? "需要邀请码" : "可直接加入"
+        }`,
         result: { type: "nearby", group },
       }));
   }
@@ -212,7 +214,7 @@ export class GroupPicker implements Component, Focusable {
       },
       {
         key: "paste",
-        label: "使用邀请信息加入",
+        label: "使用加入信息",
         description: "粘贴后直接定位群组",
         result: { type: "paste" },
       },
@@ -240,6 +242,7 @@ export class RequiredChoice<T extends string> implements Component, Focusable {
     theme: Theme;
     title: string;
     choices: Array<{ value: T; label: string; description: string }>;
+    initialValue?: T;
     done: (value: T | undefined) => void;
   }) {
     this.#tui = options.tui;
@@ -247,6 +250,11 @@ export class RequiredChoice<T extends string> implements Component, Focusable {
     this.#title = options.title;
     this.#choices = options.choices;
     this.#done = options.done;
+    if (options.initialValue !== undefined) {
+      this.#selected = this.#choices.findIndex(
+        (choice) => choice.value === options.initialValue,
+      );
+    }
   }
 
   get focused(): boolean {
@@ -275,7 +283,12 @@ export class RequiredChoice<T extends string> implements Component, Focusable {
   render(width: number): string[] {
     return [
       this.#theme.bold(this.#title),
-      this.#theme.fg("muted", "请明确选择一项"),
+      this.#theme.fg(
+        "muted",
+        this.#selected >= 0
+          ? "↑↓ 可以更改，Enter 使用当前选择"
+          : "请明确选择一项",
+      ),
       "",
       ...this.#choices.map((choice, index) => {
         const selected = index === this.#selected;

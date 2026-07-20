@@ -127,7 +127,11 @@ export function createCommsExtension(
     let cachedUserName = "";
     let cachedAgentName = "";
     let pendingCreate:
-      | { groupName: string; visibility: "local" | "nearby" }
+      | {
+          groupName: string;
+          visibility: "local" | "nearby";
+          inviteRequired: boolean;
+        }
       | undefined;
     let openGroupManagement = false;
     let networkMonitorTimer: ReturnType<typeof setInterval> | undefined;
@@ -302,14 +306,42 @@ export function createCommsExtension(
           await networkAccessStore.confirm(network);
           activeNetworkKey = network.networkKey;
         }
+        const joinMode = visibility === "nearby"
+          ? await ctx.ui.custom<"open" | "invite" | undefined>(
+              (tui, theme, _keybindings, done) => new RequiredChoice({
+                tui,
+                theme,
+                title: "其他人如何加入？",
+                done,
+                initialValue: "open",
+                choices: [
+                  {
+                    value: "open",
+                    label: "直接加入",
+                    description: "默认；附近用户不需要邀请码",
+                  },
+                  {
+                    value: "invite",
+                    label: "使用邀请码",
+                    description: "加入前需要输入这个群的邀请码",
+                  },
+                ],
+              }),
+            )
+          : "open";
+        if (joinMode === undefined) return undefined;
         if (!(await ensureDefaultNames(ctx))) return undefined;
-        pendingCreate = { groupName: groupName.trim(), visibility };
+        pendingCreate = {
+          groupName: groupName.trim(),
+          visibility,
+          inviteRequired: joinMode === "invite",
+        };
         return visibility === "nearby" ? { mode: "lan-host" } : { mode: "local" };
       }
       if (picked.type === "paste") {
         const invitation = await ctx.ui.input(
-          "粘贴群组邀请",
-          "192.168.1.23:43127 群组ID ABCDE-FGHIJ",
+          "粘贴群组加入信息",
+          "192.168.1.23:43127 群组ID [邀请码]",
         );
         if (invitation === undefined) return undefined;
         try {
@@ -320,6 +352,14 @@ export function createCommsExtension(
         }
       }
       const target = picked.group;
+      if (target.inviteRequired !== true) {
+        return {
+          mode: "lan-client",
+          endpoint: target.endpoint,
+          groupId: target.groupId,
+          brokerId: target.brokerId,
+        };
+      }
       const inviteCode = await ctx.ui.input("输入这个群的邀请码", "ABCDE-FGHIJ");
       if (inviteCode === undefined) return undefined;
       try {
@@ -426,7 +466,10 @@ export function createCommsExtension(
             savedMemberships.set(membershipKey(savedMembership), savedMembership);
             pi.appendEntry(MEMBERSHIP_ENTRY, savedMembership);
           }
-          if (message.payload.inviteCode !== undefined) {
+          if (
+            message.payload.inviteRequired &&
+            message.payload.inviteCode !== undefined
+          ) {
             const address = getLanIPv4Addresses()[0];
             if (address !== undefined) {
               ui?.notify(
@@ -438,8 +481,10 @@ export function createCommsExtension(
                 "info",
               );
             }
-          } else {
+          } else if (message.payload.visibility === "local") {
             ui?.notify("已停止附近加入", "info");
+          } else {
+            ui?.notify("附近用户现在可以直接加入", "info");
           }
           return;
         }
@@ -1143,6 +1188,7 @@ export function createCommsExtension(
             userName: cachedUserName,
             agentName: cachedAgentName,
             visibility: pendingCreate.visibility,
+            inviteRequired: pendingCreate.inviteRequired,
           });
           pendingCreate = undefined;
         }
@@ -1251,20 +1297,19 @@ export function createCommsExtension(
                   const address = getLanIPv4Addresses()[0];
                   if (
                     address === undefined ||
-                    currentGroup === undefined ||
-                    savedMembership?.inviteCode === undefined
+                    currentGroup === undefined
                   ) {
                     ctx.ui.notify(
-                      "当前没有可显示的邀请码，请生成新的邀请码",
+                      "当前没有可分享的局域网地址",
                       "warning",
                     );
                     return;
                   }
                   ctx.ui.notify(
-                    `群组邀请：${formatInvitation(
+                    `群组加入信息：${formatInvitation(
                       { host: address, port: endpoint.port },
                       currentGroup.groupId,
-                      savedMembership.inviteCode,
+                      savedMembership?.inviteCode,
                     )}`,
                     "info",
                   );

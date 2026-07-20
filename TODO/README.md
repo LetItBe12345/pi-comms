@@ -31,10 +31,11 @@
 | 15 | [mDNS 自动发现、附近群组与群主管理](./done/15-mdns-discovery-tui.md) | 自动发现群组并管理群主、成员与后台可用性 | done | 阶段 14 |
 | 16A | [跨平台自动化与局域网验收准备](./done/16a-cross-platform-automation.md) | 完成三平台 CI、自动测试和验收工具 | done | 阶段 15 |
 | 16B | [三台真实设备局域网验收](./in-progress/16b-real-lan-acceptance.md) | 使用真实 macOS/Linux 设备验收局域网链路 | in-progress（等待设备） | 阶段 16A |
+| 17 | [附近群组默认开放加入](./in-progress/17-open-nearby-join.md) | 默认直接加入，创建时可选邀请码 | in-progress | 阶段 15 |
 
 ## 当前里程碑
 
-阶段 0～16A 已完成。阶段 16B 等待三台真实设备，不阻塞阶段 16A 合并。
+阶段 0～16A 已完成。阶段 16B 等待三台真实设备；阶段 17 正在实施。
 
 ## 维护规则
 

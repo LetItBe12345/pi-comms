@@ -19,6 +19,16 @@ describe("协作空间连接配置", () => {
       .toBe("192.168.1.23:43127 group-a ABCDE-FGHJK");
   });
 
+  it("开放群组的加入信息不要求邀请码", () => {
+    const parsed = parseInvitation("192.168.1.23:43127 group-open");
+    expect(parsed).toEqual({
+      endpoint: { host: "192.168.1.23", port: 43_127 },
+      groupId: "group-open",
+    });
+    expect(formatInvitation(parsed.endpoint, parsed.groupId))
+      .toBe("192.168.1.23:43127 group-open");
+  });
+
   it("按当前 Session 恢复最后一份连接配置", () => {
     const config = restoreConnectionConfig([
       {
