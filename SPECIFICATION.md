@@ -60,6 +60,7 @@ B 的 Pi Agent 处理消息
 
 - 跨子网、公网和需要中继的通信。
 - Windows。
+- IPv6 和主机名连接。
 - Pi 以外的 Agent Harness。
 - 图片、文件和私聊。
 - 全局可读和 Agent 持续监听所有消息。
@@ -72,9 +73,10 @@ B 的 Pi Agent 处理消息
 - 运行时：Node.js 22.19+。
 - Agent：Pi 正式发行版。
 - Pi 依赖：`@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui`、`typebox`。
-- 通信：Node.js `node:net`、TCP 和 mDNS/DNS-SD；优先局域网 IPv4，必要时回退 IPv6。
+- 通信：Node.js `node:net`、TCP 和 mDNS/DNS-SD；当前正式支持局域网 IPv4。
 - 默认连接端点：`127.0.0.1:43127`。
 - `0.0.0.0` 只能作为监听地址；客户端不能把它作为连接目标。
+- IPv6 和主机名连接暂不支持，输入后必须给出可读提示，不能进入模糊超时。
 - 连接模式分为 `local`、`lan-host` 和 `lan-client`；配置按 Pi Session 保存。
 - 传输协议：JSON Lines。
 - 连接必须先完成 `broker.probe` / `broker.ready` 握手，并严格匹配 `service: pi-comms` 和 `protocolVersion: 4`。

@@ -39,8 +39,12 @@ export function formatEndpoint(endpoint: TcpListenEndpoint | TcpConnectEndpoint)
 }
 
 function validateHost(host: string, listening: boolean): void {
-  if (isIP(host) !== 4) {
-    throw new Error(`TCP host 必须是 IPv4 地址：${host}`);
+  const family = isIP(host);
+  if (family === 6) {
+    throw new Error("当前版本暂不支持 IPv6，请使用普通网络的 IPv4 地址");
+  }
+  if (family !== 4) {
+    throw new Error("当前版本请使用 IPv4 地址，不支持主机名连接");
   }
   if (!listening && host === "0.0.0.0") {
     throw new Error("0.0.0.0 只能作为监听地址");

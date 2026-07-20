@@ -20,3 +20,4 @@
 - [阶段 13：跨设备身份与连接可靠性](./13-device-identity-reliability.md)
 - [阶段 14：局域网 Broker 生命周期与准入](./14-lan-broker-lifecycle.md)
 - [阶段 15：mDNS 自动发现、附近群组与群主管理](./15-mdns-discovery-tui.md)
+- [阶段 16A：跨平台自动化与局域网验收准备](./16a-cross-platform-automation.md)

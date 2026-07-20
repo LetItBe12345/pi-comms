@@ -113,12 +113,12 @@ export async function startBroker(options: {
     ) return;
     if (result.status === "incompatible") {
       throw new Error(
-        `端口上的服务不是兼容的 Pi Comms Broker：${formatEndpoint(endpoint)}`,
+        `当前地址不是可用的 Pi Comms 群聊服务：${formatEndpoint(endpoint)}`,
       );
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   }
-  throw new Error(`启动协作空间超时：${formatEndpoint(endpoint)}`);
+  throw new Error(`启动群聊服务超时：${formatEndpoint(endpoint)}`);
 }
 
 export function brokerCompatibilityAction(
@@ -181,7 +181,7 @@ export async function stopBroker(
     let requested = false;
     const timer = setTimeout(() => {
       socket.destroy();
-      rejectStop(new Error("停止协作空间超时"));
+      rejectStop(new Error("停止群聊服务超时"));
     }, 3_000);
     const finish = (error?: Error) => {
       clearTimeout(timer);
@@ -218,7 +218,7 @@ export async function stopBroker(
     if ((await probeBroker(endpoint)).status === "unreachable") return;
     await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   }
-  throw new Error("协作空间未能完全停止");
+  throw new Error("群聊服务未能完全停止");
 }
 
 async function runMigration(): Promise<void> {

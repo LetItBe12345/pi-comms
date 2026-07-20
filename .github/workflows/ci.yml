@@ -32,6 +32,7 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
+          - macos-15-intel
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
 
@@ -53,6 +54,9 @@ jobs:
 
       - name: Unit and integration tests
         run: npm run test:unit
+
+      - name: Local mDNS diagnostic
+        run: npm run diagnose:mdns
 
       - name: Launcher and multi-session E2E
         run: npm run test:e2e

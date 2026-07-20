@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   FakeBrokerDiscovery,
+  mdnsSocketOptions,
   type DiscoveredBroker,
 } from "../src/discovery/mdns.js";
 import {
@@ -21,6 +22,15 @@ function broker(overrides: Partial<DiscoveredBroker> = {}): DiscoveredBroker {
 }
 
 describe("附近发现", () => {
+  it("绑定通配地址并只在普通网络接口加入组播", () => {
+    expect(mdnsSocketOptions()).toEqual({});
+    expect(mdnsSocketOptions("192.168.1.8")).toEqual({
+      interface: "192.168.1.8",
+      bind: "0.0.0.0",
+      reuseAddr: true,
+    });
+  });
+
   it("假发现器按 brokerId 更新、去重和下线", () => {
     const onChanged = vi.fn();
     const discovery = new FakeBrokerDiscovery(onChanged);

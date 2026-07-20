@@ -33,7 +33,9 @@ describe("TCP 端点", () => {
     expect(() => validateConnectEndpoint({ host: "0.0.0.0", port: 43_127 }))
       .toThrow("只能作为监听地址");
     expect(() => validateConnectEndpoint({ host: "::1", port: 43_127 }))
-      .toThrow("必须是 IPv4");
+      .toThrow("当前版本暂不支持 IPv6");
+    expect(() => validateConnectEndpoint({ host: "pi-comms.local", port: 43_127 }))
+      .toThrow("当前版本请使用 IPv4 地址");
   });
 });
 

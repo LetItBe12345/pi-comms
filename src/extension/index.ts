@@ -766,7 +766,7 @@ export function createCommsExtension(
     function handleResultAck(ack: AgentResultAckPayload): void {
       remoteQueue.acknowledgeResult(ack.requestId);
       if (!ack.accepted) {
-        ui?.notify(`请求 ${ack.requestId} 已被 Broker 清理`, "warning");
+        ui?.notify(`请求 ${ack.requestId} 已被群聊服务清理`, "warning");
       }
     }
 
@@ -1503,7 +1503,7 @@ function restorePermission(ctx: ExtensionContext): AgentPermission {
   return permission;
 }
 
-function restoreMemberships(
+export function restoreMemberships(
   ctx: ExtensionContext,
 ): Map<string, SavedMembership> {
   const memberships = new Map<string, SavedMembership>();

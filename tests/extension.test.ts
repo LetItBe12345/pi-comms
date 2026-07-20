@@ -17,6 +17,7 @@ import type { TcpConnectEndpoint } from "../src/transport/tcp-endpoint.js";
 import {
   createCommsExtension,
   formatAgentRequest,
+  restoreMemberships,
 } from "../src/extension/index.js";
 import type { ConnectionConfig } from "../src/extension/connection-config.js";
 
@@ -30,6 +31,39 @@ interface Notice {
   message: string;
   type?: "info" | "warning" | "error";
 }
+
+it("fork 或 clone 保留普通成员身份但不继承群主管理凭证", () => {
+  const branch = [{
+    type: "custom",
+    customType: "pi-comms-membership",
+    data: {
+      groupId: "group-a",
+      groupName: "开发组",
+      membershipCredential: "member-secret",
+      ownerCredential: "owner-secret",
+      ownerSessionId: "original-session",
+      userName: "Alice",
+      agentName: "Alice-Pi",
+      updatedAt: 1,
+      connection: { mode: "local" },
+    },
+  }];
+  const original = restoreMemberships(
+    createFakeContext("original-session", branch).ctx,
+  ).get("local:group-a");
+  const forked = restoreMemberships(
+    createFakeContext("forked-session", branch).ctx,
+  ).get("local:group-a");
+
+  expect(original).toMatchObject({
+    membershipCredential: "member-secret",
+    ownerCredential: "owner-secret",
+  });
+  expect(forked).toMatchObject({
+    membershipCredential: "member-secret",
+  });
+  expect(forked).not.toHaveProperty("ownerCredential");
+});
 
 class FakePi {
   readonly handlers = new Map<string, EventHandler>();
