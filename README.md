@@ -20,13 +20,70 @@
 - mDNS 附近发现；发现失败时可粘贴完整群组加入信息
 - 短暂离线、Session 重开或网络变化后的长期成员恢复
 
-## 安装
+## 安装 Pi
 
-要求：Linux 或 macOS、Node.js 22、npm 和 Pi 正式发行版。
+Pi Comms 是 Pi Extension。先安装 Pi CLI，再安装本项目。
+
+要求：macOS 或 Ubuntu/Linux、Node.js 22.19+ 且低于 23、npm 和 git。
+
+先确认 Node.js 和 npm：
+
+```bash
+node -v
+npm -v
+```
+
+macOS 上，已有 Node.js 22 时，最简单是直接用 npm 安装 Pi：
+
+```bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+```
+
+Ubuntu 上，可以先安装 Node.js 22，再安装 Pi：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y curl git build-essential python3
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+sudo npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+```
+
+Pi 官方也提供 Linux 和 macOS 通用安装脚本：
+
+```bash
+curl -fsSL https://pi.dev/install.sh | sh
+```
+
+安装后确认 Pi 能启动：
+
+```bash
+pi --version
+```
+
+Pi 的官方安装文档见 <https://pi.dev/docs/latest/quickstart>。
+
+## 安装 Pi Comms
+
+安装最新可用版：
+
+```bash
+pi install https://github.com/LetItBe12345/pi-comms
+```
+
+这个命令跟随 GitHub 仓库默认分支。以后更新到最新可用版：
+
+```bash
+pi update --extensions
+```
+
+如果要固定到当前已发布版本 v0.1.0：
 
 ```bash
 pi install git:github.com/LetItBe12345/pi-comms@v0.1.0
 ```
+
+固定版本不会被 `pi update --extensions` 移到新 Tag。升级固定版本时，需要重新执行带新 Tag 的 `pi install` 命令。
 
 Pi 会从 GitHub 安装 Extension 和运行依赖。本机群聊服务会在首次使用时自动启动，不需要手动运行。
 
