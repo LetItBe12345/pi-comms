@@ -40,7 +40,7 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.10",
-    "@earendil-works/pi-tui": "^0.80.10",
+    "@earendil-works/pi-tui": "^0.81.1",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.20.1",
     "typescript": "^7.0.2",
