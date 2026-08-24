@@ -502,3 +502,122 @@ Proactive: OFF
 - V4 Flash 支持 Thinking / Non-Thinking；本阶段 Router/Freshness 使用 Non-Thinking。
 - 支持 JSON Output；请求使用 `response_format: { "type": "json_object" }`，Prompt 必须明确要求 JSON 并给出 JSON 示例。
 - 官方 V4 Flash 上下文为 1M，但本阶段仍严格限制 Router 输入，避免无意义扩大成本和延迟。
+
+## 21. Proactive 实时权限边界
+
+这一节是硬约束。`proactiveEnabled` 不是加入群组时冻结的配置，也不是 Router batch 的快照；它是由该 Pi Session 的控制用户拥有、由 Broker 实时执行的授权状态。
+
+### 权限归属
+
+- [ ] 只有控制该 Pi Session 的用户可以开启或关闭自己的 Agent Proactive。
+- [ ] Broker 不得自行开启 Proactive。
+- [ ] 群主不得替其他成员开启 Proactive。
+- [ ] 其他用户和其他 Agent 不得修改该状态。
+- [ ] Session 中持久化的值用于 `/resume`、reload 和 reconnect 恢复；连接期间 Broker 当前 `GroupState` 是 Router 的实时授权来源。
+- [ ] 收到 `proactive.update` 后，Broker 立即更新当前 Agent 的 `proactiveEnabled`，之后的新 Router 构建必须立即看到新值。
+
+### Router Context 必须实时生成
+
+Router Context 明确分成两块：
+
+```text
+Recent Group Messages
+- 已发生的公共聊天事实
+- 可以包含当前已经关闭 Proactive 的 Agent 的历史发言
+
+Available Proactive Agents
+- 当前这一刻真正允许被主动选择的 Agent
+- 只包含 online + idle + proactiveEnabled=true
+- 只为这些 Agent 附带 name + description
+```
+
+- [ ] 历史消息不因 Agent 关闭 Proactive 而删除或改写。
+- [ ] 关闭 Proactive 的 Agent 不得出现在 `Available Proactive Agents` 中。
+- [ ] 关闭 Proactive 的 Agent Description 不得继续发送给 DeepSeek Router。
+- [ ] Router 看到的 candidate 集合必须等于当前真正可选择的集合，不能包含“虽然关闭但仅供模型参考”的 Agent。
+- [ ] 如果所有 Agent 都关闭 Proactive，Broker 直接返回，不调用 DeepSeek。
+
+### Debounce 不冻结候选 Agent
+
+- [ ] `ProactiveBatch` 只保存群聊触发信息，例如 `groupId`、`triggerFromSeq`、`triggerToSeq` 和必要时间信息。
+- [ ] batch 创建时不要保存 candidate list。
+- [ ] batch 创建时不要保存 Agent Description snapshot。
+- [ ] 800ms debounce / 2s maxWait 到期后，在真正调用 DeepSeek 前一刻重新读取 `GroupState` 并构建 candidates。
+- [ ] 因此用户在 debounce 期间关闭 Proactive 后，该 Agent 不得进入即将发出的 DeepSeek 请求。
+
+建议流程：
+
+```text
+普通消息进入
+    ↓
+落库 + 广播
+    ↓
+只记录 group/seq batch
+    ↓
+等待 debounce
+    ↓
+读取当前 GroupState
+    ↓
+实时过滤 candidates
+    ↓
+构建 DeepSeek Router Context
+    ↓
+调用 deepseek-v4-flash
+```
+
+### Router 请求已经发出时的竞态
+
+无法保证用户关闭 Proactive 时，一个已经发出的 HTTP 请求中没有旧 candidate。因此必须通过结果后的授权复查保证最终行为正确。
+
+- [ ] DeepSeek 返回 target 后，Broker 必须再次读取当前 GroupState。
+- [ ] 如果 target 已经 `proactiveEnabled=false`，立即丢弃结果。
+- [ ] 如果 target 已 offline / busy / 离开群组，也立即丢弃结果。
+- [ ] 这种情况下不自动改选模型的“第二名”；等待下一次群聊触发重新 Router。
+- [ ] MVP 不要求取消已经发出的 DeepSeek HTTP 请求，因为结果后的权限检查已经保证不会错误唤醒 Agent。
+
+### Extension 最后一道授权检查
+
+Broker 和 Extension 之间仍可能存在极短竞态，因此 Extension 必须保留本地最终检查。
+
+收到 `proactive.deliver` 后必须同时满足：
+
+```ts
+proactiveEnabled === true
+&& context.isIdle() === true
+&& remoteQueue.activeRequest === undefined
+```
+
+- [ ] 本地用户已经关闭 Proactive 时返回 `proactive.decline`，原因 `proactive_disabled`。
+- [ ] 即使 Broker 刚刚认为它是 enabled，也不能覆盖 Session 用户最新的本地关闭操作。
+- [ ] 只有这一步通过后，才允许把 Group Observation 注入 Pi Session。
+
+最终形成三层实时检查：
+
+```text
+1. DeepSeek Router 前
+   实时构建 candidate context
+
+2. DeepSeek Router 后
+   Broker 再检查当前授权和状态
+
+3. proactive.deliver 到达 Extension 后
+   Session 本地再检查用户最新授权和 idle 状态
+```
+
+### 实时权限测试
+
+- [ ] Agent 在 debounce 开始时为 ON，在 DeepSeek 调用前切成 OFF：Router input 中不存在该 Agent，也不存在它的 Description。
+- [ ] Agent 在 DeepSeek 请求已经发出后切成 OFF，DeepSeek 返回该 Agent：Broker drop，不发送 `proactive.deliver`。
+- [ ] Broker 已发送 `proactive.deliver`，Extension 处理前用户切成 OFF：Extension 返回 `proactive_disabled`，不注入 Session。
+- [ ] Agent 从 OFF 切成 ON：下一次 Router 调用立即可以看到它，无需退出群组或重连。
+- [ ] Agent 从 ON 切成 OFF：下一次 Router 调用立即看不到它，无需退出群组或重连。
+- [ ] Agent OFF 后，其之前已经发送到群里的公开历史消息仍保留在 `Recent Group Messages`。
+- [ ] 所有 Agent OFF 时不产生 DeepSeek Router 请求。
+
+### 实时权限完成条件
+
+- [ ] Proactive 开关由 Session 控制用户拥有，Broker 和群主不能越权开启。
+- [ ] Candidate Context 每次调用模型前实时生成，不缓存权限候选快照。
+- [ ] 关闭 Proactive 后，后续 Router Context 立即移除该 Agent 及其 Description。
+- [ ] 已经在途的 Router 请求不能绕过 Router 后和 Extension 端的二次/三次授权检查。
+- [ ] 历史聊天事实与实时 candidate 权限严格分离。
