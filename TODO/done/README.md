@@ -21,4 +21,5 @@
 - [阶段 14：局域网 Broker 生命周期与准入](./14-lan-broker-lifecycle.md)
 - [阶段 15：mDNS 自动发现、附近群组与群主管理](./15-mdns-discovery-tui.md)
 - [阶段 16A：跨平台自动化与局域网验收准备](./16a-cross-platform-automation.md)
+- [阶段 17：附近群组默认开放加入](./17-open-nearby-join.md)
 - [阶段 18：Proactive Agent Participation](./18-proactive-agent-participation.md)
