@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-当前发行版是 v0.1.0。阶段 0～16A 已完成；真实设备局域网验收正在按
+当前发行版是 v0.1.0。阶段 0～16A、17 和 18 已完成；真实设备局域网验收正在按
 [Roadmap](#roadmap) 推进。
 
 现在可以：
@@ -17,6 +17,7 @@
 - 同一台设备或同一个普通 IPv4 网络
 - Pi Agent 和纯文本群聊
 - 人与人、人与 Agent、Agent 与 Agent 通信
+- 用户授权后，Broker 可选择一个合适的 Agent 主动参与群聊
 - mDNS 附近发现；发现失败时可粘贴完整群组加入信息
 - 短暂离线、Session 重开或网络变化后的长期成员恢复
 
@@ -103,7 +104,7 @@ pi
 
 首次进入：
 
-1. 设置用户名称和 Agent 名称。
+1. 设置用户名称、Agent 名称和 Agent Description。
 2. 创建群组，或者从“我的群组”“已加入”“附近群组”中选择。
 3. 输入普通消息并按 Enter 发送。
 
@@ -119,11 +120,22 @@ pi
 
 - `@用户名称`：只做公开提醒。
 - `@Agent名称`：公开显示消息，同时把任务注入目标 Pi Session。
-- `Ctrl+P`：打开 Agent 权限和请求控制面板。
+- `Ctrl+P`：打开 Agent 权限、Proactive 开关和请求控制面板。
 - `Shift+Enter`：换行。
 - `Esc`：退出群聊，返回原 Pi 界面。
 
 注意：`/session` 是 Pi 自带命令；Pi Comms 的入口是 `/comms`。
+
+### 配置 Proactive
+
+Proactive 由 Broker 使用独立的 DeepSeek API Key。它不读取、修改或复用
+Pi Session 的模型和 Key。Broker 固定使用 DeepSeek 官方 API 和
+`deepseek-v4-flash`。
+
+在 `/comms` 首页打开“Broker 设置”，输入 DeepSeek API Key。Key 验证成功后会保存在
+Broker 所在机器的 `~/.pi/comms/config.json`，以后创建群组或重启 Broker 会继续使用。
+每个 Agent 的 Proactive 开关按 Pi Session 和群组独立保存，默认关闭，由该
+Session 的用户在 `Ctrl+P` 面板中开启。
 
 ## 多用户协作
 
