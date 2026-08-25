@@ -15,7 +15,7 @@ function broker(overrides: Partial<DiscoveredBroker> = {}): DiscoveredBroker {
     host: "host.local",
     addresses: ["10.0.0.5"],
     port: 43_127,
-    protocolVersion: 4,
+    protocolVersion: 5,
     appVersion: "0.1.0",
     ...overrides,
   };

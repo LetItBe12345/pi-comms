@@ -66,6 +66,8 @@ export interface StoredMembership {
   sessionKey: SessionKey;
   userName: string;
   agentName: string;
+  agentDescription: string;
+  proactiveEnabled: boolean;
   credentialHash: string;
   status: "active" | "removed";
   createdAt: number;
@@ -181,6 +183,7 @@ export class BrokerDatabase {
       inviteCodeHash?: string;
       userName: string;
       agentName: string;
+      agentDescription: string;
       membershipCredentialHash: string;
     },
   ): void {
@@ -208,6 +211,8 @@ export class BrokerDatabase {
         sessionKey: options.ownerSessionKey,
         userName: options.userName,
         agentName: options.agentName,
+        agentDescription: options.agentDescription,
+        proactiveEnabled: false,
         credentialHash: options.membershipCredentialHash,
         status: "active",
         createdAt: now,
@@ -220,38 +225,46 @@ export class BrokerDatabase {
     const row = this.#db.prepare(
       `SELECT group_id AS groupId, session_key AS sessionKey,
               user_name AS userName, agent_name AS agentName,
+              agent_description AS agentDescription,
+              proactive_enabled AS proactiveEnabled,
               credential_hash AS credentialHash, status,
               created_at AS createdAt, last_active_at AS lastActiveAt
          FROM group_memberships
         WHERE group_id = ? AND session_key = ?`,
-    ).get(groupId, sessionKey) as StoredMembership | undefined;
-    return row;
+    ).get(groupId, sessionKey) as StoredMembershipRow | undefined;
+    return row === undefined ? undefined : mapStoredMembership(row);
   }
 
   membershipByCredential(
     groupId: string,
     credentialHash: string,
   ): StoredMembership | undefined {
-    return this.#db.prepare(
+    const row = this.#db.prepare(
       `SELECT group_id AS groupId, session_key AS sessionKey,
               user_name AS userName, agent_name AS agentName,
+              agent_description AS agentDescription,
+              proactive_enabled AS proactiveEnabled,
               credential_hash AS credentialHash, status,
               created_at AS createdAt, last_active_at AS lastActiveAt
          FROM group_memberships
         WHERE group_id = ? AND credential_hash = ?`,
-    ).get(groupId, credentialHash) as StoredMembership | undefined;
+    ).get(groupId, credentialHash) as StoredMembershipRow | undefined;
+    return row === undefined ? undefined : mapStoredMembership(row);
   }
 
   memberships(groupId: string): StoredMembership[] {
-    return this.#db.prepare(
+    const rows = this.#db.prepare(
       `SELECT group_id AS groupId, session_key AS sessionKey,
               user_name AS userName, agent_name AS agentName,
+              agent_description AS agentDescription,
+              proactive_enabled AS proactiveEnabled,
               credential_hash AS credentialHash, status,
               created_at AS createdAt, last_active_at AS lastActiveAt
          FROM group_memberships
         WHERE group_id = ?
         ORDER BY created_at`,
-    ).all(groupId) as StoredMembership[];
+    ).all(groupId) as StoredMembershipRow[];
+    return rows.map(mapStoredMembership);
   }
 
   insertMembership(
@@ -272,6 +285,35 @@ export class BrokerDatabase {
           SET last_active_at = ?
         WHERE group_id = ? AND session_key = ? AND status = 'active'`,
     ).run(Date.now(), groupId, sessionKey);
+  }
+
+  completeLegacyMembership(
+    groupId: string,
+    sessionKey: SessionKey,
+    agentDescription: string,
+    credentialHash: string,
+  ): boolean {
+    const result = this.#db.prepare(
+      `UPDATE group_memberships
+          SET agent_description = ?, credential_hash = ?, proactive_enabled = 0,
+              last_active_at = ?
+        WHERE group_id = ? AND session_key = ? AND status = 'active'
+          AND agent_description = ''`,
+    ).run(agentDescription, credentialHash, Date.now(), groupId, sessionKey);
+    return result.changes === 1;
+  }
+
+  updateProactiveEnabled(
+    groupId: string,
+    sessionKey: SessionKey,
+    enabled: boolean,
+  ): boolean {
+    const result = this.#db.prepare(
+      `UPDATE group_memberships
+          SET proactive_enabled = ?, last_active_at = ?
+        WHERE group_id = ? AND session_key = ? AND status = 'active'`,
+    ).run(enabled ? 1 : 0, Date.now(), groupId, sessionKey);
+    return result.changes === 1;
   }
 
   deleteMembership(groupId: string, sessionKey: SessionKey): void {
@@ -414,9 +456,9 @@ export class BrokerDatabase {
     this.#db.prepare(
       `INSERT INTO group_memberships (
          group_id, session_key, user_name, normalized_user_name,
-         agent_name, normalized_agent_name, credential_hash, status,
-         created_at, last_active_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         agent_name, normalized_agent_name, agent_description,
+         proactive_enabled, credential_hash, status, created_at, last_active_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       membership.groupId,
       membership.sessionKey,
@@ -424,6 +466,8 @@ export class BrokerDatabase {
       normalizeName(membership.userName),
       membership.agentName,
       normalizeName(membership.agentName),
+      membership.agentDescription,
+      membership.proactiveEnabled ? 1 : 0,
       membership.credentialHash,
       membership.status,
       membership.createdAt,
@@ -731,12 +775,39 @@ export class BrokerDatabase {
              message_id
            FROM messages
            WHERE group_id = ?
-           ORDER BY timestamp DESC, rowid DESC
+           ORDER BY group_seq DESC
            LIMIT ?
          )
-       ) ORDER BY timestamp ASC, rowid ASC`,
+       ) ORDER BY group_seq ASC`,
       [groupId, limit],
     );
+  }
+
+  publicMessages(
+    groupId: string,
+    options: { afterSeq?: number; limit?: number } = {},
+  ): HistoryMessage[] {
+    const afterSeq = options.afterSeq ?? 0;
+    const limit = options.limit ?? 20;
+    return this.#readMessages(
+      `WHERE message_id IN (
+         SELECT message_id FROM (
+           SELECT message_id
+             FROM messages
+            WHERE group_id = ? AND group_seq > ? AND sender_id <> 'system'
+            ORDER BY group_seq DESC
+            LIMIT ?
+         )
+       ) ORDER BY group_seq ASC`,
+      [groupId, afterSeq, limit],
+    );
+  }
+
+  latestGroupSeq(groupId: string): number {
+    const row = this.#db.prepare(
+      "SELECT COALESCE(MAX(group_seq), 0) AS value FROM messages WHERE group_id = ?",
+    ).get(groupId) as { value: number };
+    return row.value;
   }
 
   #insertRequest(
@@ -801,6 +872,7 @@ export class BrokerDatabase {
   #readMessages(where: string, params: unknown[]): HistoryMessage[] {
     const rows = this.#db.prepare(
       `SELECT message_id AS messageId, group_id AS groupId,
+              group_seq AS groupSeq,
               sender_id AS senderId, sender_name AS senderName,
               sender_type AS senderType, text, mention_ids AS mentionIds,
               timestamp, status, request_id AS requestId, chain_id AS chainId,
@@ -821,18 +893,22 @@ export class BrokerDatabase {
   }
 
   #insertMessage(message: HistoryMessage): void {
+    if (message.groupSeq <= 0) {
+      message.groupSeq = this.nextGroupSeq(message.groupId);
+    }
     this.#db
       .prepare(
         `INSERT INTO messages (
-           message_id, group_id, sender_id, sender_name, sender_type, text,
+           message_id, group_id, group_seq, sender_id, sender_name, sender_type, text,
            mention_ids, timestamp, status, request_id, chain_id, round,
            failure_reason, kind, route_request_id, route_status,
            route_failure_reason, route_target_name, next_round
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         message.messageId,
         message.groupId,
+        message.groupSeq,
         message.senderId,
         message.senderName,
         message.senderType,
@@ -851,6 +927,13 @@ export class BrokerDatabase {
         message.routeTargetName ?? null,
         message.nextRound ?? null,
       );
+  }
+
+  nextGroupSeq(groupId: string): number {
+    const row = this.#db.prepare(
+      "SELECT COALESCE(MAX(group_seq), 0) + 1 AS nextSeq FROM messages WHERE group_id = ?",
+    ).get(groupId) as { nextSeq: number };
+    return row.nextSeq;
   }
 
   #interruptActiveRequests(): void {
@@ -906,10 +989,53 @@ export class BrokerDatabase {
 
   #migrate(): void {
     const version = this.#db.pragma("user_version", { simple: true }) as number;
-    if (version > 7) {
+    if (version > 8) {
       throw new Error(`数据库版本不受支持：${version}`);
     }
+    if (version === 8) {
+      return;
+    }
     if (version === 7) {
+      this.#db.transaction(() => {
+        const membershipColumns = new Set(
+          (this.#db.prepare("PRAGMA table_info(group_memberships)").all() as Array<{ name: string }>)
+            .map((column) => column.name),
+        );
+        if (!membershipColumns.has("agent_description")) {
+          this.#db.exec(
+            "ALTER TABLE group_memberships ADD COLUMN agent_description TEXT NOT NULL DEFAULT ''",
+          );
+        }
+        if (!membershipColumns.has("proactive_enabled")) {
+          this.#db.exec(
+            "ALTER TABLE group_memberships ADD COLUMN proactive_enabled INTEGER NOT NULL DEFAULT 0",
+          );
+        }
+        const messageColumns = new Set(
+          (this.#db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>)
+            .map((column) => column.name),
+        );
+        if (!messageColumns.has("group_seq")) {
+          this.#db.exec("ALTER TABLE messages ADD COLUMN group_seq INTEGER");
+        }
+        this.#db.exec(`
+          WITH ranked AS (
+            SELECT rowid AS message_rowid,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY group_id ORDER BY timestamp ASC, rowid ASC
+                   ) AS seq
+              FROM messages
+          )
+          UPDATE messages
+             SET group_seq = (
+               SELECT seq FROM ranked WHERE ranked.message_rowid = messages.rowid
+             )
+           WHERE group_seq IS NULL;
+          CREATE UNIQUE INDEX IF NOT EXISTS messages_group_seq_idx
+            ON messages(group_id, group_seq);
+          PRAGMA user_version = 8;
+        `);
+      })();
       return;
     }
     if (version === 6) {
@@ -925,6 +1051,7 @@ export class BrokerDatabase {
         PRAGMA user_version = 7;
         COMMIT;
       `);
+      this.#migrate();
       return;
     }
     if (version === 5) {
@@ -1134,6 +1261,8 @@ export class BrokerDatabase {
         normalized_user_name TEXT NOT NULL,
         agent_name TEXT NOT NULL,
         normalized_agent_name TEXT NOT NULL,
+        agent_description TEXT NOT NULL DEFAULT '',
+        proactive_enabled INTEGER NOT NULL DEFAULT 0,
         credential_hash TEXT NOT NULL UNIQUE,
         status TEXT NOT NULL CHECK (status IN ('active', 'removed')),
         created_at INTEGER NOT NULL,
@@ -1144,6 +1273,7 @@ export class BrokerDatabase {
       CREATE TABLE messages (
         message_id TEXT PRIMARY KEY,
         group_id TEXT NOT NULL REFERENCES groups(group_id),
+        group_seq INTEGER NOT NULL,
         sender_id TEXT NOT NULL,
         sender_name TEXT NOT NULL,
         sender_type TEXT NOT NULL CHECK (sender_type IN ('user', 'agent')),
@@ -1221,6 +1351,8 @@ export class BrokerDatabase {
 
       CREATE INDEX messages_group_time_idx
         ON messages(group_id, timestamp DESC);
+      CREATE UNIQUE INDEX messages_group_seq_idx
+        ON messages(group_id, group_seq);
       CREATE INDEX agent_requests_group_status_idx
         ON agent_requests(group_id, status, updated_at DESC);
       CREATE INDEX agent_requests_chain_round_idx
@@ -1229,7 +1361,7 @@ export class BrokerDatabase {
         ON paused_chains(initiator_session_key, group_id, paused_at DESC);
       CREATE INDEX group_memberships_group_status_idx
         ON group_memberships(group_id, status, last_active_at DESC);
-      PRAGMA user_version = 7;
+      PRAGMA user_version = 8;
       COMMIT;
     `);
   }
@@ -1246,6 +1378,7 @@ export function historyMessage(
     messageId,
     timestamp,
     ...payload,
+    groupSeq: payload.groupSeq ?? 0,
     status,
     ...(failureReason === undefined ? {} : { failureReason }),
   };
@@ -1253,6 +1386,14 @@ export function historyMessage(
 
 function normalizeName(name: string): string {
   return name.toLocaleLowerCase("en-US");
+}
+
+interface StoredMembershipRow extends Omit<StoredMembership, "proactiveEnabled"> {
+  proactiveEnabled: number;
+}
+
+function mapStoredMembership(row: StoredMembershipRow): StoredMembership {
+  return { ...row, proactiveEnabled: row.proactiveEnabled === 1 };
 }
 
 interface StoredGroupRow {

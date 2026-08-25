@@ -97,6 +97,7 @@ describe("单机网络栈三 Session 模拟", () => {
         groupName: "局域网验收组",
         userName: "Alice",
         agentName: "Alice-Pi",
+        agentDescription: "负责测试",
         visibility: "nearby",
       });
       const aliceSnapshot = await alice.waitFor(
@@ -117,11 +118,13 @@ describe("单机网络栈三 Session 模拟", () => {
         groupId,
         userName: "Bob",
         agentName: "Bob-Pi",
+        agentDescription: "负责测试",
       });
       carol.send("group.join", {
         groupId,
         userName: "Carol",
         agentName: "Carol-Pi",
+        agentDescription: "负责测试",
       });
       await Promise.all([
         bob.waitFor(

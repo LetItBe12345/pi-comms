@@ -51,6 +51,7 @@ export class GroupState {
     agentName: string,
     groupId = randomUUID(),
     stableSessionKey?: string,
+    agentDescription = "",
   ): Membership {
     this.#ensureNotJoined(clientId);
     validateDisplayName(groupName);
@@ -76,6 +77,7 @@ export class GroupState {
       agentName,
       true,
       stableSessionKey,
+      agentDescription,
     );
   }
 
@@ -141,6 +143,7 @@ export class GroupState {
     agentName: string,
     isOwner = false,
     stableSessionKey?: string,
+    agentDescription = "",
   ): Membership {
     this.#ensureNotJoined(clientId);
     const group = this.#groups.get(groupId);
@@ -167,6 +170,7 @@ export class GroupState {
       agentName,
       isOwner,
       stableSessionKey,
+      agentDescription,
     );
   }
 
@@ -216,6 +220,13 @@ export class GroupState {
     const agent = this.#memberships.get(clientId)?.agent;
     if (agent === undefined) return undefined;
     agent.agentPermission = permission;
+    return { ...agent };
+  }
+
+  setProactiveEnabled(clientId: string, enabled: boolean): Member | undefined {
+    const agent = this.#memberships.get(clientId)?.agent;
+    if (agent === undefined) return undefined;
+    agent.proactiveEnabled = enabled;
     return { ...agent };
   }
 
@@ -320,6 +331,7 @@ export class GroupState {
     agentName: string,
     isOwner: boolean,
     stableSessionKey?: string,
+    agentDescription = "",
   ): Membership {
     const membership: Membership = {
       groupId: group.groupId,
@@ -343,6 +355,8 @@ export class GroupState {
         agentStatus: "idle",
         agentPermission: "auto",
         pendingApprovalCount: 0,
+        agentDescription,
+        proactiveEnabled: false,
         ...(stableSessionKey === undefined ? {} : { stableSessionKey }),
       },
     };

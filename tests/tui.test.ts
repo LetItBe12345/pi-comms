@@ -95,6 +95,7 @@ function message(overrides: Partial<HistoryMessage>): HistoryMessage {
   return {
     messageId: "message-1",
     groupId: "group-a",
+    groupSeq: 1,
     senderId: "user:client-a",
     senderName: "Alice",
     senderType: "user",
@@ -198,13 +199,21 @@ describe("最小群聊 TUI", () => {
     expect(view.stage).toBe("agent");
     expect(view.agentName).toBe("Alice-Pi");
     view.handleInput("\r");
+    expect(view.stage).toBe("description");
+    type(view, "负责 TypeScript 和测试");
+    view.handleInput("\r");
     expect(view.stage).toBe("action");
     view.handleInput("\x1b[B");
     view.handleInput("\r");
     expect(view.stage).toBe("join");
     view.handleInput("\r");
 
-    expect(actions.joinGroup).toHaveBeenCalledWith("active", "Alice", "Alice-Pi");
+    expect(actions.joinGroup).toHaveBeenCalledWith(
+      "active",
+      "Alice",
+      "Alice-Pi",
+      "负责 TypeScript 和测试",
+    );
     expect(view.render(80).join("\n")).toContain("正在加入群组");
   });
 
@@ -216,6 +225,8 @@ describe("最小群聊 TUI", () => {
     ]);
     type(view, "Alice");
     view.handleInput("\r");
+    view.handleInput("\r");
+    type(view, "负责审查代码");
     view.handleInput("\r");
     view.handleInput("\x1b[B");
     view.handleInput("\r");
@@ -233,6 +244,7 @@ describe("最小群聊 TUI", () => {
       "nearby",
       "Alice",
       "Alice-Pi",
+      "负责审查代码",
       "ABCDEFGHJK",
     );
   });
@@ -349,7 +361,7 @@ describe("最小群聊 TUI", () => {
     view.handleInput("\x1b[B");
     view.handleInput("\r");
     expect(updatePermission).toHaveBeenCalledWith("approval");
-    expect(view.render(80).join("\n")).toContain("接收 需批准");
+    expect(view.render(80).join("\n")).toContain("被 @ 时 需批准");
 
     view.setPendingRequests([{
       requestId: "request-1",
@@ -372,6 +384,23 @@ describe("最小群聊 TUI", () => {
     expect(view.render(80).join("\n")).toContain("请检查测试");
     view.handleInput("\r");
     expect(approveRequest).toHaveBeenCalledWith("request-1");
+  });
+
+  it("Proactive 开关与 @Agent 权限独立显示", () => {
+    const updateProactive = vi.fn(() => true);
+    const { view } = createView({ updateProactive });
+    view.applySnapshot({
+      ...snapshot(),
+      proactiveStatus: "ready",
+      ownProactiveEnabled: false,
+    });
+    view.setConnection("connected");
+    view.handleInput("\x10");
+    expect(view.render(80).join("\n")).toContain("主动参与：关闭");
+    for (let index = 0; index < 5; index += 1) view.handleInput("\x1b[B");
+    view.handleInput("\r");
+    expect(updateProactive).toHaveBeenCalledWith(true);
+    expect(view.render(80).join("\n")).toContain("主动参与 开启");
   });
 
   it("显示自动路由轮数，并通过 Ctrl+P 继续暂停链", () => {

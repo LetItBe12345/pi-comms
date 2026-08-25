@@ -36,7 +36,7 @@ describe("Broker SQLite", () => {
     store.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(7);
+    expect(raw.pragma("user_version", { simple: true })).toBe(8);
     expect(raw.pragma("journal_mode", { simple: true })).toBe("wal");
     const tables = raw
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -131,11 +131,13 @@ describe("Broker SQLite", () => {
     expect(migrated.recentMessages("g")).toEqual([
       expect.objectContaining({
         messageId: "m-completed",
+        groupSeq: 1,
         status: "completed",
         text: "@Bob-Pi 已完成",
       }),
       expect.objectContaining({
         messageId: "m-pending",
+        groupSeq: 2,
         status: "interrupted",
         failureReason: "broker_restarted",
       }),
@@ -143,7 +145,7 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(7);
+    expect(raw.pragma("user_version", { simple: true })).toBe(8);
     const columns = raw
       .prepare("PRAGMA table_info(agent_requests)")
       .all() as Array<{ name: string }>;
@@ -157,6 +159,15 @@ describe("Broker SQLite", () => {
     );
     expect(raw.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'paused_chains'",
+    ).get()).toBeDefined();
+    const membershipColumns = raw
+      .prepare("PRAGMA table_info(group_memberships)")
+      .all() as Array<{ name: string }>;
+    expect(membershipColumns.map((column) => column.name)).toEqual(
+      expect.arrayContaining(["agent_description", "proactive_enabled"]),
+    );
+    expect(raw.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'messages_group_seq_idx'",
     ).get()).toBeDefined();
     raw.close();
   });
@@ -186,7 +197,7 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(7);
+    expect(raw.pragma("user_version", { simple: true })).toBe(8);
     expect((raw.prepare(
       "SELECT initiator_session_key AS value FROM agent_requests WHERE request_id = ?",
     ).get("release-request") as { value: string }).value).toBe(
@@ -207,6 +218,7 @@ describe("Broker SQLite", () => {
     for (let index = 0; index < 105; index += 1) {
       const payload: ChatMessagePayload = {
         groupId: "g",
+        groupSeq: index + 1,
         senderId: "user:a",
         senderName: "Alice",
         senderType: "user",
@@ -229,6 +241,7 @@ describe("Broker SQLite", () => {
     store.insertGroup({ groupId: "g", groupName: "开发组" });
     const payload: ChatMessagePayload = {
       groupId: "g",
+      groupSeq: 1,
       senderId: "user:a",
       senderName: "Alice",
       senderType: "user",
@@ -283,6 +296,7 @@ describe("Broker SQLite", () => {
     });
     const makeMessage = (id: string): ChatMessagePayload => ({
       groupId: "g",
+      groupSeq: 0,
       senderId: "user:a",
       senderName: "Alice",
       senderType: "user",
@@ -323,6 +337,7 @@ describe("Broker SQLite", () => {
     store.insertGroup({ groupId: "g", groupName: "开发组" });
     const payload: ChatMessagePayload = {
       groupId: "g",
+      groupSeq: 1,
       senderId: "user:a",
       senderName: "Alice",
       senderType: "user",
@@ -382,6 +397,7 @@ describe("Broker SQLite", () => {
     };
     const source = historyMessage("source", 1, {
       groupId: "g",
+      groupSeq: 1,
       senderId: "agent:b",
       senderName: "Bob-Pi",
       senderType: "agent",
@@ -403,6 +419,7 @@ describe("Broker SQLite", () => {
     store.markDelivered("round-10");
     const answer = historyMessage("answer", 2, {
       groupId: "g",
+      groupSeq: 2,
       senderId: "agent:c",
       senderName: "Carol-Pi",
       senderType: "agent",

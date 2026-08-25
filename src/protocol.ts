@@ -25,7 +25,7 @@ export const PI_COMMS_BUILD_CHANNEL: PiCommsBuildChannel =
   process.env.PI_COMMS_BUILD_CHANNEL === "development"
     ? "development"
     : "release";
-export const BROKER_PROTOCOL_VERSION = 4;
+export const BROKER_PROTOCOL_VERSION = 5;
 export const MAX_JSONL_FRAME_BYTES = 8 * 1024 * 1024;
 
 export interface BrokerProbePayload {
@@ -55,6 +55,8 @@ export interface SnapshotPayload {
   groupSettings?: GroupSettings;
   isOwner?: boolean;
   ownerRecoveryAvailable?: boolean;
+  proactiveStatus?: ProactiveStatus;
+  ownProactiveEnabled?: boolean;
 }
 
 export interface ClientHelloPayload {
@@ -88,6 +90,7 @@ export interface GroupCreatePayload {
   groupName: string;
   userName: string;
   agentName: string;
+  agentDescription: string;
   visibility?: GroupVisibility;
   inviteRequired?: boolean;
 }
@@ -96,6 +99,7 @@ export interface GroupJoinPayload {
   groupId: string;
   userName?: string;
   agentName?: string;
+  agentDescription?: string;
   inviteCode?: string;
   membershipCredential?: string;
 }
@@ -184,6 +188,7 @@ export interface ChatSendPayload {
 
 export interface ChatMessagePayload {
   groupId: string;
+  groupSeq: number;
   senderId: string;
   senderName: string;
   senderType: MemberType;
@@ -237,6 +242,7 @@ export type MessageFailureReason =
 export interface HistoryMessage extends ChatMessagePayload {
   messageId: string;
   timestamp: number;
+  groupSeq: number;
   chainId?: string;
   round?: number;
 }
@@ -297,6 +303,97 @@ export interface AgentResultAckPayload {
   requestId: string;
   accepted: boolean;
   reason?: "unknown_request";
+}
+
+export type ProactiveStatus =
+  | "ready"
+  | "unconfigured"
+  | "unverified"
+  | "invalid_key"
+  | "temporarily_unavailable"
+  | "config_error";
+
+export interface ProactiveUpdatePayload {
+  groupId: string;
+  enabled: boolean;
+  lastSeenGroupSeq?: number;
+}
+
+export interface ProactiveUpdateAckPayload {
+  groupId: string;
+  enabled: boolean;
+  accepted: boolean;
+  reason?: ProactiveStatus | "not_in_group";
+}
+
+export interface ProactiveObservationMessage {
+  groupSeq: number;
+  senderName: string;
+  senderType: MemberType;
+  text: string;
+}
+
+export interface ProactiveDeliverPayload {
+  proactiveId: string;
+  groupId: string;
+  groupName: string;
+  targetAgentId: string;
+  targetAgentName: string;
+  triggerFromSeq: number;
+  triggerToSeq: number;
+  observedToSeq: number;
+  messages: ProactiveObservationMessage[];
+  omitted: boolean;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface ProactiveDeliverAckPayload {
+  proactiveId: string;
+}
+
+export type ProactiveDeclineReason =
+  | "agent_busy"
+  | "proactive_disabled"
+  | "expired"
+  | "explicit_request_active"
+  | "explicit_approval_pending"
+  | "interrupted_by_user"
+  | "interrupted_by_explicit_request"
+  | "left_group"
+  | "group_deleted"
+  | "broker_disconnected"
+  | "delivery_failed"
+  | "no_text";
+
+export interface ProactiveDeclinePayload {
+  proactiveId: string;
+  reason: ProactiveDeclineReason;
+}
+
+export type ProactiveResultPayload =
+  | { proactiveId: string; action: "answer"; text: string }
+  | { proactiveId: string; action: "silent" };
+
+export interface ProactiveResultAckPayload {
+  proactiveId: string;
+  accepted: boolean;
+}
+
+export interface BrokerConfigKeyPayload {
+  apiKey: string;
+}
+
+export interface BrokerConfigDeletePayload {
+  rebuild?: boolean;
+}
+
+export interface BrokerConfigStatusPayload {
+  proactiveStatus: ProactiveStatus;
+  maskedApiKey?: string;
+  requestId?: string;
+  message?: string;
+  backupPath?: string;
 }
 
 export interface SendFailedPayload {
@@ -420,6 +517,27 @@ export type AgentDeliverAckEnvelope = Envelope<AgentDeliverAckPayload> & {
 export type AgentResultEnvelope = Envelope<AgentResultPayload> & {
   type: "agent.result";
 };
+export type ProactiveUpdateEnvelope = Envelope<ProactiveUpdatePayload> & {
+  type: "proactive.update";
+};
+export type ProactiveDeliverAckEnvelope = Envelope<ProactiveDeliverAckPayload> & {
+  type: "proactive.deliver.ack";
+};
+export type ProactiveResultEnvelope = Envelope<ProactiveResultPayload> & {
+  type: "proactive.result";
+};
+export type ProactiveDeclineEnvelope = Envelope<ProactiveDeclinePayload> & {
+  type: "proactive.decline";
+};
+export type BrokerConfigValidateEnvelope = Envelope<BrokerConfigKeyPayload> & {
+  type: "broker.config.validate";
+};
+export type BrokerConfigUpdateEnvelope = Envelope<BrokerConfigKeyPayload> & {
+  type: "broker.config.update";
+};
+export type BrokerConfigDeleteEnvelope = Envelope<BrokerConfigDeletePayload> & {
+  type: "broker.config.delete";
+};
 
 export type ClientEnvelope =
   | BrokerProbeEnvelope
@@ -446,7 +564,14 @@ export type ClientEnvelope =
   | ChainContinueEnvelope
   | ChainEndEnvelope
   | AgentDeliverAckEnvelope
-  | AgentResultEnvelope;
+  | AgentResultEnvelope
+  | ProactiveUpdateEnvelope
+  | ProactiveDeliverAckEnvelope
+  | ProactiveResultEnvelope
+  | ProactiveDeclineEnvelope
+  | BrokerConfigValidateEnvelope
+  | BrokerConfigUpdateEnvelope
+  | BrokerConfigDeleteEnvelope;
 
 export type BrokerEnvelope =
   | (Envelope<BrokerReadyPayload> & { type: "broker.ready" })
@@ -472,6 +597,10 @@ export type BrokerEnvelope =
   | (Envelope<PausedChainPayload> & { type: "chain.paused" })
   | (Envelope<ChainResolvedPayload> & { type: "chain.resolved" })
   | (Envelope<AgentResultAckPayload> & { type: "agent.result.ack" })
+  | (Envelope<ProactiveDeliverPayload> & { type: "proactive.deliver" })
+  | (Envelope<ProactiveResultAckPayload> & { type: "proactive.result.ack" })
+  | (Envelope<ProactiveUpdateAckPayload> & { type: "proactive.update.ack" })
+  | (Envelope<BrokerConfigStatusPayload> & { type: "broker.config.status" })
   | (Envelope<SendFailedPayload> & { type: "send.failed" })
   | (Envelope<ErrorPayload> & { type: "error" });
 
@@ -599,6 +728,7 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
         "groupName",
         "userName",
         "agentName",
+        "agentDescription",
         ]);
         if (!result.ok) return result;
         const visibilityValid = value.payload.visibility === undefined ||
@@ -625,6 +755,8 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
         payload.userName.trim().length > 0 &&
         typeof payload.agentName === "string" &&
         payload.agentName.trim().length > 0;
+      const hasDescription = typeof payload.agentDescription === "string" &&
+        payload.agentDescription.trim().length > 0;
       if (hasInvite && hasCredential) {
         return invalid(
           "invalid_payload",
@@ -633,14 +765,19 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
         );
       }
       if (hasInvite || !hasCredential) {
-        if (!hasNames) {
+        if (!hasNames || !hasDescription) {
           return invalid(
             "invalid_payload",
-            "group.join 首次加入时必须提供用户和 Agent 名称",
+            "group.join 首次加入时必须提供用户、Agent 名称和 Description",
             requestId,
           );
         }
-        return requireStrings(value, requestId, ["groupId", "userName", "agentName"]);
+        return requireStrings(value, requestId, [
+          "groupId",
+          "userName",
+          "agentName",
+          "agentDescription",
+        ]);
       }
       return { ok: true, envelope: value as unknown as GroupJoinEnvelope };
     }
@@ -696,6 +833,43 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
       return requireStrings(value, requestId, ["requestId"]);
     case "agent.result":
       return parseAgentResult(value, requestId);
+    case "proactive.update":
+      return typeof value.payload.groupId === "string" &&
+          value.payload.groupId.trim().length > 0 &&
+          typeof value.payload.enabled === "boolean" &&
+          (value.payload.lastSeenGroupSeq === undefined ||
+            (Number.isInteger(value.payload.lastSeenGroupSeq) &&
+              (value.payload.lastSeenGroupSeq as number) >= 0))
+        ? { ok: true, envelope: value as unknown as ProactiveUpdateEnvelope }
+        : invalid("invalid_payload", "proactive.update payload 无效", requestId);
+    case "proactive.deliver.ack":
+      return requireStrings(value, requestId, ["proactiveId"]);
+    case "proactive.result": {
+      const payload = value.payload;
+      if (typeof payload.proactiveId !== "string" || !payload.proactiveId.trim()) {
+        return invalid("invalid_payload", "proactive.result proactiveId 无效", requestId);
+      }
+      if (payload.action === "silent") {
+        return { ok: true, envelope: value as unknown as ProactiveResultEnvelope };
+      }
+      return payload.action === "answer" && typeof payload.text === "string" &&
+          payload.text.trim().length > 0
+        ? { ok: true, envelope: value as unknown as ProactiveResultEnvelope }
+        : invalid("invalid_payload", "proactive.result payload 无效", requestId);
+    }
+    case "proactive.decline":
+      return typeof value.payload.proactiveId === "string" &&
+          value.payload.proactiveId.trim().length > 0 &&
+          isProactiveDeclineReason(value.payload.reason)
+        ? { ok: true, envelope: value as unknown as ProactiveDeclineEnvelope }
+        : invalid("invalid_payload", "proactive.decline payload 无效", requestId);
+    case "broker.config.validate":
+    case "broker.config.update":
+      return requireStrings(value, requestId, ["apiKey"]);
+    case "broker.config.delete":
+      return value.payload.rebuild === undefined || typeof value.payload.rebuild === "boolean"
+        ? { ok: true, envelope: value as unknown as BrokerConfigDeleteEnvelope }
+        : invalid("invalid_payload", "broker.config.delete payload 无效", requestId);
     default:
       return invalid(
         "unsupported_type",
@@ -703,6 +877,15 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
         requestId,
       );
   }
+}
+
+function isProactiveDeclineReason(value: unknown): value is ProactiveDeclineReason {
+  return value === "agent_busy" || value === "proactive_disabled" ||
+    value === "expired" || value === "explicit_request_active" ||
+    value === "explicit_approval_pending" || value === "interrupted_by_user" ||
+    value === "interrupted_by_explicit_request" || value === "left_group" ||
+    value === "group_deleted" || value === "broker_disconnected" ||
+    value === "delivery_failed" || value === "no_text";
 }
 
 function isAgentPermission(value: unknown): value is AgentPermission {

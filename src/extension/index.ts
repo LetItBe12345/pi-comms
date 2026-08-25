@@ -11,10 +11,14 @@ import type {
   AgentResultAckPayload,
   AgentResultPayload,
   BrokerEnvelope,
+  BrokerConfigStatusPayload,
   HistoryMessage,
   PausedChainPayload,
   SnapshotPayload,
   MembershipWelcomePayload,
+  ProactiveDeliverPayload,
+  ProactiveResultPayload,
+  ProactiveStatus,
 } from "../protocol.js";
 import type {
   AgentPermission,
@@ -57,10 +61,13 @@ const PERMISSION_ENTRY = "pi-comms-permission";
 const MEMBERSHIP_ENTRY = "pi-comms-membership";
 const MEMBERSHIP_REMOVED_ENTRY = "pi-comms-membership-removed";
 const DEFAULT_NAMES_ENTRY = "pi-comms-default-names";
+const PROACTIVE_ENTRY = "pi-comms-proactive";
+const PROACTIVE_CURSOR_ENTRY = "pi-comms-proactive-cursor";
 const DEFAULT_RESULT_RETRY_INTERVAL_MS = 1_000;
 const DEFAULT_BROKER_START_TIMEOUT_MS = 8_000;
 
 interface SavedMembership {
+  sessionId: string;
   groupId: string;
   groupName?: string;
   membershipCredential: string;
@@ -68,6 +75,7 @@ interface SavedMembership {
   ownerSessionId?: string;
   userName: string;
   agentName: string;
+  agentDescription: string;
   updatedAt: number;
   inviteCode?: string;
   connection?: Exclude<ConnectionConfig, { mode: "local" }> | { mode: "local" };
@@ -77,6 +85,7 @@ interface DesiredMembership {
   groupId: string;
   userName: string;
   agentName: string;
+  agentDescription: string;
   inviteCode?: string;
   membershipCredential?: string;
 }
@@ -126,11 +135,26 @@ export function createCommsExtension(
     let activeView: ChatView | undefined;
     let cachedUserName = "";
     let cachedAgentName = "";
+    let pendingAgentDescription = "";
+    let proactiveStatus: ProactiveStatus = "unconfigured";
+    let proactiveMaskedApiKey: string | undefined;
+    const proactiveConfigWaiters = new Map<
+      string,
+      (payload: BrokerConfigStatusPayload) => void
+    >();
+    let proactiveEnabledByGroup = new Map<string, boolean>();
+    let proactiveCursorByGroup = new Map<string, number>();
+    let activeProactive: ProactiveDeliverPayload | undefined;
+    let proactiveAssistantText: string | undefined;
+    let pendingProactiveToggle:
+      | { groupId: string; previous: boolean }
+      | undefined;
     let pendingCreate:
       | {
           groupName: string;
           visibility: "local" | "nearby";
           inviteRequired: boolean;
+          agentDescription: string;
         }
       | undefined;
     let openGroupManagement = false;
@@ -153,9 +177,15 @@ export function createCommsExtension(
       reconnectIntervalMs: options.reconnectIntervalMs,
       onMessage: handleBrokerMessage,
       onDisconnected: (wasConnected) => {
+        if (activeProactive !== undefined) {
+          context?.abort();
+          activeProactive = undefined;
+          proactiveAssistantText = undefined;
+          ui?.notify("Proactive 已中断，可能留下未完成修改", "warning");
+        }
         clientId = undefined;
         setConnected(false);
-        if (!shuttingDown && commsOpen) {
+        if (!shuttingDown) {
           activeView?.setConnection("reconnecting");
           void connectOrStartBroker();
         }
@@ -262,12 +292,17 @@ export function createCommsExtension(
           groupId: stored.groupId,
           userName: stored.userName,
           agentName: stored.agentName,
+          agentDescription: stored.agentDescription,
           membershipCredential: stored.membershipCredential,
         };
         return stored.connection ?? { mode: "local" };
       }
       if (picked.type === "local") return { mode: "local" };
       if (picked.type === "create") {
+        if (!(await ensureDefaultNames(ctx))) return undefined;
+        const agentDescription = await promptAgentDescription(ctx);
+        if (agentDescription === undefined) return undefined;
+        pendingAgentDescription = agentDescription;
         const groupName = await ctx.ui.input("群组名称", "例如：项目协作");
         if (groupName === undefined || !groupName.trim()) return undefined;
         const range = await ctx.ui.custom<"nearby" | "local" | undefined>(
@@ -330,11 +365,11 @@ export function createCommsExtension(
             )
           : "open";
         if (joinMode === undefined) return undefined;
-        if (!(await ensureDefaultNames(ctx))) return undefined;
         pendingCreate = {
           groupName: groupName.trim(),
           visibility,
           inviteRequired: joinMode === "invite",
+          agentDescription,
         };
         return visibility === "nearby" ? { mode: "lan-host" } : { mode: "local" };
       }
@@ -393,6 +428,22 @@ export function createCommsExtension(
         agentName: cachedAgentName,
       });
       return true;
+    }
+
+    async function promptAgentDescription(
+      ctx: ExtensionContext,
+    ): Promise<string | undefined> {
+      const value = await ctx.ui.input(
+        "Agent Description",
+        "例如：负责 Node.js、Broker、SQLite 和消息协议",
+      );
+      if (value === undefined) return undefined;
+      const normalized = [...value.trim().replace(/\s+/gu, " ")].slice(0, 240).join("");
+      if (!normalized) {
+        ctx.ui.notify("Agent Description 不能为空", "error");
+        return promptAgentDescription(ctx);
+      }
+      return normalized;
     }
 
     function startNetworkMonitor(ctx: ExtensionContext): void {
@@ -540,6 +591,7 @@ export function createCommsExtension(
               ...message.payload,
               messageId: message.id,
               timestamp: message.timestamp,
+              groupSeq: message.payload.groupSeq ?? 0,
             };
             const historyIndex = history.findIndex(
               (item) => item.messageId === receivedMessage.messageId,
@@ -557,6 +609,47 @@ export function createCommsExtension(
           return;
         case "agent.deliver":
           handleAgentDelivery(message.payload);
+          return;
+        case "proactive.deliver":
+          handleProactiveDelivery(message.payload);
+          return;
+        case "proactive.result.ack":
+          return;
+        case "proactive.update.ack":
+          if (!message.payload.accepted && pendingProactiveToggle !== undefined) {
+            proactiveEnabledByGroup.set(
+              pendingProactiveToggle.groupId,
+              pendingProactiveToggle.previous,
+            );
+            pi.appendEntry(PROACTIVE_ENTRY, {
+              sessionId,
+              groupId: pendingProactiveToggle.groupId,
+              enabled: pendingProactiveToggle.previous,
+            });
+            activeView?.setProactive(pendingProactiveToggle.previous, proactiveStatus);
+            ui?.notify(
+              proactiveStatusMessage(message.payload.reason),
+              "warning",
+            );
+          }
+          pendingProactiveToggle = undefined;
+          return;
+        case "broker.config.status":
+          proactiveStatus = message.payload.proactiveStatus;
+          proactiveMaskedApiKey = message.payload.maskedApiKey;
+          if (message.payload.requestId !== undefined) {
+            proactiveConfigWaiters.get(message.payload.requestId)?.(message.payload);
+            proactiveConfigWaiters.delete(message.payload.requestId);
+          }
+          activeView?.setProactive(
+            currentGroup === undefined
+              ? false
+              : proactiveEnabledByGroup.get(currentGroup.groupId) === true,
+            proactiveStatus,
+          );
+          if (message.payload.message !== undefined) {
+            ui?.notify(message.payload.message, proactiveStatus === "ready" ? "info" : "warning");
+          }
           return;
         case "request.pending":
           pendingApprovals.set(message.payload.requestId, message.payload);
@@ -590,6 +683,9 @@ export function createCommsExtension(
             message.payload.code === "membership_invalid" ||
             message.payload.code === "group_deleted"
           ) {
+            clearRemoteWork(
+              message.payload.code === "group_deleted" ? "group_deleted" : "left_group",
+            );
             clearSavedMembership();
           }
           activeView?.receiveError(message.payload);
@@ -601,7 +697,8 @@ export function createCommsExtension(
     function saveMembership(welcome: MembershipWelcomePayload): void {
       const own = desiredMembership;
       if (own === undefined) return;
-      savedMembership = {
+      const saved: SavedMembership = {
+        sessionId: sessionId!,
         groupId: welcome.groupId,
         membershipCredential: welcome.membershipCredential,
         ...(welcome.ownerCredential === undefined
@@ -615,6 +712,7 @@ export function createCommsExtension(
           : { inviteCode: welcome.inviteCode }),
         userName: own.userName,
         agentName: own.agentName,
+        agentDescription: own.agentDescription,
         updatedAt: Date.now(),
         ...(connectionConfig === undefined
           ? {}
@@ -624,8 +722,9 @@ export function createCommsExtension(
                 : connectionConfig,
             }),
       };
-      savedMemberships.set(membershipKey(savedMembership), savedMembership);
-      pi.appendEntry?.(MEMBERSHIP_ENTRY, savedMembership);
+      savedMembership = saved;
+      savedMemberships.set(membershipKey(saved), saved);
+      pi.appendEntry?.(MEMBERSHIP_ENTRY, saved);
       if (welcome.ownerCredential !== undefined) {
         ui?.notify("群组已创建，可通过 Ctrl+G 管理附近加入和成员", "info");
       }
@@ -634,6 +733,7 @@ export function createCommsExtension(
         membershipCredential: welcome.membershipCredential,
         userName: own.userName,
         agentName: own.agentName,
+        agentDescription: own.agentDescription,
       };
       if (welcome.inviteCode !== undefined) {
         const address = getLanIPv4Addresses()[0];
@@ -683,6 +783,7 @@ export function createCommsExtension(
       currentGroup = snapshot.group;
       currentGroupSettings = snapshot.groupSettings;
       currentIsOwner = snapshot.isOwner === true;
+      proactiveStatus = snapshot.proactiveStatus ?? proactiveStatus;
       if (
         snapshot.group !== undefined &&
         savedMembership?.groupId === snapshot.group.groupId &&
@@ -711,14 +812,39 @@ export function createCommsExtension(
         const user = ownMembers.find((member) => member.type === "user");
         const agent = ownMembers.find((member) => member.type === "agent");
         if (user !== undefined && agent !== undefined) {
+          const agentDescription = agent.agentDescription ??
+            (savedMembership?.groupId === snapshot.group.groupId
+              ? savedMembership.agentDescription
+              : "");
           desiredMembership = {
             groupId: snapshot.group.groupId,
             userName: user.displayName,
             agentName: agent.displayName,
+            agentDescription,
             ...(savedMembership?.groupId === snapshot.group.groupId
               ? { membershipCredential: savedMembership.membershipCredential }
               : {}),
           };
+          if (
+            savedMembership?.groupId === snapshot.group.groupId &&
+            agentDescription &&
+            savedMembership.agentDescription !== agentDescription
+          ) {
+            savedMembership = {
+              ...savedMembership,
+              agentDescription,
+              updatedAt: Date.now(),
+            };
+            savedMemberships.set(membershipKey(savedMembership), savedMembership);
+            pi.appendEntry(MEMBERSHIP_ENTRY, savedMembership);
+          }
+          const desiredEnabled = proactiveEnabledByGroup.get(snapshot.group.groupId) ?? false;
+          brokerClient.send("proactive.update", {
+            groupId: snapshot.group.groupId,
+            enabled: desiredEnabled,
+            lastSeenGroupSeq:
+              proactiveCursorByGroup.get(snapshot.group.groupId) ?? 0,
+          });
         }
       }
       setConnected(true);
@@ -756,6 +882,17 @@ export function createCommsExtension(
     }
 
     function handleAgentDelivery(request: AgentRequestPayload): void {
+      if (activeProactive !== undefined) {
+        const interrupted = activeProactive;
+        context?.abort();
+        activeProactive = undefined;
+        proactiveAssistantText = undefined;
+        brokerClient.send("proactive.decline", {
+          proactiveId: interrupted.proactiveId,
+          reason: "interrupted_by_explicit_request",
+        });
+        ui?.notify("Proactive 已中断，可能留下未完成修改", "warning");
+      }
       pendingApprovals.delete(request.requestId);
       activeView?.setPendingRequests([...pendingApprovals.values()]);
       const added = remoteQueue.enqueue(request);
@@ -765,6 +902,62 @@ export function createCommsExtension(
       if (added) {
         tryStartNext();
       }
+    }
+
+    function handleProactiveDelivery(delivery: ProactiveDeliverPayload): void {
+      const enabled = proactiveEnabledByGroup.get(delivery.groupId) === true;
+      let reason:
+        | "proactive_disabled"
+        | "expired"
+        | "agent_busy"
+        | "explicit_request_active"
+        | "explicit_approval_pending"
+        | undefined;
+      if (!enabled) reason = "proactive_disabled";
+      else if (Date.now() >= delivery.expiresAt) reason = "expired";
+      else if (remoteQueue.activeRequest !== undefined || remoteQueue.hasWork) {
+        reason = "explicit_request_active";
+      } else if (pendingApprovals.size > 0) reason = "explicit_approval_pending";
+      else if (context?.isIdle() !== true || activeProactive !== undefined) reason = "agent_busy";
+      if (reason !== undefined) {
+        brokerClient.send("proactive.decline", {
+          proactiveId: delivery.proactiveId,
+          reason,
+        });
+        return;
+      }
+      brokerClient.send("proactive.deliver.ack", { proactiveId: delivery.proactiveId });
+      activeProactive = delivery;
+      proactiveAssistantText = undefined;
+      try {
+        pi.sendUserMessage(formatProactiveInvitation(delivery));
+        proactiveCursorByGroup.set(delivery.groupId, delivery.observedToSeq);
+        pi.appendEntry(PROACTIVE_CURSOR_ENTRY, {
+          sessionId,
+          groupId: delivery.groupId,
+          lastSeenGroupSeq: delivery.observedToSeq,
+        });
+        brokerClient.send("proactive.update", {
+          groupId: delivery.groupId,
+          enabled,
+          lastSeenGroupSeq: delivery.observedToSeq,
+        });
+        publishAgentStatus();
+      } catch {
+        activeProactive = undefined;
+        brokerClient.send("proactive.decline", {
+          proactiveId: delivery.proactiveId,
+          reason: "delivery_failed",
+        });
+      }
+    }
+
+    function completeProactive(result: ProactiveResultPayload): void {
+      brokerClient.send("proactive.result", result);
+      activeProactive = undefined;
+      proactiveAssistantText = undefined;
+      publishAgentStatus();
+      tryStartNext();
     }
 
     function tryStartNext(): void {
@@ -815,7 +1008,21 @@ export function createCommsExtension(
       }
     }
 
-    function clearRemoteWork(): void {
+    function clearRemoteWork(
+      proactiveReason: "broker_disconnected" | "left_group" | "group_deleted" =
+        "broker_disconnected",
+    ): void {
+      if (activeProactive !== undefined) {
+        const proactiveId = activeProactive.proactiveId;
+        context?.abort();
+        brokerClient.send("proactive.decline", {
+          proactiveId,
+          reason: proactiveReason,
+        });
+        activeProactive = undefined;
+        proactiveAssistantText = undefined;
+        ui?.notify("Proactive 已中断，可能留下未完成修改", "warning");
+      }
       if (remoteQueue.activeRequest !== undefined) {
         context?.abort();
       }
@@ -826,7 +1033,7 @@ export function createCommsExtension(
     }
 
     function publishAgentStatus(): void {
-      const busy = remoteQueue.hasWork || context?.isIdle() === false;
+      const busy = activeProactive !== undefined || remoteQueue.hasWork || context?.isIdle() === false;
       brokerClient.send("agent.status", { status: busy ? "busy" : "idle" });
       activeView?.setOwnAgentBusy(busy);
     }
@@ -946,11 +1153,101 @@ export function createCommsExtension(
       return false;
     }
 
+    async function sendBrokerConfigRequest(
+      type: "broker.config.update" | "broker.config.validate" | "broker.config.delete",
+      payload: unknown,
+    ): Promise<BrokerConfigStatusPayload | undefined> {
+      const requestId = brokerClient.send(type, payload);
+      if (requestId === undefined) return undefined;
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          proactiveConfigWaiters.delete(requestId);
+          resolve(undefined);
+        }, 12_000);
+        timer.unref?.();
+        proactiveConfigWaiters.set(requestId, (status) => {
+          clearTimeout(timer);
+          resolve(status);
+        });
+      });
+    }
+
+    async function configureBroker(ctx: ExtensionContext): Promise<void> {
+      if (connectionConfig?.mode === "lan-client") {
+        ctx.ui.notify("远程 Session 不能管理 Broker API Key", "warning");
+        return;
+      }
+      if (proactiveStatus === "config_error") {
+        const rebuild = await ctx.ui.confirm(
+          "Broker 配置文件损坏",
+          "重建前会保留一份带时间戳的备份。",
+        );
+        if (!rebuild) return;
+        await sendBrokerConfigRequest("broker.config.delete", { rebuild: true });
+        return;
+      }
+      const choices = ["配置或更换 API Key"];
+      if (proactiveMaskedApiKey !== undefined) {
+        choices.push("重新验证 API Key", "删除 API Key");
+      }
+      const action = await ctx.ui.select(
+        `Broker Router：${proactiveStatusMessage(proactiveStatus)}${
+          proactiveMaskedApiKey === undefined ? "" : `（${proactiveMaskedApiKey}）`
+        }`,
+        choices,
+      );
+      if (action === undefined) return;
+      if (action === "删除 API Key") {
+        if (await ctx.ui.confirm("删除 DeepSeek API Key？", "Proactive 将停止，普通群聊不受影响。")) {
+          await sendBrokerConfigRequest("broker.config.delete", {});
+        }
+        return;
+      }
+      const apiKey = await ctx.ui.input("DeepSeek API Key", "sk-...");
+      if (apiKey === undefined || !apiKey.trim()) return;
+      await sendBrokerConfigRequest(
+        "broker.config.update",
+        { apiKey: apiKey.trim() },
+      );
+    }
+
+    async function checkBrokerKeyBeforeCreate(ctx: ExtensionContext): Promise<boolean> {
+      if (connectionConfig?.mode === "lan-client") return true;
+      if (proactiveStatus === "ready" || proactiveStatus === "unverified") return true;
+      const environmentKey = process.env.DEEPSEEK_API_KEY?.trim();
+      if (proactiveStatus === "unconfigured" && environmentKey) {
+        const migrate = await ctx.ui.confirm(
+          "发现 DEEPSEEK_API_KEY",
+          "是否验证并保存到这台电脑的 Broker 配置？",
+        );
+        if (migrate) {
+          const status = await sendBrokerConfigRequest(
+            "broker.config.update",
+            { apiKey: environmentKey },
+          );
+          if (status?.proactiveStatus === "ready" || status?.proactiveStatus === "unverified") {
+            return true;
+          }
+        }
+      }
+      const action = await ctx.ui.select("Proactive Router 尚未可用", [
+        "配置 Broker API Key",
+        "跳过，先创建群组",
+        "取消创建",
+      ]);
+      if (action === "取消创建" || action === undefined) return false;
+      if (action === "配置 Broker API Key") await configureBroker(ctx);
+      return true;
+    }
+
     pi.on("session_start", (_event, ctx) => {
       shuttingDown = false;
       updateContext(ctx);
       permission = restorePermission(ctx);
       savedMemberships = restoreMemberships(ctx);
+      proactiveEnabledByGroup = restoreProactiveSettings(ctx);
+      proactiveCursorByGroup = restoreProactiveCursors(ctx);
+      resultRetryTimer ??= setInterval(flushPendingResults, resultRetryIntervalMs);
       const names = restoreDefaultNames(ctx);
       cachedUserName = names.userName;
       cachedAgentName = names.agentName;
@@ -961,6 +1258,7 @@ export function createCommsExtension(
           groupId: savedMembership.groupId,
           userName: savedMembership.userName,
           agentName: savedMembership.agentName,
+          agentDescription: savedMembership.agentDescription,
           membershipCredential: savedMembership.membershipCredential,
         };
       }
@@ -976,7 +1274,9 @@ export function createCommsExtension(
         connectionConfig = restoreConnectionConfig(branch);
         connectionConfigPersisted = connectionConfig !== undefined;
       }
-      if (connectionConfig !== undefined) void applyConnectionConfig(connectionConfig);
+      if (connectionConfig !== undefined) {
+        void applyConnectionConfig(connectionConfig).then(() => connectOrStartBroker());
+      }
     });
 
     pi.on("session_shutdown", async (_event, ctx) => {
@@ -1007,6 +1307,19 @@ export function createCommsExtension(
 
     pi.on("input", (event, ctx) => {
       updateContext(ctx);
+      if (activeProactive !== undefined && event.source !== "extension") {
+        const interrupted = activeProactive;
+        ctx.abort();
+        activeProactive = undefined;
+        proactiveAssistantText = undefined;
+        brokerClient.send("proactive.decline", {
+          proactiveId: interrupted.proactiveId,
+          reason: "interrupted_by_user",
+        });
+        ctx.ui.notify("Proactive 已中断，可能留下未完成修改", "warning");
+        publishAgentStatus();
+        return { action: "continue" as const };
+      }
       if (
         remoteQueue.activeRequest !== undefined &&
         event.source !== "extension"
@@ -1019,6 +1332,10 @@ export function createCommsExtension(
 
     pi.on("message_end", (event, ctx) => {
       updateContext(ctx);
+      if (activeProactive !== undefined && event.message.role === "assistant") {
+        proactiveAssistantText = extractAssistantText(event.message.content);
+        return;
+      }
       if (
         remoteQueue.activeRequest !== undefined &&
         event.message.role === "assistant"
@@ -1034,6 +1351,24 @@ export function createCommsExtension(
 
     pi.on("agent_settled", (_event, ctx) => {
       updateContext(ctx);
+      if (activeProactive !== undefined) {
+        const proactiveId = activeProactive.proactiveId;
+        if (proactiveAssistantText === undefined) {
+          brokerClient.send("proactive.decline", {
+            proactiveId,
+            reason: "no_text",
+          });
+          activeProactive = undefined;
+          publishAgentStatus();
+          return;
+        }
+        completeProactive(
+          proactiveAssistantText.trim() === "[PI_COMMS_NO_REPLY]"
+            ? { proactiveId, action: "silent" }
+            : { proactiveId, action: "answer", text: proactiveAssistantText },
+        );
+        return;
+      }
       const activeRequest = remoteQueue.activeRequest;
       if (activeRequest === undefined) {
         tryStartNext();
@@ -1055,6 +1390,14 @@ export function createCommsExtension(
       publishAgentStatus();
     });
 
+    pi.on("before_agent_start", (event, ctx) => {
+      updateContext(ctx);
+      if (currentGroup === undefined || savedMembership === undefined) return;
+      return {
+        systemPrompt: `${event.systemPrompt}\n\n${formatStableCommsPrompt(savedMembership, currentGroup)}`,
+      };
+    });
+
     pi.registerCommand("comms", {
       description: "打开 Pi Comms 群聊",
       handler: async (_args, ctx) => {
@@ -1070,6 +1413,15 @@ export function createCommsExtension(
         ) {
           const selected = await chooseConnectionConfig(ctx);
           if (selected === undefined) return;
+          if (
+            selected.mode === "lan-client" &&
+            savedMembership?.groupId !== selected.groupId
+          ) {
+            if (!await ensureDefaultNames(ctx)) return;
+            const description = await promptAgentDescription(ctx);
+            if (description === undefined) return;
+            pendingAgentDescription = description;
+          }
           connectionConfig = selected;
           connectionConfigPersisted = false;
           await applyConnectionConfig(selected);
@@ -1154,8 +1506,16 @@ export function createCommsExtension(
             groupId: connectionConfig.groupId,
             userName: cachedUserName,
             agentName: cachedAgentName,
+            agentDescription: pendingAgentDescription,
             inviteCode: connectionConfig.inviteCode,
           };
+        }
+        if (
+          connected &&
+          pendingCreate !== undefined &&
+          !(await checkBrokerKeyBeforeCreate(ctx))
+        ) {
+          pendingCreate = undefined;
         }
         if (connected && pendingCreate !== undefined) {
           while (availableGroups.some(
@@ -1182,11 +1542,13 @@ export function createCommsExtension(
             groupId: "",
             userName: cachedUserName,
             agentName: cachedAgentName,
+            agentDescription: pendingCreate.agentDescription,
           };
           brokerClient.send("group.create", {
             groupName: pendingCreate.groupName,
             userName: cachedUserName,
             agentName: cachedAgentName,
+            agentDescription: pendingCreate.agentDescription,
             visibility: pendingCreate.visibility,
             inviteRequired: pendingCreate.inviteRequired,
           });
@@ -1202,6 +1564,7 @@ export function createCommsExtension(
               done,
               initialUserName: cachedUserName,
               initialAgentName: cachedAgentName,
+              initialAgentDescription: pendingAgentDescription || savedMembership?.agentDescription,
               initialPermission: permission,
               initialPendingRequests: [...pendingApprovals.values()],
               initialPausedChains: [...pausedChains.values()],
@@ -1209,19 +1572,32 @@ export function createCommsExtension(
                 ? { initialGroupName: savedMembership?.groupName ?? savedMembership?.groupId }
                 : {}),
               openGroupPanelOnJoin: openGroupManagement,
+              showBrokerSettings: connectionConfig?.mode !== "lan-client",
               actions: {
-                createGroup: (groupName, userName, agentName) => {
-                  desiredMembership = { groupId: "", userName, agentName };
+                createGroup: (groupName, userName, agentName, agentDescription) => {
+                  desiredMembership = {
+                    groupId: "",
+                    userName,
+                    agentName,
+                    agentDescription,
+                  };
                   return brokerClient.send("group.create", {
                     groupName,
                     userName,
                     agentName,
+                    agentDescription,
                     visibility: connectionConfig?.mode === "lan-host"
                       ? "nearby"
                       : "local",
                   });
                 },
-                joinGroup: (groupId, userName, agentName, enteredInviteCode) => {
+                joinGroup: (
+                  groupId,
+                  userName,
+                  agentName,
+                  agentDescription,
+                  enteredInviteCode,
+                ) => {
                   const restored = savedMembership?.groupId === groupId
                     ? savedMembership.membershipCredential
                     : undefined;
@@ -1234,6 +1610,9 @@ export function createCommsExtension(
                     groupId,
                     userName,
                     agentName,
+                    agentDescription: restored === undefined
+                      ? agentDescription
+                      : savedMembership!.agentDescription,
                     ...(restored === undefined
                       ? { inviteCode }
                       : { membershipCredential: restored }),
@@ -1248,6 +1627,56 @@ export function createCommsExtension(
                   return brokerClient.send("permission.update", {
                     permission: nextPermission,
                   }) !== undefined;
+                },
+                updateProactive: (enabled) => {
+                  if (currentGroup === undefined) return false;
+                  const previous = proactiveEnabledByGroup.get(currentGroup.groupId) ?? false;
+                  if (
+                    enabled &&
+                    proactiveStatus !== "ready" &&
+                    proactiveStatus !== "temporarily_unavailable"
+                  ) return false;
+                  try {
+                    pi.appendEntry(PROACTIVE_ENTRY, {
+                      sessionId,
+                      groupId: currentGroup.groupId,
+                      enabled,
+                    });
+                  } catch {
+                    ui?.notify("Proactive 开关未能保存", "error");
+                    return false;
+                  }
+                  proactiveEnabledByGroup.set(currentGroup.groupId, enabled);
+                  if (!enabled && activeProactive !== undefined) {
+                    const interrupted = activeProactive;
+                    context?.abort();
+                    activeProactive = undefined;
+                    proactiveAssistantText = undefined;
+                    brokerClient.send("proactive.decline", {
+                      proactiveId: interrupted.proactiveId,
+                      reason: "proactive_disabled",
+                    });
+                    ui?.notify("Proactive 已中断，可能留下未完成修改", "warning");
+                  }
+                  pendingProactiveToggle = { groupId: currentGroup.groupId, previous };
+                  const requestId = brokerClient.send("proactive.update", {
+                    groupId: currentGroup.groupId,
+                    enabled,
+                    lastSeenGroupSeq:
+                      proactiveCursorByGroup.get(currentGroup.groupId) ?? 0,
+                  });
+                  if (requestId !== undefined) return true;
+                  proactiveEnabledByGroup.set(currentGroup.groupId, previous);
+                  pi.appendEntry(PROACTIVE_ENTRY, {
+                    sessionId,
+                    groupId: currentGroup.groupId,
+                    enabled: previous,
+                  });
+                  pendingProactiveToggle = undefined;
+                  return false;
+                },
+                configureBroker: () => {
+                  void configureBroker(ctx);
                 },
                 approveRequest: (requestId) => {
                   return brokerClient.send("request.approve", { requestId });
@@ -1384,7 +1813,7 @@ export function createCommsExtension(
                   });
                 },
                 leaveGroup: () => {
-                  clearRemoteWork();
+                  clearRemoteWork("left_group");
                   const id = brokerClient.send("group.leave", {});
                   if (id !== undefined) clearSavedMembership();
                   return id;
@@ -1421,7 +1850,7 @@ export function createCommsExtension(
                     membershipCredential: savedMembership.membershipCredential,
                   });
                 },
-                close: clearRemoteWork,
+                close: () => undefined,
               },
             });
             activeView = view;
@@ -1437,6 +1866,9 @@ export function createCommsExtension(
                 members: [...members.values()],
                 messages: history,
                 pausedChains: [...pausedChains.values()],
+                proactiveStatus,
+                ownProactiveEnabled:
+                  proactiveEnabledByGroup.get(currentGroup.groupId) === true,
                 ...(currentGroupSettings === undefined
                   ? {}
                   : { groupSettings: currentGroupSettings }),
@@ -1449,44 +1881,19 @@ export function createCommsExtension(
             return view;
           });
         } finally {
-          const remainingOnline = [...members.values()].filter(
-            (member) =>
-              member.type === "user" &&
-              member.online &&
-              member.clientId !== clientId,
-          ).length;
-          if (currentIsOwner && remainingOnline > 0) {
-            ctx.ui.notify(
-              `你已离线，群组内还有 ${remainingOnline} 人在线`,
-              "info",
-            );
-          }
           if (activeView !== undefined) {
             cachedUserName = activeView.userName;
             cachedAgentName = activeView.agentName;
+            pendingAgentDescription = activeView.agentDescription;
           }
           activeView = undefined;
           openGroupManagement = false;
           pendingCreate = undefined;
           commsOpen = false;
-          clearRemoteWork();
-          desiredMembership = undefined;
-          await brokerClient.stop();
-          clientId = undefined;
-          currentGroup = undefined;
-          history = [];
-          members.clear();
-          pendingApprovals.clear();
-          pausedChains.clear();
-          if (resultRetryTimer !== undefined) {
-            clearInterval(resultRetryTimer);
-            resultRetryTimer = undefined;
-          }
-          if (networkMonitorTimer !== undefined) {
-            clearInterval(networkMonitorTimer);
-            networkMonitorTimer = undefined;
-          }
-          ctx.ui.setStatus(STATUS_KEY, undefined);
+          ctx.ui.setStatus(
+            STATUS_KEY,
+            brokerClient.connected ? "群聊已连接" : "群聊暂时未连接",
+          );
         }
       },
     });
@@ -1498,7 +1905,20 @@ export function createCommsExtension(
         members,
       }), (membership) => {
         desiredMembership = membership;
-      }, clearRemoteWork);
+      }, () => clearRemoteWork("left_group"), (enabled) => {
+        if (currentGroup === undefined) return;
+        proactiveEnabledByGroup.set(currentGroup.groupId, enabled);
+        pi.appendEntry(PROACTIVE_ENTRY, {
+          sessionId,
+          groupId: currentGroup.groupId,
+          enabled,
+        });
+        brokerClient.send("proactive.update", {
+          groupId: currentGroup.groupId,
+          enabled,
+          lastSeenGroupSeq: proactiveCursorByGroup.get(currentGroup.groupId) ?? 0,
+        });
+      });
     }
   };
 }
@@ -1513,7 +1933,7 @@ export function formatAgentRequest(request: AgentRequestPayload): string {
         .join("、")
     : "无其他在线成员";
   return [
-    "[Pi Comms 群聊请求]",
+    "[Pi Comms Remote Request]",
     `你是：${request.targetAgentName}（Agent）`,
     `所属用户：${request.ownerUserName}`,
     `来自：${request.senderName}${request.senderType === "agent" ? "（Agent）" : "（用户）"}`,
@@ -1526,9 +1946,55 @@ export function formatAgentRequest(request: AgentRequestPayload): string {
     "",
     request.text,
     "",
+    "你可以使用工具、修改本地项目并运行测试。",
     `你的回答会作为公开消息发送到群组「${request.groupName}」，用于回应 ${request.senderName}。请直接回答。`,
     `如果这个问题更适合群里其他在线 Agent 处理，可在回答开头 @Agent名称 并附上要转交的问题，任务会转给该 Agent；每次只转一次。`,
   ].join("\n");
+}
+
+export function formatProactiveInvitation(delivery: ProactiveDeliverPayload): string {
+  const messages = delivery.messages.map((message) =>
+    `#${message.groupSeq} [${message.senderType}] ${message.senderName}: ${message.text}`
+  );
+  return [
+    "[Pi Comms Proactive Invitation]",
+    `群组：${delivery.groupName}`,
+    `你是：${delivery.targetAgentName}（Agent）`,
+    ...(delivery.omitted ? ["较早的群聊消息已省略。"] : []),
+    "",
+    ...messages,
+    "",
+    "Broker 认为你可能可以推进讨论。请结合当前项目上下文自行判断是否发言。",
+    "你可以使用工具、修改本地项目并运行测试，但不要主动 git push、创建 PR、发布 Release、发邮件或进行其他外部写操作。",
+    "如果不应发言，最终完整输出 [PI_COMMS_NO_REPLY]。如果使用过工具或修改过本地状态，必须正常说明结果，不能沉默。",
+    "如果回答开头是一个有效的 @Agent名称，成功公开后会按现有 Agent-to-Agent 规则转交一次。",
+  ].join("\n");
+}
+
+function formatStableCommsPrompt(
+  membership: SavedMembership,
+  group: Group,
+): string {
+  return [
+    "[Pi Comms Session Context]",
+    `你已加入群组「${group.groupName}」。`,
+    `你的公开 Agent 名称：${membership.agentName}。`,
+    `你的公开 Agent Description：${membership.agentDescription}。`,
+    "[Pi Comms Remote Request] 表示有人明确 @ 你：按普通定向任务处理。",
+    "[Pi Comms Proactive Invitation] 表示 Broker 主动邀请：只有能提供具体价值时才回答，也可以严格返回 [PI_COMMS_NO_REPLY]。",
+    "两类任务都可以使用工具、修改本地项目和运行测试。Proactive 不主动执行外部写操作。",
+  ].join("\n");
+}
+
+function proactiveStatusMessage(value: unknown): string {
+  if (value === "ready") return "Proactive Router 已就绪";
+  if (value === "unconfigured") return "群聊主机未配置 Proactive Router";
+  if (value === "unverified") return "Broker Key 尚未验证";
+  if (value === "invalid_key") return "Broker Key 已失效";
+  if (value === "config_error") return "Broker 配置文件无法读取";
+  if (value === "temporarily_unavailable") return "Proactive Router 暂时不可用";
+  if (value === "not_in_group") return "当前 Session 尚未加入该群组";
+  return "Proactive Router 不可用";
 }
 
 function restorePermission(ctx: ExtensionContext): AgentPermission {
@@ -1581,14 +2047,17 @@ export function restoreMemberships(
     ) continue;
     const value = entry.data as Partial<SavedMembership>;
     if (
+      value.sessionId === ctx.sessionManager.getSessionId() &&
       typeof value.groupId === "string" &&
       typeof value.membershipCredential === "string" &&
       typeof value.userName === "string" &&
       typeof value.agentName === "string" &&
+      typeof value.agentDescription === "string" &&
       typeof value.updatedAt === "number"
     ) {
       const connection = parseSavedConnection(value.connection);
       const membership: SavedMembership = {
+        sessionId: value.sessionId,
         groupId: value.groupId,
         ...(typeof value.groupName === "string" ? { groupName: value.groupName } : {}),
         membershipCredential: value.membershipCredential,
@@ -1601,6 +2070,7 @@ export function restoreMemberships(
           : {}),
         userName: value.userName,
         agentName: value.agentName,
+        agentDescription: value.agentDescription,
         updatedAt: value.updatedAt,
         ...(typeof value.inviteCode === "string"
           ? { inviteCode: value.inviteCode }
@@ -1611,6 +2081,42 @@ export function restoreMemberships(
     }
   }
   return memberships;
+}
+
+function restoreProactiveSettings(ctx: ExtensionContext): Map<string, boolean> {
+  const result = new Map<string, boolean>();
+  for (const entry of ctx.sessionManager.getBranch()) {
+    if (
+      entry.type === "custom" && entry.customType === PROACTIVE_ENTRY &&
+      typeof entry.data === "object" && entry.data !== null &&
+      "sessionId" in entry.data &&
+      entry.data.sessionId === ctx.sessionManager.getSessionId() &&
+      "groupId" in entry.data && typeof entry.data.groupId === "string" &&
+      "enabled" in entry.data && typeof entry.data.enabled === "boolean"
+    ) {
+      result.set(entry.data.groupId, entry.data.enabled);
+    }
+  }
+  return result;
+}
+
+function restoreProactiveCursors(ctx: ExtensionContext): Map<string, number> {
+  const result = new Map<string, number>();
+  for (const entry of ctx.sessionManager.getBranch()) {
+    if (
+      entry.type === "custom" && entry.customType === PROACTIVE_CURSOR_ENTRY &&
+      typeof entry.data === "object" && entry.data !== null &&
+      "sessionId" in entry.data &&
+      entry.data.sessionId === ctx.sessionManager.getSessionId() &&
+      "groupId" in entry.data && typeof entry.data.groupId === "string" &&
+      "lastSeenGroupSeq" in entry.data &&
+      typeof entry.data.lastSeenGroupSeq === "number" &&
+      Number.isInteger(entry.data.lastSeenGroupSeq)
+    ) {
+      result.set(entry.data.groupId, entry.data.lastSeenGroupSeq);
+    }
+  }
+  return result;
 }
 
 function membershipKey(membership: Pick<SavedMembership, "groupId" | "connection">): string {
@@ -1698,9 +2204,10 @@ function registerTestCommands(
     members: Map<string, Member>;
   },
   setDesiredMembership: (
-    membership: { groupId: string; userName: string; agentName: string },
+    membership: DesiredMembership,
   ) => void,
   clearRemoteWork: () => void,
+  updateProactive: (enabled: boolean) => void,
 ): void {
   pi.registerCommand("comms-create", {
     description: "测试：创建群组",
@@ -1712,11 +2219,13 @@ function registerTestCommands(
         groupId: "",
         userName: values[1],
         agentName: values[2],
+        agentDescription: "测试 Agent",
       });
       brokerClient.send("group.create", {
         groupName: values[0],
         userName: values[1],
         agentName: values[2],
+        agentDescription: "测试 Agent",
       });
     },
   });
@@ -1726,12 +2235,25 @@ function registerTestCommands(
       if (!(await ensureConnected(ctx))) return;
       const values = parseCommandArgs(args, 3);
       if (values === undefined) return;
-      setDesiredMembership({ groupId: values[0], userName: values[1], agentName: values[2] });
+      setDesiredMembership({
+        groupId: values[0],
+        userName: values[1],
+        agentName: values[2],
+        agentDescription: "测试 Agent",
+      });
       brokerClient.send("group.join", {
         groupId: values[0],
         userName: values[1],
         agentName: values[2],
+        agentDescription: "测试 Agent",
       });
+    },
+  });
+  pi.registerCommand("comms-proactive", {
+    description: "测试：切换 Proactive",
+    handler: async (args, ctx) => {
+      if (!(await ensureConnected(ctx))) return;
+      updateProactive(args.trim() === "on");
     },
   });
   pi.registerCommand("comms-members", {
