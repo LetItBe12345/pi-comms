@@ -50,7 +50,7 @@ B 的 Pi Agent 处理消息
 - 用户和 Agent 作为两个独立群成员出现。
 - 人对人、人对 Agent、Agent 对 Agent 通信。
 - 所有群聊消息公开显示。
-- 只有明确 `@Agent` 的消息才注入目标 Agent。
+- 显式 `@Agent` 消息注入目标 Agent；阶段 18 起，用户明确开启 Proactive 后，Broker 也可以按第 19 节主动邀请最多一个 Agent。
 - Agent 忙碌时排队，不抢占当前任务。
 - Agent 最终回答自动回传，且只回传一次。
 - Agent 每连续自动通信 10 轮必须暂停，由原发起 Session 决定继续或结束。
@@ -63,7 +63,7 @@ B 的 Pi Agent 处理消息
 - IPv6 和主机名连接。
 - Pi 以外的 Agent Harness。
 - 图片、文件和私聊。
-- 全局可读和 Agent 持续监听所有消息。
+- 全局可读和 Agent 持续监听所有消息；Proactive 只在 Broker 选中后按 `groupSeq` 增量注入公开上下文。
 - 群聊摘要和上下文压缩。
 - 消息优先级和多个远程请求的并行处理。
 
@@ -79,7 +79,7 @@ B 的 Pi Agent 处理消息
 - IPv6 和主机名连接暂不支持，输入后必须给出可读提示，不能进入模糊超时。
 - 连接模式分为 `local`、`lan-host` 和 `lan-client`；配置按 Pi Session 保存。
 - 传输协议：JSON Lines。
-- 连接必须先完成 `broker.probe` / `broker.ready` 握手，并严格匹配 `service: pi-comms` 和 `protocolVersion: 4`。
+- 连接必须先完成 `broker.probe` / `broker.ready` 握手，并严格匹配 `service: pi-comms` 和 `protocolVersion: 5`。
 - 数据库：SQLite + `better-sqlite3`，开启 WAL 模式。
 - 数据库默认路径：`~/.pi/comms/comms.db`。
 - 只有 Local Broker 可以读写数据库，Extension 不直接访问数据库。
@@ -153,12 +153,16 @@ Nearby Pi Extension ─────── LAN TCP ───────┘
 - 已加入群组的长期成员凭证和最近进入时间。
 - 当前 Session 创建群组的群主凭证。
 - 群组内名称覆盖和未发送草稿。
+- 按 `groupId` 保存的 `proactiveEnabled`。
+- Proactive 群聊观察进度 `lastSeenGroupSeq`。
 
 ### 7.2 SQLite 保存
 
 - 群组信息、群主凭证摘要、可见范围、可选的群组邀请码摘要和后台设置。
 - 长期成员、成员凭证摘要、群组内名称、最后活跃时间和移出状态。
+- 每个 membership 的 Agent Description 和最后同步的 Proactive 状态。
 - 公开群聊消息。
+- 每群单调递增的 `groupSeq`。
 - 消息状态。
 - Agent 请求和结果。
 - `chainId` 和通信轮数。
@@ -173,12 +177,13 @@ Nearby Pi Extension ─────── LAN TCP ───────┘
 - Socket 状态。
 - 临时请求队列。
 - mDNS 浏览结果、群组目录缓存和空闲关闭计时器。
+- Proactive batch、Router/Freshness 调度队列、Agent cooldown、临时失败暂停和 `proactiveId` 去重记录。
 
 ### 7.4 禁止行为
 
 - 不把全部群聊历史写入每个 Pi Session。
 - 不把 Pi Session 当作群聊数据库。
-- 不把未 `@Agent` 的普通群聊消息注入 Agent。
+- 除第 19 节的 Proactive Observation 外，不把未 `@Agent` 的普通群聊消息注入 Agent。
 - 不保存模型推理过程。
 
 ## 8. 数据模型
@@ -205,6 +210,8 @@ interface PersistentMembership {
   sessionKey: string;
   userName: string;
   agentName: string;
+  agentDescription: string;
+  proactiveEnabled: boolean;
   status: "active" | "removed";
   lastActiveAt: number;
 }
@@ -220,6 +227,7 @@ interface Member {
   displayName: string;
   groupId: string;
   online: boolean;
+  agentDescription?: string;
 }
 ```
 
@@ -229,6 +237,7 @@ interface Member {
 interface Message {
   messageId: string;
   groupId: string;
+  groupSeq: number;
   senderId: string;
   senderName: string;
   senderType: "user" | "agent";
@@ -269,7 +278,7 @@ interface AgentRequest {
 
 ## 9. 协议
 
-- 阶段 15 完成后的固定协议版本为 `4`。
+- 阶段 18 的协议版本为 `5`。版本 4 与版本 5 不允许混用。
 - 每台设备在 `~/.pi/comms/device-id` 保存稳定 UUID。
 - Broker 内部使用 `JSON.stringify([deviceId, sessionId])` 作为统一 `SessionKey`。
 - `clientId` 只表示当前 Broker 实例中的逻辑客户端；群成员 ID 仍基于 `clientId`。
@@ -298,6 +307,13 @@ interface AgentRequest {
 - `agent.deliver.ack`
 - `agent.result`
 - `permission.update`
+- `proactive.update`
+- `proactive.deliver.ack`
+- `proactive.result`
+- `proactive.decline`
+- `broker.config.validate`（仅 Broker 本机用户）
+- `broker.config.update`（仅 Broker 本机用户）
+- `broker.config.delete`（仅 Broker 本机用户）
 - `request.approve`
 - `request.reject`
 - `chain.continue`
@@ -315,6 +331,10 @@ interface AgentRequest {
 - `presence.changed`
 - `agent.deliver`
 - `agent.result.ack`
+- `proactive.deliver`
+- `proactive.result.ack`
+- `proactive.update.ack`
+- `broker.config.status`
 - `request.pending`
 - `chain.paused`
 - `chain.resolved`
@@ -418,7 +438,7 @@ interface Envelope<T = unknown> {
 
 ### 11.1 接收和注入
 
-- 普通群聊消息不注入 Agent，只有明确 `@Agent` 才处理。
+- 默认情况下普通群聊消息不注入 Agent，只有明确 `@Agent` 才处理。用户开启 Proactive 后，按第 19 节的独立协议注入增量公开上下文。
 - 每次只注入当前消息，不注入完整群聊历史。
 - `@用户名称` 只公开提醒；`@Agent名称` 同时注入目标 Session。
 - 只识别消息开头的一个 `@名称`，内部使用成员 ID 路由。
@@ -439,7 +459,7 @@ interface Envelope<T = unknown> {
 你的回答会作为公开消息发送到群组「{groupName}」，用于回应 {senderName}。请直接回答。
 ```
 
-- 不注入完整群聊历史、未 `@Agent` 的普通消息和私人 Session 内容。
+- 显式请求不注入完整群聊历史、未 `@Agent` 的普通消息和私人 Session 内容。Proactive 只注入第 19 节定义的增量公开消息。
 - 目标离线或拒绝接收时，群聊中显示失败状态。
 
 ### 11.2 接收权限
@@ -487,6 +507,7 @@ seenRequestIds: Set<string>;
 - 发送者是作出回答的 Agent；注入内容同时注明目标 Agent 和发送方 Agent 各自的所属用户。
 - 新的人类 `@Agent` 请求生成新 `chainId` 并计为第 1 轮；后续请求沿用 `chainId`，每次成功创建路由时增加轮数。
 - 通信链可以经过任意数量 Agent；每个目标继续使用现有 FIFO 串行队列。
+- Proactive Agent 的成功公开回答如果以有效 `@Agent` 开头，也按本节创建下一跳。该链的初始决策 Session 是最初被 Broker 主动选中的 Agent 所属 Session。
 - 每次自动路由都重新检查目标在线状态和接收权限；离线、禁止、拒绝或执行失败时停止且不重试。
 - 初始额度为 10 轮；第 10 轮回答仍公开，但其中准备触发的第 11 轮请求暂停。
 - 只有最初发起请求的 Pi Session 可以通过 `Ctrl+P` 继续或结束；继续时沿用 `chainId` 和轮数，每次增加 10 轮额度并再次检查目标状态与权限。
@@ -554,7 +575,7 @@ seenRequestIds: Set<string>;
 - 群组首屏按“我的群组”“已加入”“附近群组”分区；同一群组只显示一次。
 - “我的群组”和“已加入”按最近进入时间排序；附近群组按名称排序，人数变化不改变位置。
 - 打开首屏不等待发现；附近区域先显示“正在查找附近群组…”，无结果时显示可执行的空状态。
-- 设置流程先选择或创建群组，再填写用户名称和 Agent 名称；列表显示友好的在线人数，不显示 Broker、端点或 Session 技术词。
+- 创建群组时依次填写用户名称、Agent 名称、Agent Description、群组名称和加入方式，再检查 Broker Router 配置，最后写入群组。加入现有群组也必须填写 Description。列表显示友好的在线人数，不显示 Broker、端点或 Session 技术词。
 - 当前 Pi Session 内缓存上次名称；首次填写用户名后，Agent 名称默认使用 `用户名-Pi`。
 - 消息按日期分隔并显示本地时间；当前用户消息在右，其余用户和所有 Agent 消息在左，Agent 带固定 `[Agent]` 标签。
 - 初次进入加载 SQLite 返回的最近 100 条消息；在线期间新消息只追加、不截断，退出后释放内存，不提供加载更多。
@@ -571,6 +592,8 @@ seenRequestIds: Set<string>;
 - 群主显示 `Ctrl+G 群组管理`，普通成员显示 `Ctrl+G 群组信息`；所有人显示 `Ctrl+P Agent 控制`、`Esc 返回`和 `? 全部快捷键`。
 - 狭窄终端可以收起次要快捷键，但必须保留动作名称和完整帮助入口。
 - 群主管理使用分层菜单：群组设置、附近加入、成员管理和危险操作。
+- Broker 本机用户在 `/comms` 首页可以打开“Broker 设置”，配置、验证、更换或删除 DeepSeek API Key。远程客户端不显示该入口。
+- Agent 控制面板把“被 `@` 时”和“主动参与”分开。其他群成员不能看到该 Agent 的 Proactive 开关。
 - 在“我的群组”中无需进入群聊即可打开群组管理。
 - 危险操作不提供单键快捷键，并要求二次确认。
 - Agent 在执行任务或队列非空时显示忙碌，否则显示空闲；忙碌状态只在底部汇总，不修改历史消息标题。
@@ -593,7 +616,7 @@ seenRequestIds: Set<string>;
 - `@Agent` 公开消息与请求记录必须在同一事务中写入。
 - Agent 回答、请求完成状态和原消息状态必须在同一事务中写入。
 - Agent 回答和由它触发的下一请求或暂停状态必须在同一事务中写入。
-- SQLite 保留全部公开消息；加入群组时按时间正序返回最近 100 条。
+- SQLite 保留全部公开消息；加入群组时按 `groupSeq ASC` 返回最近 100 条。`timestamp` 只用于显示时间。
 - Broker 重启时，`pending` 和 `delivered` 请求改为 `interrupted`，不自动重试。
 - 达到轮数上限的暂停链保留；重启后仍只允许原发起 Pi Session 继续或结束。
 - Broker 或 Pi 重启后，Extension 使用长期成员凭证恢复原群组和名称；不重新要求邀请码。
@@ -679,3 +702,106 @@ pi-comms/
 最重要的目标是：一个 Pi Session 能稳定、准确地向另一个 Pi Session 发送任务，并拿回唯一且正确的最终回答。
 
 实施优先级：路由正确 → 回答对应 → 私有 Session 不泄露 → 固定 SQLite 数据边界 → 完善 TUI、权限和 Agent 对 Agent。
+
+## 19. Proactive Agent Participation
+
+本节定义阶段 18 的最终产品和协议行为。完整设计选择及原因见 [阶段 18 决策记录](./TODO/decision/18-proactive-agent-participation.md)。
+
+### 19.1 Agent Description 与授权
+
+- 创建或加入群组时必须填写 Agent Description。程序自动 trim，将换行和连续空白合并为一个空格，并自动截断到 240 个字符；处理后为空才要求重新填写。
+- Description 属于当前 Pi Session 在当前群的 membership。加入后不可编辑；只有主动离群并重新加入时才能重新填写。
+- Description 对已入群成员公开，离线后继续可见。附近发现、完整邀请信息和未入群客户端不得获得成员 Description。
+- 旧 membership 缺少 Description 时不自动从 cwd、仓库名或 `AGENTS.md` 生成。用户下次打开 `/comms` 补填前保持未入群。
+- Proactive 是独立于 `AgentPermission` 的布尔开关，默认关闭。每个 Session 按 `groupId` 保存自己的开关；首次加入新群一律关闭，恢复同一群时恢复该群原值。
+- 开关只由对应 Pi Session 的控制用户修改。Broker 所有者、群主、其他用户和其他 Agent 都不得代为开启或关闭。
+- 其他群成员不得在 Snapshot、presence 或 TUI 中获得 `proactiveEnabled`。Agent 主人可以看自己的值，Broker 内部保留真实值。
+- Extension 切换开关时先写 Session custom entry，再发送 `proactive.update`。Broker 拒绝时返回原因，Extension 回滚本地值和 UI。重连时以 Session custom entry 为准，缺失时按 `false`。
+- fork 或 clone 出的新 Pi Session 不继承 membership、Description 或 Proactive 开关。
+
+### 19.2 Broker 模型与本机配置
+
+- Broker Router 和 Freshness 默认且只使用 DeepSeek 官方 `deepseek-v4-flash`。Base URL 固定为 `https://api.deepseek.com`，不允许自定义模型或中转 endpoint。
+- Pi Session 自己的模型与 Broker 模型严格分开。Pi Comms 不读取、修改或复用 Session 的模型配置和 Key。
+- DeepSeek API Key 由 Broker 本机用户提供并承担费用，只保存在 `~/.pi/comms/config.json`。文件使用临时文件原子替换，macOS/Linux 权限为 `0600`。
+- 本机设置页可以配置、验证、更换、删除 Key。保存后只显示 `****abcd` 形式的遮罩值，不提供完整值回显。远程客户端不显示设置入口。
+- 首次建群可以配置或跳过 Key。跳过不影响普通群聊和显式 `@Agent`。`DEEPSEEK_API_KEY` 只作为配置文件为空时的首次迁移来源，必须经本机用户确认。
+- Key 保存前使用最小 `deepseek-v4-flash` 请求验证 Key、账户和模型权限。首次配置遇到网络故障可保存为未验证，但不能启用 Proactive；已有有效 Key 时不得用未验证新 Key 覆盖。
+- 更换 Key 先验证新值，成功后再替换。删除 Key 立即取消在途 Router/Freshness HTTP 请求，但不强制中止已进入 Pi Session 的生成。
+- Broker 使用 `ready | unconfigured | unverified | invalid_key | temporarily_unavailable | config_error` 表示 Proactive 能力。仅 `ready` 实际调用 Router；`ready` 和 `temporarily_unavailable` 允许用户新打开开关，其他状态禁止新打开。任何状态都允许关闭。
+- `401/403` 把 Key 持久化标记为无效。未验证 Key 每次 Broker 启动时自动验证一次，设置页也提供手动重新验证。
+- 配置文件损坏或不可读时进入 `config_error`。重建配置前把旧文件重命名为带时间戳的 `0600` 备份，不自动删除。
+- 日志、错误、Snapshot 和协议回复不得包含完整 Key。
+
+### 19.3 触发、候选与调度
+
+- 只有新的普通人类公开消息创建 Proactive batch。消息开头的显式 `@Agent` 跳过 Router；`@人类`、正文中间的 `@Agent`、短消息和寒暄仍交给 Router 判断。
+- Agent 公开消息、系统通知、成员变化、权限变化和错误消息不创建 batch。
+- 没有 eligible Agent 时不调用模型。开启开关、上线、变为 idle 或 cooldown 到期都不追溯触发旧消息；必须等下一条新人类消息。
+- Router 每次调用前从当前 GroupState 实时构建候选。候选必须同时满足 `type=agent`、online、idle、`proactiveEnabled=true`且不在 cooldown。
+- 未入选、关闭、busy、offline 或 cooldown 中 Agent 的 Description 不得发送给 DeepSeek。候选不设数量上限。
+- 每次 Router 最多选择一个 Agent，也可以返回 `null`。同一群不限制只有一个活跃 Proactive：后续 batch 可以选择另一个 idle Agent，多个 Session 可以并行生成。
+- 每群第一条消息启动 batch；后续消息把 debounce 延后到最后一条后 800ms，但从第一条起最多等 2 秒。每群 Router 请求开始时间间隔不少于 5 秒。
+- 整个 Broker 同时只运行一个 DeepSeek 请求。用户发起的 Key 验证优先，其次是 Freshness，最后是 Router。多群 Router 按 round-robin 调度，多个 Freshness 按结果到达时间 FIFO。
+- Router 输入只包含最近 20 条人类或 Agent 公开文本，按 `groupSeq` 去重排序；超出部分标记省略。候选为 `{ agentId, name, description }`。
+- Router Prompt 要求只在能回答未解决问题、纠正重要错误、补充缺失专业知识或明显推进讨论时选择 Agent；寒暄、附和、重复和无实质内容应返回 `null`。
+- Router 返回后再次检查目标的当前授权、online、idle 和 membership。不再满足时丢弃，不改选第二名。
+
+### 19.4 DeepSeek Provider
+
+- Router 和 Freshness 都使用 Chat Completions JSON Output：`thinking: { type: "disabled" }`、`response_format: { type: "json_object" }`、`temperature: 0`、`max_tokens: 128`、`stream: false`。
+- Router 和 Freshness Prompt 版本分别为 `router-v1` 和 `freshness-v1`。Prompt 必须明确包含 `json` 字样和合法 JSON 示例。
+- Router 只要求 `{ "targetAgentId": "agent:..." }` 或 `{ "targetAgentId": null }`。Freshness 只要求 `{ "publish": true }` 或 `{ "publish": false }`。`reason` 可选、忽略且不记录。
+- Provider 只接受纯 JSON。Markdown 代码块不自动剥离。`targetAgentId` 必须是当前 eligible ID 或 `null`；`"NONE"`、空字符串和缺少字段都非法。`publish` 必须是 JSON 布尔值。未知顶层字段允许并忽略。
+- 网络错误、3 秒超时、`429` 和 `5xx` 最多共请求 3 次。两次重试分别 full jitter `0～500ms` 和 `0～1000ms`；`Retry-After` 优先，单次最多等 5 秒。
+- `400`、`401/403`、空内容、非法 JSON 和未知 Agent ID 不重试。一组重试耗尽后 Broker 全局暂停 30 秒；暂停只存内存，Broker 重启后清空。
+- Router 每次重试前重建候选和最新消息 batch。Freshness 每次重试前重新读取最新公开消息，候选回答保持不变。
+- Router/Freshness 不写 SQLite。结构化日志可以记录 Prompt 版本、目标 ID、结果类型、错误码和耗时，不记录完整 Prompt、群聊副本、reasoning 或 `reason`。
+
+### 19.5 Delivery 与 Session 行为
+
+- `proactive.deliver` 从 Broker 创建起 10 秒内有效，不重发。无 ACK 时 TTL 到期后清理。Proactive 不进入 `RemoteQueue`。
+- Extension 注入前最后检查本地 `proactiveEnabled`、`context.isIdle()`、活动显式任务、待批准请求和 TTL。任一不满足就 `proactive.decline`，不进 cooldown。
+- Broker 发送 delivery 前把当前最新公开消息补入 Observation。负载同时记录 Router 的 `triggerFromSeq/triggerToSeq` 和 Agent 实际看到的 `observedToSeq`。
+- 每个 Session/群组持久化 `lastSeenGroupSeq`。未观察增量不超过 20 条时全量注入；超过时只注入最近约 12 条并标记前文省略。
+- Observation 使用 `pi.sendUserMessage()` 追加到真实 Session History。每条消息使用 `#seq [user|agent] Name: text` 格式。注入成功后立即持久化 `lastSeenGroupSeq=observedToSeq`；后续中断不回滚，注入失败不推进。
+- Pi Comms 稳定提示词只在 Session 已入群时注入，包含 Agent 群聊名称、Description 和两种触发方式。显式请求使用 `[Pi Comms Remote Request]`，主动邀请使用 `[Pi Comms Proactive Invitation]`。
+- Proactive 与显式请求都可以使用工具、修改本地项目和运行测试。Proactive Prompt 明确禁止主动 `git push`、创建 PR、发布 Release、发邮件或其他外部写操作；该限制只由 Prompt 约束，不做工具层拦截。
+- Proactive Agent 可以通过最终文本 `[PI_COMMS_NO_REPLY]` 保持沉默。Extension 使用 `text.trim()` 后做完整相等比较，不接受 Markdown 包裹或附加说明。只要使用过工具或修改过本地状态，Prompt 必须要求生成正常最终回答而不得沉默。
+- Proactive 生成不设独立硬超时。本机用户输入、新的显式 `@Agent` 请求、关闭 Proactive、主动离群、群解散或 Broker 断线会立即取消。显式请求进入现有队列并优先处理。
+- 中断不回滚已经发生的本地修改。Extension 在 Session 本地提示可能存在未完成修改，群聊不发布残缺回答。
+- 关闭 `/comms` TUI 不停止 Proactive；只要 Session 仍在群且开关为开启，就继续作为候选。
+
+### 19.6 结果、Freshness、Duplicate 和 Cooldown
+
+- Extension 只回传 Pi Session 的最后一条 Assistant 文本，处理方式与显式请求一致。`proactive.result` 不持久化、无 ACK 时不重发。
+- Broker 在内存中保留已完成 `proactiveId` 10 分钟。重复结果只回 ACK，不再发布；Broker 重启后清空。
+- Broker 收到正常结果或 `silent` 时立即从当前时间开始 30 秒 cooldown，在 Duplicate/Freshness 前就移出候选。发布、沉默或被 Freshness 丢弃都进 cooldown；拒绝、过期或中断不进。cooldown 只存内存。
+- 先对当前群最近 20 条 Agent 回答做 exact duplicate：trim 并统一连续空白后完全相等就丢弃，不调用 Freshness，不创建下一跳，但仍进 cooldown。
+- Agent 实际观察后没有新的人类或 Agent 公开文本时直接发布。有新文本时调用 Freshness，输入原始触发、完整候选回答和最近 20 条新消息；更早新消息标记省略。
+- Freshness 失败、暂停期、超时、限流、空内容或非法结果均 fail closed，不发布。被丢弃后不向群聊或 Session 本地额外发送通知。
+- 多个 Agent 并行完成时按结果到达顺序处理。先发布的回答写入新 `groupSeq`，并进入后续回答的 Freshness 上下文。
+- Proactive 结果只有通过 Duplicate/Freshness 并成功公开写入后，才解析开头的一个 `@Agent` 并创建现有 Agent-to-Agent 下一跳。目标按现有权限、FIFO 队列和 10 轮暂停规则处理，不传播 `chainOrigin`。
+- Proactive 发起的链达到轮数上限后，由最初被 Broker 选中的 Agent 所属 Session 决定继续或结束。
+- 群聊不显示“主动”标记、选择理由、处理中提示、沉默、Proactive 失败或丢弃通知。只显示成功发布的普通 Agent 回答。
+
+### 19.7 `groupSeq` 与数据恢复
+
+- 每群公开消息使用从 1 开始的单调 `groupSeq`，SQLite 对 `(group_id, group_seq)` 建唯一索引。Snapshot、history 和 TUI 统一按 `groupSeq ASC` 排序，timestamp 只用于显示。
+- 旧消息在一个事务中按每群 `timestamp ASC, rowid ASC` 补齐 seq，再建立唯一索引。
+- SQLite 的 `group_memberships` 增加 `agent_description TEXT NOT NULL DEFAULT ''` 和 `proactive_enabled INTEGER NOT NULL DEFAULT 0`。老数据迁移后 Proactive 一律默认关闭。
+- Broker membership 是已入群 Description 的权威来源；Session custom entry 是重连时 Proactive 开关的权威来源。
+
+### 19.8 测试与验收
+
+- CI 只使用 Fake Router 或本地 HTTP mock，不读取真实 DeepSeek Key，不调用真实 API。
+- 自动测试必须覆盖 Description 规范化与恢复、状态隐藏、老 DB 迁移、协议 v5、实时候选、debounce、round-robin、并行结果、中断、cursor、Duplicate、Freshness、cooldown、重试、暂停、Key 生命周期和 Agent-to-Agent。
+- 真实 API 只用于人工验收。验收使用三个彼此独立的一次性仓库和本地 bare Git remote，不连接 GitHub，不在真实工作仓库执行主动修改。
+- 真实验收必须验证：后端/UI 问题选中对应 Agent；关闭的 Agent 不进候选；寒暄返回 `null`；多 Agent 可并行；过时和重复回答不发布；Proactive 可修改本地但不主动 push；显式 `@Agent` 不受 Router 故障影响。
+
+DeepSeek 实现以官方文档为准：
+
+- [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing)
+- [Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion/)
+- [Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/)
+- [JSON Output](https://api-docs.deepseek.com/guides/json_mode)

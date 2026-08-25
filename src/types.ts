@@ -26,6 +26,8 @@ export interface GroupMembership {
   sessionKey: string;
   userName: string;
   agentName: string;
+  agentDescription: string;
+  proactiveEnabled: boolean;
   isOwner: boolean;
   removed: boolean;
   lastActiveAt: number;
@@ -40,6 +42,8 @@ export interface Member {
   online: boolean;
   agentStatus?: AgentActivityStatus;
   agentPermission?: AgentPermission;
+  agentDescription?: string;
+  proactiveEnabled?: boolean;
   pendingApprovalCount?: number;
   isOwner?: boolean;
   stableSessionKey?: string;

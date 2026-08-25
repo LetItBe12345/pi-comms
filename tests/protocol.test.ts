@@ -182,6 +182,13 @@ describe("客户端消息校验", () => {
       sessionId: "session-a",
       permission: "auto",
     }))).toMatchObject({ ok: false, code: "protocol_mismatch" });
+    expect(BROKER_PROTOCOL_VERSION).toBe(5);
+    expect(parseClientEnvelope(createEnvelope("client.hello", {
+      protocolVersion: 4,
+      deviceId: "device-a",
+      sessionId: "session-a",
+      permission: "auto",
+    }))).toMatchObject({ ok: false, code: "protocol_mismatch" });
     expect(parseClientEnvelope(createEnvelope("client.hello", {
       protocolVersion: BROKER_PROTOCOL_VERSION,
       deviceId: "device-a",
@@ -198,6 +205,7 @@ describe("客户端消息校验", () => {
           groupName: "开发组",
           userName: "Alice",
           agentName: "Alice-Pi",
+          agentDescription: "负责开发",
         }),
       ).ok,
     ).toBe(true);
@@ -207,6 +215,7 @@ describe("客户端消息校验", () => {
           groupName: "受限开发组",
           userName: "Alice",
           agentName: "Alice-Pi",
+          agentDescription: "负责开发",
           visibility: "nearby",
           inviteRequired: true,
         }),
@@ -218,6 +227,7 @@ describe("客户端消息校验", () => {
           groupName: "错误开发组",
           userName: "Alice",
           agentName: "Alice-Pi",
+          agentDescription: "负责开发",
           inviteRequired: "yes",
         }),
       ).ok,
@@ -228,11 +238,50 @@ describe("客户端消息校验", () => {
           groupId: "group-a",
           userName: "Bob",
           agentName: "Bob-Pi",
+          agentDescription: "负责开发",
         }),
       ).ok,
     ).toBe(true);
     expect(parseClientEnvelope(createEnvelope("group.leave", {})).ok).toBe(
       true,
     );
+  });
+
+  it("严格校验 Proactive 和 Broker 配置消息", () => {
+    expect(parseClientEnvelope(createEnvelope("proactive.update", {
+      groupId: "group-a",
+      enabled: true,
+      lastSeenGroupSeq: 12,
+    })).ok).toBe(true);
+    expect(parseClientEnvelope(createEnvelope("proactive.update", {
+      groupId: "group-a",
+      enabled: "yes",
+    })).ok).toBe(false);
+    expect(parseClientEnvelope(createEnvelope("proactive.deliver.ack", {
+      proactiveId: "p-1",
+    })).ok).toBe(true);
+    expect(parseClientEnvelope(createEnvelope("proactive.result", {
+      proactiveId: "p-1",
+      action: "answer",
+      text: "答案",
+    })).ok).toBe(true);
+    expect(parseClientEnvelope(createEnvelope("proactive.result", {
+      proactiveId: "p-1",
+      action: "silent",
+    })).ok).toBe(true);
+    expect(parseClientEnvelope(createEnvelope("proactive.decline", {
+      proactiveId: "p-1",
+      reason: "expired",
+    })).ok).toBe(true);
+    expect(parseClientEnvelope(createEnvelope("proactive.decline", {
+      proactiveId: "p-1",
+      reason: "unknown",
+    })).ok).toBe(false);
+    expect(parseClientEnvelope(createEnvelope("broker.config.update", {
+      apiKey: "sk-test",
+    })).ok).toBe(true);
+    expect(parseClientEnvelope(createEnvelope("broker.config.delete", {
+      rebuild: true,
+    })).ok).toBe(true);
   });
 });

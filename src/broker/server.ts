@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer, type AddressInfo, type Socket } from "node:net";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { loadOrCreateDeviceId } from "../device-identity.js";
 import {
   BROKER_PROTOCOL_VERSION,
@@ -24,6 +24,7 @@ import {
   type GroupJoinPayload,
   type HistoryMessage,
   type PausedChainPayload,
+  type ProactiveResultPayload,
   type SendFailedPayload,
 } from "../protocol.js";
 import { createSessionKey, type SessionKey } from "../session-key.js";
@@ -56,6 +57,22 @@ import {
   writeBrokerRuntimeMetadata,
   type BrokerMode,
 } from "./runtime-metadata.js";
+import {
+  DEFAULT_PROACTIVE_CONFIG_PATH,
+  normalizeAgentDescription,
+  ProactiveConfigStore,
+} from "./proactive-config.js";
+import {
+  DeepSeekProactiveProvider,
+  ProactiveProviderError,
+  type ProactiveProvider,
+  withProactiveRetry,
+} from "./proactive-provider.js";
+import {
+  ProactiveCoordinator,
+  type PendingProactive,
+} from "./proactive-coordinator.js";
+import { ProactiveCallScheduler } from "./proactive-scheduler.js";
 
 export const DEFAULT_DATABASE_PATH = join(
   homedir(),
@@ -92,6 +109,17 @@ export interface BrokerServerOptions {
   mdnsPublisherFactory?: typeof publishBrokerMdns;
   networkAccessRequired?: boolean;
   configureAutostart?: typeof configureBrokerAutostart;
+  proactiveConfigPath?: string;
+  proactiveProvider?: ProactiveProvider;
+  proactiveLog?(event: string, fields?: Record<string, unknown>): void;
+  proactiveTimings?: {
+    debounceMs?: number;
+    maxWaitMs?: number;
+    groupIntervalMs?: number;
+    deliveryTtlMs?: number;
+    cooldownMs?: number;
+    pauseMs?: number;
+  };
 }
 
 export interface BrokerServer {
@@ -136,6 +164,13 @@ export function createBrokerServer(
   const listen = validateListenEndpoint(options.listen ?? DEFAULT_BROKER_ENDPOINT);
   let endpoint = listen;
   const dbPath = options.dbPath ?? DEFAULT_DATABASE_PATH;
+  const proactiveConfigPath = options.proactiveConfigPath ??
+    (dbPath === DEFAULT_DATABASE_PATH
+      ? DEFAULT_PROACTIVE_CONFIG_PATH
+      : join(dirname(dbPath), "config.json"));
+  const proactiveConfig = new ProactiveConfigStore(proactiveConfigPath);
+  const proactiveProvider = options.proactiveProvider ?? new DeepSeekProactiveProvider();
+  const proactiveScheduler = new ProactiveCallScheduler();
   const localDisconnectGraceMs = options.disconnectGraceMs ??
     options.localDisconnectGraceMs ?? DEFAULT_LOCAL_DISCONNECT_GRACE_MS;
   const lanDisconnectGraceMs = options.disconnectGraceMs ??
@@ -165,12 +200,14 @@ export function createBrokerServer(
   const sessions = new Map<SessionKey, ClientSession>();
   let groups = new GroupState();
   let database: BrokerDatabase | undefined;
+  let proactive: ProactiveCoordinator | undefined;
   const pendingRequests = new Map<string, PendingRequest>();
   const permissions = new Map<string, AgentPermission>();
   const resolvedApprovalRequests = new Map<string, string>();
   const completedRequests = new Map<string, string>();
   const closedRequestIds = new Set<string>();
   const inviteFailures = new Map<string, InviteFailureState>();
+  const proactiveCursors = new Map<string, number>();
   const server = createServer(handleConnection);
   let started = false;
   let closing = false;
@@ -446,6 +483,7 @@ export function createBrokerServer(
       resumeToken: session.resumeToken,
     }) as BrokerEnvelope);
     sendSnapshot(clientId, socket);
+    sendConfigStatus(socket);
     if (reconnectedMembers.length > 0) {
       broadcastPresence(reconnectedMembers, clientId);
       broadcastGroupsChanged();
@@ -490,6 +528,7 @@ export function createBrokerServer(
       return;
     }
 
+    proactive?.cancelForClient(clientId);
     const offlineMembers = groups.setOnline(clientId, false);
     broadcastPresence(offlineMembers, clientId);
     if (offlineMembers.length > 0) {
@@ -544,6 +583,103 @@ export function createBrokerServer(
     socket: Socket,
     envelope: Exclude<ClientEnvelope, ClientHelloEnvelope>,
   ): void {
+    if (envelope.type === "proactive.update") {
+      const membership = groups.membershipForClient(clientId);
+      const status = currentProactiveStatus();
+      const previouslyEnabled = db().membership(
+        envelope.payload.groupId,
+        sessionKey,
+      )?.proactiveEnabled === true;
+      const allowedToEnable = status === "ready" || status === "temporarily_unavailable" ||
+        previouslyEnabled;
+      if (
+        membership === undefined ||
+        membership.groupId !== envelope.payload.groupId ||
+        (envelope.payload.enabled && !allowedToEnable)
+      ) {
+        send(socket, createEnvelope("proactive.update.ack", {
+          groupId: envelope.payload.groupId,
+          enabled: envelope.payload.enabled,
+          accepted: false,
+          reason: membership === undefined ? "not_in_group" : status,
+        }) as BrokerEnvelope);
+        return;
+      }
+      if (!db().updateProactiveEnabled(
+        envelope.payload.groupId,
+        sessionKey,
+        envelope.payload.enabled,
+      )) {
+        send(socket, createEnvelope("proactive.update.ack", {
+          groupId: envelope.payload.groupId,
+          enabled: envelope.payload.enabled,
+          accepted: false,
+          reason: "not_in_group",
+        }) as BrokerEnvelope);
+        return;
+      }
+      groups.setProactiveEnabled(clientId, envelope.payload.enabled);
+      if (envelope.payload.lastSeenGroupSeq !== undefined) {
+        proactiveCursors.set(clientId, envelope.payload.lastSeenGroupSeq);
+      }
+      if (!envelope.payload.enabled) proactive?.cancelForClient(clientId);
+      send(socket, createEnvelope("proactive.update.ack", {
+        groupId: envelope.payload.groupId,
+        enabled: envelope.payload.enabled,
+        accepted: true,
+      }) as BrokerEnvelope);
+      return;
+    }
+    if (envelope.type === "proactive.deliver.ack") {
+      proactive?.acknowledge(envelope.payload.proactiveId);
+      return;
+    }
+    if (envelope.type === "proactive.decline") {
+      proactive?.decline(envelope.payload.proactiveId, envelope.payload.reason);
+      return;
+    }
+    if (envelope.type === "proactive.result") {
+      void handleProactiveResult(socket, envelope.payload);
+      return;
+    }
+    if (
+      envelope.type === "broker.config.validate" ||
+      envelope.type === "broker.config.update" ||
+      envelope.type === "broker.config.delete"
+    ) {
+      if (!isLoopback(socket.remoteAddress)) {
+        sendError(socket, {
+          code: "invalid_payload",
+          message: "只能在 Broker 本机管理 Proactive Router",
+          requestId: envelope.id,
+        });
+        return;
+      }
+      if (envelope.type === "broker.config.delete") {
+        proactiveScheduler.abortAll();
+        proactive?.clear();
+        if (envelope.payload.rebuild === true) {
+          const rebuilt = proactiveConfig.rebuild();
+          sendConfigStatus(
+            socket,
+            envelope.id,
+            "Broker 配置已重建",
+            rebuilt.backupPath,
+          );
+        } else {
+          proactiveConfig.delete();
+          sendConfigStatus(socket, envelope.id, "DeepSeek API Key 已删除");
+        }
+      } else {
+        void validateConfigKey(
+          socket,
+          envelope.id,
+          envelope.payload.apiKey,
+          envelope.type === "broker.config.update",
+        );
+      }
+      return;
+    }
     if (envelope.type === "broker.network.refresh") {
       if (!isLoopback(socket.remoteAddress)) {
         sendError(socket, {
@@ -630,6 +766,7 @@ export function createBrokerServer(
         db().updateGroupName(envelope.payload.groupId, envelope.payload.groupName);
         const notice = createEnvelope("chat.message", {
           groupId: envelope.payload.groupId,
+          groupSeq: db().nextGroupSeq(envelope.payload.groupId),
           senderId: "system",
           senderName: "系统",
           senderType: "user" as const,
@@ -857,6 +994,251 @@ export function createBrokerServer(
     }
   }
 
+  async function handleProactiveResult(
+    socket: Socket,
+    result: ProactiveResultPayload,
+  ): Promise<void> {
+    const accepted = await proactive?.result(result) ?? false;
+    send(socket, createEnvelope("proactive.result.ack", {
+      proactiveId: result.proactiveId,
+      accepted,
+    }) as BrokerEnvelope);
+  }
+
+  async function validateConfigKey(
+    socket: Socket,
+    requestId: string,
+    apiKey: string,
+    save: boolean,
+  ): Promise<void> {
+    try {
+      await proactiveScheduler.schedule("validation", (signal) =>
+        withProactiveRetry(() => proactiveProvider.validate(apiKey, signal))
+      );
+      if (save) proactiveConfig.saveVerified(apiKey);
+      sendConfigStatus(socket, requestId, save ? "DeepSeek API Key 已验证并保存" : "验证成功");
+    } catch (error) {
+      if (
+        save &&
+        error instanceof ProactiveProviderError &&
+        (error.kind === "network" || error.kind === "timeout") &&
+        proactiveConfig.snapshot().apiKey === undefined
+      ) {
+        proactiveConfig.saveUnverified(apiKey);
+        sendConfigStatus(socket, requestId, "网络不可用，Key 已保存为未验证");
+        return;
+      }
+      sendConfigStatus(
+        socket,
+        requestId,
+        error instanceof Error ? error.message : "验证失败",
+      );
+    }
+  }
+
+  function currentProactiveStatus() {
+    return proactive?.status() ?? proactiveConfig.snapshot().proactiveStatus;
+  }
+
+  function sendConfigStatus(
+    socket: Socket,
+    requestId?: string,
+    message?: string,
+    backupPath?: string,
+  ): void {
+    const snapshot = proactiveConfig.snapshot();
+    send(socket, createEnvelope("broker.config.status", {
+      proactiveStatus: currentProactiveStatus(),
+      ...(isLoopback(socket.remoteAddress) && snapshot.maskedApiKey !== undefined
+        ? { maskedApiKey: snapshot.maskedApiKey }
+        : {}),
+      ...(requestId === undefined ? {} : { requestId }),
+      ...(message === undefined ? {} : { message }),
+      ...(backupPath === undefined ? {} : { backupPath }),
+    }) as BrokerEnvelope);
+  }
+
+  function createProactiveCoordinator(): ProactiveCoordinator {
+    return new ProactiveCoordinator({
+      provider: proactiveProvider,
+      scheduler: proactiveScheduler,
+      credentials: () => proactiveConfig.snapshot(),
+      groupName: (groupId) => db().storedGroup(groupId)?.groupName,
+      candidates: (groupId) => groups.members(groupId)
+        .filter((member) =>
+          member.type === "agent" &&
+          member.online &&
+          member.agentStatus === "idle" &&
+          member.proactiveEnabled === true &&
+          typeof member.agentDescription === "string" &&
+          member.agentDescription.length > 0
+        )
+        .map((member) => ({
+          agentId: member.memberId,
+          clientId: member.clientId,
+          name: member.displayName,
+          description: member.agentDescription!,
+        })),
+      messages: (groupId, afterSeq = 0, limit = 20) =>
+        db().publicMessages(groupId, { afterSeq, limit }),
+      latestSeq: (groupId) => db().latestGroupSeq(groupId),
+      deliver: (clientId, payload) => {
+        const target = groups.membershipForClient(clientId)?.agent;
+        const targetSocket = clients.get(clientId);
+        if (
+          targetSocket === undefined || target === undefined ||
+          !target.online || target.agentStatus !== "idle" ||
+          target.proactiveEnabled !== true
+        ) return false;
+        const cursor = proactiveCursors.get(clientId) ?? 0;
+        const delta = db().publicMessages(payload.groupId, {
+          afterSeq: cursor,
+          limit: 21,
+        });
+        const messages = delta.length > 20 ? delta.slice(-12) : delta;
+        send(targetSocket, createEnvelope("proactive.deliver", {
+          ...payload,
+          observedToSeq: db().latestGroupSeq(payload.groupId),
+          messages: messages.map((message) => ({
+            groupSeq: message.groupSeq,
+            senderName: message.senderName,
+            senderType: message.senderType,
+            text: message.text,
+          })),
+          omitted: delta.length > 20,
+        }) as BrokerEnvelope);
+        return true;
+      },
+      publish: publishProactiveAnswer,
+      onInvalidKey: () => {
+        proactiveScheduler.abortAll();
+        proactiveConfig.markInvalid();
+        broadcastConfigStatus();
+      },
+      onStatusChanged: broadcastConfigStatus,
+      log: options.proactiveLog ?? (
+        options.proactiveProvider === undefined
+          ? (event, fields) => console.error(JSON.stringify({
+              component: "pi-comms-proactive",
+              event,
+              ...fields,
+            }))
+          : undefined
+      ),
+      ...(options.proactiveTimings ?? {}),
+    });
+  }
+
+  function broadcastConfigStatus(): void {
+    for (const socket of clients.values()) sendConfigStatus(socket);
+  }
+
+  function publishProactiveAnswer(pending: PendingProactive, text: string): void {
+    const source = groups.membershipForClient(pending.target.clientId);
+    if (source === undefined || source.groupId !== pending.groupId) return;
+    const mention = parseMention(text.trimStart());
+    const target = mention === undefined
+      ? undefined
+      : groups.findMemberByName(pending.groupId, mention.name);
+    const answerPayload: ChatMessagePayload = {
+      groupId: pending.groupId,
+      groupSeq: db().nextGroupSeq(pending.groupId),
+      senderId: source.agent.memberId,
+      senderName: source.agent.displayName,
+      senderType: "agent",
+      text,
+      mentionIds: target === undefined ? [] : [target.memberId],
+      status: "sent",
+      chainId: pending.proactiveId,
+      round: 1,
+    };
+    let nextRequest:
+      | { request: AgentRequestPayload; targetClientId: string; awaitingApproval: boolean }
+      | undefined;
+    if (mention !== undefined && target?.type === "agent") {
+      answerPayload.routeTargetName = target.displayName;
+      answerPayload.nextRound = 2;
+      if (target.memberId === source.agent.memberId) {
+        answerPayload.routeStatus = "failed";
+        answerPayload.routeFailureReason = "target_self";
+      } else if (mention.text === undefined || !mention.text.trim()) {
+        answerPayload.routeStatus = "failed";
+        answerPayload.routeFailureReason = "empty_mention";
+      } else if (!target.online || clients.get(target.clientId) === undefined) {
+        answerPayload.routeStatus = "failed";
+        answerPayload.routeFailureReason = "target_offline";
+      } else if ((permissions.get(target.clientId) ?? "auto") === "blocked") {
+        answerPayload.routeStatus = "failed";
+        answerPayload.routeFailureReason = "target_blocked";
+      } else {
+        const targetMembership = groups.membershipForClient(target.clientId)!;
+        const awaitingApproval = (permissions.get(target.clientId) ?? "auto") === "approval";
+        const request: AgentRequestPayload = {
+          requestId: randomUUID(),
+          groupId: pending.groupId,
+          groupName: pending.groupName,
+          senderId: source.agent.memberId,
+          senderName: source.agent.displayName,
+          senderType: "agent",
+          senderOwnerUserName: source.user.displayName,
+          targetAgentId: target.memberId,
+          targetAgentName: target.displayName,
+          ownerUserName: targetMembership.user.displayName,
+          onlineMembers: groups.onlineMembers(pending.groupId)
+            .filter((member) => member.memberId !== target.memberId)
+            .map((member) => ({ displayName: member.displayName, type: member.type })),
+          text: mention.text,
+          chainId: pending.proactiveId,
+          round: 2,
+          createdAt: Date.now(),
+        };
+        answerPayload.routeRequestId = request.requestId;
+        answerPayload.routeStatus = awaitingApproval ? "waiting_approval" : "queued";
+        nextRequest = { request, targetClientId: target.clientId, awaitingApproval };
+      }
+    }
+    const answer = createEnvelope("chat.message", answerPayload);
+    const stored = historyMessage(answer.id, answer.timestamp, answer.payload, "sent");
+    if (nextRequest === undefined) {
+      db().insertMessage(stored);
+    } else {
+      const context: AgentChainContext = {
+        initiatorSessionKey: sessionKeyForClient(source.user.clientId)!,
+        initiatorName: source.user.displayName,
+        participants: [source.agent.displayName, nextRequest.request.targetAgentName],
+        roundLimit: 10,
+      };
+      db().insertAgentRequest(
+        stored,
+        nextRequest.request,
+        nextRequest.awaitingApproval,
+        context,
+      );
+      pendingRequests.set(nextRequest.request.requestId, {
+        targetClientId: nextRequest.targetClientId,
+        targetAgentId: nextRequest.request.targetAgentId,
+        targetName: nextRequest.request.targetAgentName,
+        groupId: nextRequest.request.groupId,
+        request: nextRequest.request,
+        message: stored,
+        state: nextRequest.awaitingApproval ? "awaiting_approval" : "delivering",
+        deliveryAcknowledged: false,
+        context,
+      });
+    }
+    broadcastToGroup(pending.groupId, answer as BrokerEnvelope);
+    if (nextRequest !== undefined) {
+      const targetSocket = clients.get(nextRequest.targetClientId);
+      if (targetSocket !== undefined) {
+        send(targetSocket, createEnvelope(
+          nextRequest.awaitingApproval ? "request.pending" : "agent.deliver",
+          nextRequest.request,
+        ) as BrokerEnvelope);
+      }
+      if (nextRequest.awaitingApproval) updatePendingApprovalCount(nextRequest.targetClientId);
+    }
+  }
+
   function handleGroupCreate(
     sessionKey: SessionKey,
     clientId: string,
@@ -874,6 +1256,7 @@ export function createBrokerServer(
     }
     let groupId: string | undefined;
     try {
+      payload.agentDescription = normalizeAgentDescription(payload.agentDescription);
       const membership = groups.createGroup(
         clientId,
         payload.groupName,
@@ -881,6 +1264,7 @@ export function createBrokerServer(
         payload.agentName,
         undefined,
         sessionKey,
+        payload.agentDescription,
       );
       groupId = membership.groupId;
       groups.setAgentPermission(clientId, permissions.get(clientId) ?? "auto");
@@ -901,6 +1285,7 @@ export function createBrokerServer(
             : { inviteCodeHash: hashSecret(normalizeInviteCode(inviteCode)) }),
           userName: payload.userName,
           agentName: payload.agentName,
+          agentDescription: payload.agentDescription,
           membershipCredentialHash: hashSecret(membershipCredential),
         },
       );
@@ -930,6 +1315,9 @@ export function createBrokerServer(
     payload: GroupJoinPayload,
   ): void {
     try {
+      if (payload.agentDescription !== undefined) {
+        payload.agentDescription = normalizeAgentDescription(payload.agentDescription);
+      }
       const storedGroup = db().storedGroup(payload.groupId);
       if (storedGroup === undefined) {
         const deletedGroup = db().consumeGroupTombstone(
@@ -948,6 +1336,8 @@ export function createBrokerServer(
       }
       let userName: string;
       let agentName: string;
+      let agentDescription: string;
+      let proactiveEnabled = false;
       let membershipCredential: string | undefined;
       let isOwner = false;
       if (payload.membershipCredential !== undefined) {
@@ -982,8 +1372,18 @@ export function createBrokerServer(
           });
           return;
         }
+        if (!stored.agentDescription) {
+          sendError(socket, {
+            code: "membership_invalid",
+            message: "旧成员身份需要重新加入并填写 Agent Description",
+            requestId,
+          });
+          return;
+        }
         userName = stored.userName;
         agentName = stored.agentName;
+        agentDescription = stored.agentDescription;
+        proactiveEnabled = stored.proactiveEnabled;
         isOwner = storedGroup.ownerSessionKey === sessionKey;
         db().touchMembership(payload.groupId, sessionKey);
       } else {
@@ -1010,19 +1410,35 @@ export function createBrokerServer(
           return;
         }
         inviteFailures.delete(socket.remoteAddress ?? "unknown");
-        userName = payload.userName!;
-        agentName = payload.agentName!;
-        if (!db().isMemberNameAvailable(payload.groupId, userName, agentName)) {
-          throw new GroupStateError("member_name_conflict", "群组内名称已被使用");
-        }
         membershipCredential = createCredential();
-        db().insertMembership({
-          groupId: payload.groupId,
-          sessionKey,
-          userName,
-          agentName,
-          credentialHash: hashSecret(membershipCredential),
-        });
+        const legacy = db().membership(payload.groupId, sessionKey);
+        if (legacy !== undefined && legacy.status === "active" && !legacy.agentDescription) {
+          userName = legacy.userName;
+          agentName = legacy.agentName;
+          agentDescription = payload.agentDescription!;
+          db().completeLegacyMembership(
+            payload.groupId,
+            sessionKey,
+            agentDescription,
+            hashSecret(membershipCredential),
+          );
+        } else {
+          userName = payload.userName!;
+          agentName = payload.agentName!;
+          agentDescription = payload.agentDescription!;
+          if (!db().isMemberNameAvailable(payload.groupId, userName, agentName)) {
+            throw new GroupStateError("member_name_conflict", "群组内名称已被使用");
+          }
+          db().insertMembership({
+            groupId: payload.groupId,
+            sessionKey,
+            userName,
+            agentName,
+            agentDescription,
+            proactiveEnabled: false,
+            credentialHash: hashSecret(membershipCredential),
+          });
+        }
       }
       const membership = groups.joinGroup(
         clientId,
@@ -1031,8 +1447,10 @@ export function createBrokerServer(
         agentName,
         isOwner,
         sessionKey,
+        agentDescription,
       );
       groups.setAgentPermission(clientId, permissions.get(clientId) ?? "auto");
+      groups.setProactiveEnabled(clientId, proactiveEnabled);
       if (membershipCredential !== undefined) {
         send(socket, createEnvelope("membership.welcome", {
           groupId: payload.groupId,
@@ -1082,6 +1500,7 @@ export function createBrokerServer(
       }
       return;
     }
+    proactive?.cancelForClient(clientId);
     const offlineMembers = groups.setOnline(clientId, false);
     broadcastPresence(offlineMembers, clientId);
     const removed = groups.leaveGroup(clientId);
@@ -1123,6 +1542,7 @@ export function createBrokerServer(
         : groups.findMemberByName(group.groupId, mention.name);
     const basePayload = {
       groupId: group.groupId,
+      groupSeq: db().nextGroupSeq(group.groupId),
       senderId: membership.user.memberId,
       senderName: membership.user.displayName,
       senderType: "user" as const,
@@ -1146,6 +1566,7 @@ export function createBrokerServer(
         return;
       }
       broadcastToGroup(group.groupId, message as BrokerEnvelope);
+      proactive?.trigger(group.groupId, basePayload.groupSeq);
       return;
     }
 
@@ -1209,6 +1630,9 @@ export function createBrokerServer(
         ...(target?.type === "agent" ? { targetAgentId: target.memberId } : {}),
         reason,
       });
+      if (target?.type !== "agent") {
+        proactive?.trigger(group.groupId, basePayload.groupSeq);
+      }
     };
 
     if (target === undefined) {
@@ -1234,6 +1658,7 @@ export function createBrokerServer(
         return;
       }
       broadcastToGroup(group.groupId, message as BrokerEnvelope);
+      proactive?.trigger(group.groupId, basePayload.groupSeq);
       return;
     }
     if (mention.text === undefined || !mention.text.trim()) {
@@ -1480,6 +1905,7 @@ export function createBrokerServer(
         : pending.context.participants;
       const answerPayload: ChatMessagePayload = {
         groupId: pending.groupId,
+        groupSeq: db().nextGroupSeq(pending.groupId),
         senderId: pending.request.targetAgentId,
         senderName: pending.request.targetAgentName,
         senderType: "agent",
@@ -1859,6 +2285,13 @@ export function createBrokerServer(
       createEnvelope("snapshot", {
         brokerInstanceId: instanceId,
         clientId,
+        proactiveStatus: currentProactiveStatus(),
+        ...(groups.membershipForClient(clientId)?.agent.proactiveEnabled === undefined
+          ? {}
+          : {
+              ownProactiveEnabled:
+                groups.membershipForClient(clientId)!.agent.proactiveEnabled,
+            }),
         groups: isLoopback(socket.remoteAddress)
           ? groups.summaries()
           : nearbyGroupSummaries(),
@@ -1927,21 +2360,21 @@ export function createBrokerServer(
           );
       result.push(
         {
-          ...(currentUser ?? {
+          ...(currentUser === undefined ? {
             memberId: `user:${stored.sessionKey}`,
             clientId: stored.sessionKey,
             type: "user" as const,
             displayName: stored.userName,
             groupId,
             online: false,
-          }),
+          } : publicMember(currentUser)),
           stableSessionKey: stored.sessionKey,
           lastActiveAt: stored.lastActiveAt,
           isOwner: db().storedGroup(groupId)?.ownerSessionKey === stored.sessionKey,
           ...(stored.status === "removed" ? { removed: true, online: false } : {}),
         },
         {
-          ...(currentAgent ?? {
+          ...(currentAgent === undefined ? {
             memberId: `agent:${stored.sessionKey}`,
             clientId: stored.sessionKey,
             type: "agent" as const,
@@ -1951,7 +2384,9 @@ export function createBrokerServer(
             agentStatus: "idle" as const,
             agentPermission: "auto" as const,
             pendingApprovalCount: 0,
-          }),
+            agentDescription: stored.agentDescription,
+          } : publicMember(currentAgent)),
+          agentDescription: stored.agentDescription,
           stableSessionKey: stored.sessionKey,
           lastActiveAt: stored.lastActiveAt,
           ...(stored.status === "removed" ? { removed: true, online: false } : {}),
@@ -2010,10 +2445,15 @@ export function createBrokerServer(
     for (const member of members) {
       broadcastToGroup(
         member.groupId,
-        createEnvelope("presence.changed", { ...member }) as BrokerEnvelope,
+        createEnvelope("presence.changed", publicMember(member)) as BrokerEnvelope,
         excludeClientId,
       );
     }
+  }
+
+  function publicMember(member: Member): Member {
+    const { proactiveEnabled: _proactiveEnabled, ...visible } = member;
+    return visible;
   }
 
   function broadcastGroupsChanged(): void {
@@ -2092,6 +2532,29 @@ export function createBrokerServer(
       database = new BrokerDatabase(dbPath, deviceId);
       stableBrokerId = database.brokerId();
       groups = new GroupState(database.groups());
+      const configSnapshot = proactiveConfig.load();
+      proactive = createProactiveCoordinator();
+      if (
+        configSnapshot.proactiveStatus === "unverified" &&
+        configSnapshot.apiKey !== undefined
+      ) {
+        void proactiveScheduler.schedule("validation", (signal) =>
+          proactiveProvider.validate(configSnapshot.apiKey!, signal)
+        ).then(() => {
+          if (proactiveConfig.snapshot().configVersion !== configSnapshot.configVersion) return;
+          proactiveConfig.saveVerified(configSnapshot.apiKey!);
+          broadcastConfigStatus();
+        }).catch((error: unknown) => {
+          if (
+            error instanceof ProactiveProviderError &&
+            error.kind === "invalid_key" &&
+            proactiveConfig.snapshot().configVersion === configSnapshot.configVersion
+          ) {
+            proactiveConfig.markInvalid();
+            broadcastConfigStatus();
+          }
+        });
+      }
       await new Promise<void>((resolveStart, rejectStart) => {
         const onError = (error: NodeJS.ErrnoException) => {
           server.off("listening", onListening);
@@ -2218,6 +2681,10 @@ export function createBrokerServer(
     clients.clear();
     sessions.clear();
     pendingRequests.clear();
+    proactive?.clear();
+    proactiveScheduler.abortAll();
+    proactive = undefined;
+    proactiveCursors.clear();
     await mdnsPublisher?.stop();
     mdnsPublisher = undefined;
     await new Promise<void>((resolveClose, rejectClose) => {

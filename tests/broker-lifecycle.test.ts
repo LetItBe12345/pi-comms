@@ -62,6 +62,7 @@ describe("Broker 空闲生命周期", () => {
       groupName: "后台群组",
       userName: "Alice",
       agentName: "Alice-Pi",
+      agentDescription: "负责测试",
       visibility: "nearby",
     });
     const welcome = await waitForMessage(

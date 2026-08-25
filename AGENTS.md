@@ -10,6 +10,7 @@
 - [TODO 总览](./TODO/README.md)：列出实施阶段、执行顺序、依赖关系和当前状态。
 - [进行中的 TODO](./TODO/in-progress/README.md)：存放尚未完成或正在实施的任务。
 - [已完成的 TODO](./TODO/done/README.md)：存放已经满足完成条件的任务，作为实施记录。
+- [TODO 决策记录](./TODO/decision/)：存放与阶段 TODO 对应的已确认设计决定。
 - [发布](./RELEASE.md)：说明 Pi Package 的发布路线、安装命令和 `package.json` 发布要求。
 - [领域语言](./docs/CONTEXT.md)：统一群组、群主、长期成员、附近加入和 Broker 的产品术语。
 - [旧 TODO 入口](./TODO(1).md)：仅用于兼容旧链接，并导航到 Specification 和 TODO 总览；不要在这里新增任务。
@@ -21,6 +22,13 @@
 - 一个任务文件的任务和完成条件全部满足后，才移入 `TODO/done/`。
 - 移动任务文件后，同步更新 `TODO/README.md` 中的状态和链接。
 - 产品规则写入 `SPECIFICATION.md`，可执行动作写入 TODO，避免重复。
+
+### Grill-me 决策记录
+
+- 使用 `grill-me` 或 `grilling` 对某个 TODO 进行访谈时，在 `TODO/decision/` 中维护对应的 Markdown 文件。
+- 文件名必须以 TODO 阶段编号开头，并与 TODO 文件使用同一个名称，例如 `18-proactive-agent-participation.md`。
+- 每累计 10 条用户已确认的决定，立即写入对应的决策文件；访谈结束时再写入不足 10 条的剩余决定。
+- 只记录用户已明确确认、否决或修改的内容。尚未回答的问题和 Agent 自己的建议不得写成已定决策。
 
 ## 2. 沟通风格
 

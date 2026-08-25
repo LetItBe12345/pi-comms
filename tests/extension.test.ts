@@ -20,6 +20,8 @@ import {
   restoreMemberships,
 } from "../src/extension/index.js";
 import type { ConnectionConfig } from "../src/extension/connection-config.js";
+import { ProactiveConfigStore } from "../src/broker/proactive-config.js";
+import { FakeProactiveRouter } from "../src/broker/proactive-provider.js";
 
 type EventHandler = (event: any, ctx: ExtensionContext) => Promise<any> | any;
 type CommandHandler = (
@@ -32,11 +34,12 @@ interface Notice {
   type?: "info" | "warning" | "error";
 }
 
-it("fork 或 clone 保留普通成员身份但不继承群主管理凭证", () => {
+it("fork 或 clone 不继承群组身份和 Proactive 设置", () => {
   const branch = [{
     type: "custom",
     customType: "pi-comms-membership",
     data: {
+      sessionId: "original-session",
       groupId: "group-a",
       groupName: "开发组",
       membershipCredential: "member-secret",
@@ -44,6 +47,7 @@ it("fork 或 clone 保留普通成员身份但不继承群主管理凭证", () =
       ownerSessionId: "original-session",
       userName: "Alice",
       agentName: "Alice-Pi",
+      agentDescription: "负责后端",
       updatedAt: 1,
       connection: { mode: "local" },
     },
@@ -59,10 +63,7 @@ it("fork 或 clone 保留普通成员身份但不继承群主管理凭证", () =
     membershipCredential: "member-secret",
     ownerCredential: "owner-secret",
   });
-  expect(forked).toMatchObject({
-    membershipCredential: "member-secret",
-  });
-  expect(forked).not.toHaveProperty("ownerCredential");
+  expect(forked).toBeUndefined();
 });
 
 class FakePi {
@@ -83,6 +84,7 @@ class FakePi {
     sendUserMessage: (content: string) => {
       this.sentUserMessages.push(content);
     },
+    appendEntry: () => undefined,
   } as unknown as ExtensionAPI;
 
   async emit(
@@ -256,6 +258,7 @@ describe("Pi Extension 群组接入", () => {
     await Promise.all([start(a), start(b)]);
     const groupId = await createGroup(a);
     await joinGroup(b, groupId);
+    await new Promise((resolve) => setTimeout(resolve, 50));
     await command(a, "comms-members");
     expect(a.notices.at(-1)?.message).toContain("Alice-Pi (Agent)");
     expect(a.notices.at(-1)?.message).toContain("Bob-Pi (Agent)");
@@ -357,7 +360,7 @@ describe("Pi Extension 群组接入", () => {
     expect(c.pi.sentUserMessages).toEqual([]);
     expect(b.pi.sentUserMessages[0]).toBe(
       [
-        "[Pi Comms 群聊请求]",
+        "[Pi Comms Remote Request]",
         "你是：Bob-Pi（Agent）",
         "所属用户：Bob",
         "来自：Alice（用户）",
@@ -366,6 +369,7 @@ describe("Pi Extension 群组接入", () => {
         "",
         "只回复 OK",
         "",
+        "你可以使用工具、修改本地项目并运行测试。",
         "你的回答会作为公开消息发送到群组「开发组」，用于回应 Alice。请直接回答。",
         "如果这个问题更适合群里其他在线 Agent 处理，可在回答开头 @Agent名称 并附上要转交的问题，任务会转给该 Agent；每次只转一次。",
       ].join("\n"),
@@ -383,6 +387,59 @@ describe("Pi Extension 群组接入", () => {
       a.pi.emit("session_shutdown", a.ctx),
       b.pi.emit("session_shutdown", b.ctx),
       c.pi.emit("session_shutdown", c.ctx),
+    ]);
+  });
+
+  it("Proactive Invitation 写入 Session History，严格取最后 Assistant 文本", async () => {
+    const config = new ProactiveConfigStore(join(directory, "config.json"));
+    config.load();
+    config.saveVerified("sk-fake-1234");
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath,
+      proactiveProvider: new FakeProactiveRouter((input) =>
+        input.candidates.find((candidate) => candidate.name === "Bob-Pi")?.agentId ?? null
+      ),
+      proactiveTimings: {
+        debounceMs: 5,
+        maxWaitMs: 10,
+        groupIntervalMs: 0,
+        cooldownMs: 0,
+        deliveryTtlMs: 500,
+      },
+    });
+    await broker.start();
+    endpoint = broker.endpoint;
+    const a = setup("session-a");
+    const b = setup("session-b");
+    await Promise.all([start(a), start(b)]);
+    const groupId = await createGroup(a);
+    await joinGroup(b, groupId);
+    await command(b, "comms-proactive", "on");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    await command(a, "comms-test", "请检查迁移事务");
+    await waitFor(() => b.pi.sentUserMessages.length === 1, "Proactive 未注入");
+    expect(b.pi.sentUserMessages[0]).toContain("[Pi Comms Proactive Invitation]");
+    expect(b.pi.sentUserMessages[0]).toContain("#1 [user] Alice: 请检查迁移事务");
+    expect(b.pi.sentUserMessages[0]).toContain("[PI_COMMS_NO_REPLY]");
+
+    await b.pi.emit("message_end", b.ctx, {
+      message: { role: "assistant", content: [{ type: "text", text: "应将迁移放在一个事务中。" }] },
+    });
+    await b.pi.emit("agent_settled", b.ctx);
+    await waitFor(
+      () => a.notices.some((notice) => notice.message === "[Bob-Pi] 应将迁移放在一个事务中。"),
+      "Proactive 结果未公开",
+    );
+    await command(a, "comms-test", "再检查一次");
+    await waitFor(() => b.pi.sentUserMessages.length === 2, "第二次 Proactive 未注入");
+    await b.pi.emit("input", b.ctx, { source: "interactive" });
+    expect(b.aborted()).toBe(1);
+    expect(b.notices.at(-1)?.message).toContain("可能留下未完成修改");
+    await Promise.all([
+      a.pi.emit("session_shutdown", a.ctx),
+      b.pi.emit("session_shutdown", b.ctx),
     ]);
   });
 

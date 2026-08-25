@@ -36,6 +36,7 @@ import type {
 type SetupStage =
   | "user"
   | "agent"
+  | "description"
   | "action"
   | "create"
   | "join"
@@ -45,15 +46,23 @@ type ConnectionState = "connecting" | "connected" | "reconnecting";
 type NetworkStatus = "available" | "paused" | "restoring" | "unavailable";
 
 export interface ChatViewActions {
-  createGroup(groupName: string, userName: string, agentName: string): string | undefined;
+  createGroup(
+    groupName: string,
+    userName: string,
+    agentName: string,
+    agentDescription: string,
+  ): string | undefined;
   joinGroup(
     groupId: string,
     userName: string,
     agentName: string,
+    agentDescription: string,
     inviteCode?: string,
   ): string | undefined;
   sendMessage(text: string): string | undefined;
   updatePermission(permission: AgentPermission): boolean;
+  updateProactive?(enabled: boolean): boolean;
+  configureBroker?(): void;
   approveRequest(requestId: string): string | undefined;
   rejectRequest(requestId: string): string | undefined;
   continueChain?(chainId: string): string | undefined;
@@ -84,11 +93,13 @@ export interface ChatViewOptions {
   actions: ChatViewActions;
   initialUserName?: string;
   initialAgentName?: string;
+  initialAgentDescription?: string;
   initialPermission?: AgentPermission;
   initialPendingRequests?: AgentRequestPayload[];
   initialPausedChains?: PausedChainPayload[];
   initialGroupName?: string;
   openGroupPanelOnJoin?: boolean;
+  showBrokerSettings?: boolean;
 }
 
 interface PendingSetup {
@@ -110,6 +121,7 @@ export class ChatView implements Component, Focusable {
   readonly #actions: ChatViewActions;
   readonly #userInput = new Input();
   readonly #agentInput = new Input();
+  readonly #descriptionInput = new Input();
   readonly #groupInput = new Input();
   readonly #inviteInput = new Input();
   readonly #editor: Editor;
@@ -151,6 +163,8 @@ export class ChatView implements Component, Focusable {
     | "help"
     | undefined;
   #permission: AgentPermission;
+  #proactiveEnabled = false;
+  #proactiveStatus: SnapshotPayload["proactiveStatus"] = "unconfigured";
   #pendingRequests: AgentRequestPayload[];
   #selectedRequest: AgentRequestPayload | undefined;
   #pausedChains: PausedChainPayload[];
@@ -162,6 +176,7 @@ export class ChatView implements Component, Focusable {
   #focused = false;
   #initialGroupName: string | undefined;
   #openGroupPanelOnJoin: boolean;
+  readonly #showBrokerSettings: boolean;
   #noticeCounter = 0;
   readonly #historicalFinalStatusIds = new Set<string>();
 
@@ -173,9 +188,11 @@ export class ChatView implements Component, Focusable {
     this.#actions = options.actions;
     this.#userInput.setValue(options.initialUserName ?? "");
     this.#agentInput.setValue(options.initialAgentName ?? "");
+    this.#descriptionInput.setValue(options.initialAgentDescription ?? "");
     this.#permission = options.initialPermission ?? "auto";
     this.#initialGroupName = options.initialGroupName;
     this.#openGroupPanelOnJoin = options.openGroupPanelOnJoin === true;
+    this.#showBrokerSettings = options.showBrokerSettings === true;
     if (this.#initialGroupName !== undefined) this.#stage = "chat";
     this.#pendingRequests = sortPendingRequests(options.initialPendingRequests ?? []);
     this.#pausedChains = sortPausedChains(options.initialPausedChains ?? []);
@@ -227,6 +244,19 @@ export class ChatView implements Component, Focusable {
         return;
       }
       this.#agentInput.setValue(value.trim());
+      this.#stage = "description";
+      this.#syncFocus();
+      this.#tui.requestRender();
+    };
+    this.#descriptionInput.onSubmit = (value) => {
+      const normalized = normalizeDescription(value);
+      if (!normalized) {
+        this.#error = "Agent Description 不能为空";
+        this.#tui.requestRender();
+        return;
+      }
+      this.#descriptionInput.setValue(normalized);
+      this.#error = undefined;
       this.#stage = "action";
       this.#syncFocus();
       this.#tui.requestRender();
@@ -239,6 +269,7 @@ export class ChatView implements Component, Focusable {
     this.#inviteInput.onSubmit = (value) => this.#submitInvite(value);
     this.#userInput.onEscape = () => this.#requestClose();
     this.#agentInput.onEscape = () => this.#goBack();
+    this.#descriptionInput.onEscape = () => this.#goBack();
     this.#groupInput.onEscape = () => {
       if (this.#panel === "rename" || this.#panel === "delete-name") {
         this.#closePanel();
@@ -267,6 +298,10 @@ export class ChatView implements Component, Focusable {
     return this.#agentInput.getValue().trim();
   }
 
+  get agentDescription(): string {
+    return normalizeDescription(this.#descriptionInput.getValue());
+  }
+
   get stage(): SetupStage {
     return this.#stage;
   }
@@ -286,6 +321,13 @@ export class ChatView implements Component, Focusable {
     this.#tui.requestRender();
   }
 
+  setProactive(enabled: boolean, status = this.#proactiveStatus): void {
+    this.#proactiveEnabled = enabled;
+    this.#proactiveStatus = status;
+    this.#permissionList = this.#createPermissionList();
+    this.#tui.requestRender();
+  }
+
   setGroups(groups: GroupSummary[]): void {
     this.#groups = sortGroups(groups);
     this.#groupList = this.#createGroupList();
@@ -294,6 +336,8 @@ export class ChatView implements Component, Focusable {
 
   applySnapshot(snapshot: SnapshotPayload): void {
     this.#snapshot = snapshot;
+    this.#proactiveEnabled = snapshot.ownProactiveEnabled === true;
+    this.#proactiveStatus = snapshot.proactiveStatus ?? "unconfigured";
     this.setGroups(snapshot.groups);
     this.#messages = dedupeMessages(snapshot.messages);
     this.#historicalFinalStatusIds.clear();
@@ -301,6 +345,7 @@ export class ChatView implements Component, Focusable {
       if (hasFinalFailureState(message)) this.#historicalFinalStatusIds.add(message.messageId);
     }
     this.#members = new Map(snapshot.members.map((member) => [member.memberId, member]));
+    this.#permissionList = this.#createPermissionList();
     this.#groupPanelList = this.#createGroupPanelList();
     if (snapshot.group !== undefined) {
       this.#stage = "chat";
@@ -525,6 +570,7 @@ export class ChatView implements Component, Focusable {
   invalidate(): void {
     this.#userInput.invalidate();
     this.#agentInput.invalidate();
+    this.#descriptionInput.invalidate();
     this.#groupInput.invalidate();
     this.#inviteInput.invalidate();
     this.#editor.invalidate();
@@ -556,6 +602,7 @@ export class ChatView implements Component, Focusable {
     switch (this.#stage) {
       case "user": return this.#userInput;
       case "agent": return this.#agentInput;
+      case "description": return this.#descriptionInput;
       case "action": return this.#actionList;
       case "create": return this.#groupInput;
       case "join": return this.#groupList;
@@ -568,6 +615,7 @@ export class ChatView implements Component, Focusable {
     for (const input of [
       this.#userInput,
       this.#agentInput,
+      this.#descriptionInput,
       this.#groupInput,
       this.#inviteInput,
       this.#editor,
@@ -591,7 +639,12 @@ export class ChatView implements Component, Focusable {
 
   #submitCreate(value: string): void {
     if (!this.#acceptName(value) || this.#pendingSetup !== undefined) return;
-    const id = this.#actions.createGroup(value.trim(), this.userName, this.agentName);
+    const id = this.#actions.createGroup(
+      value.trim(),
+      this.userName,
+      this.agentName,
+      this.agentDescription,
+    );
     if (id === undefined) {
       this.#error = "群聊暂时未连接，正在重试";
       return;
@@ -621,7 +674,8 @@ export class ChatView implements Component, Focusable {
     this.#error = undefined;
     this.#stage =
       this.#stage === "agent" ? "user" :
-      this.#stage === "action" ? "agent" :
+      this.#stage === "description" ? "agent" :
+      this.#stage === "action" ? "description" :
       this.#stage === "create" || this.#stage === "join" ? "action" :
       this.#stage === "invite" ? "join" : this.#stage;
     this.#syncFocus();
@@ -639,7 +693,7 @@ export class ChatView implements Component, Focusable {
     }
     this.#exitList = this.#createSelectList([
       { value: "cancel", label: "继续聊天", description: "保留草稿和当前任务" },
-      { value: "exit", label: "确认退出", description: "丢弃草稿并中止当前群聊任务" },
+      { value: "exit", label: "关闭界面", description: "丢弃草稿；Agent 仍保持群聊在线" },
     ]);
     this.#exitList.onSelect = (item) => {
       if (item.value === "exit") {
@@ -665,6 +719,7 @@ export class ChatView implements Component, Focusable {
     const step =
       this.#stage === "user" ? "设置用户名称" :
       this.#stage === "agent" ? "设置 Agent 名称" :
+      this.#stage === "description" ? "填写 Agent Description" :
       this.#stage === "action" ? "选择操作" :
       this.#stage === "create" ? "创建群组" :
       this.#stage === "invite" ? "输入群组邀请码" : "选择群组";
@@ -716,7 +771,7 @@ export class ChatView implements Component, Focusable {
     const busy = online.filter((member) => member.type === "agent" && member.agentStatus === "busy").length;
     const pending = this.#pendingRequests.length + this.#pausedChains.length;
     const first = `${state} · 在线 ${onlineUsers} · Agent 忙碌 ${busy}`;
-    const second = `接收 ${permissionLabel(this.#permission)} · 待处理 ${pending}`;
+    const second = `被 @ 时 ${permissionLabel(this.#permission)} · 主动参与 ${this.#proactiveEnabled ? "开启" : "关闭"} · 待处理 ${pending}`;
     if (width < 60) {
       return [first, second].map((line) => truncateToWidth(this.#theme.fg("muted", line), width));
     }
@@ -727,7 +782,11 @@ export class ChatView implements Component, Focusable {
     const entries = [
       ...this.#messages.map((message) => ({ ...message, entryType: "message" as const })),
       ...this.#notices.map((notice) => ({ ...notice, entryType: "notice" as const })),
-    ].sort((a, b) => a.timestamp - b.timestamp);
+    ].sort((a, b) =>
+      a.entryType === "message" && b.entryType === "message"
+        ? a.groupSeq - b.groupSeq
+        : a.timestamp - b.timestamp
+    );
     const result: string[] = [];
     let currentDate = "";
     let previousMessage: HistoryMessage | undefined;
@@ -780,7 +839,7 @@ export class ChatView implements Component, Focusable {
   #renderExit(width: number): string[] {
     return [
       this.#theme.bold("退出群聊？"),
-      this.#theme.fg("warning", "草稿会丢失，正在处理的群聊请求会中止。"),
+      this.#theme.fg("warning", "草稿会丢失；关闭界面不会停止 Agent 的群聊任务。"),
       "",
       ...(this.#exitList?.render(width) ?? []),
       "",
@@ -912,12 +971,31 @@ export class ChatView implements Component, Focusable {
         label: `禁止接收${this.#permission === "blocked" ? current : ""}`,
         description: "拒绝新的 @Agent 请求",
       },
+      {
+        value: "proactive",
+        label: `主动参与：${this.#proactiveEnabled ? "开启" : "关闭"}`,
+        description: proactiveStatusDescription(this.#proactiveStatus),
+      },
+      ...(this.#showBrokerSettings ? [{
+        value: "broker-config",
+        label: "Broker 设置",
+        description: "配置独立的 DeepSeek Router API Key",
+      }] : []),
     ]);
     list.onSelect = (item) => {
       if (item.value === "pending") {
         this.#panel = "pending";
       } else if (item.value === "chains") {
         this.#panel = "chains";
+      } else if (item.value === "proactive") {
+        const enabled = !this.#proactiveEnabled;
+        const synced = this.#actions.updateProactive?.(enabled) ?? false;
+        if (synced) this.#proactiveEnabled = enabled;
+        this.#panel = undefined;
+        this.#error = synced ? undefined : proactiveStatusDescription(this.#proactiveStatus);
+      } else if (item.value === "broker-config") {
+        this.#panel = undefined;
+        this.#actions.configureBroker?.();
       } else {
         const permission = item.value as AgentPermission;
         this.#permission = permission;
@@ -1054,7 +1132,9 @@ export class ChatView implements Component, Focusable {
         return {
           value: `member:${member.memberId}`,
           label: `${state} · ${member.displayName}${member.isOwner ? " [群主]" : ""}`,
-          description: `Agent：${agent?.displayName ?? "未命名"}${lastActive}`,
+          description: `Agent：${agent?.displayName ?? "未命名"}${
+            agent?.agentDescription ? ` · ${agent.agentDescription}` : ""
+          }${lastActive}`,
         };
       });
     const items: SelectItem[] = !isOwner || settings === undefined ? [
@@ -1337,7 +1417,12 @@ export class ChatView implements Component, Focusable {
     list.onSelect = (item) => {
       if (this.#pendingSetup !== undefined) return;
       this.#pendingJoinGroupId = item.value;
-      const id = this.#actions.joinGroup(item.value, this.userName, this.agentName);
+      const id = this.#actions.joinGroup(
+        item.value,
+        this.userName,
+        this.agentName,
+        this.agentDescription,
+      );
       if (id === undefined) {
         this.#error = "群聊暂时未连接，正在重试";
       } else {
@@ -1366,6 +1451,7 @@ export class ChatView implements Component, Focusable {
       this.#pendingJoinGroupId,
       this.userName,
       this.agentName,
+      this.agentDescription,
       inviteCode,
     );
     if (id === undefined) {
@@ -1467,7 +1553,8 @@ function networkStatusLabel(status: NetworkStatus): string {
 }
 
 function dedupeMessages(messages: HistoryMessage[]): HistoryMessage[] {
-  return [...new Map(messages.map((message) => [message.messageId, { ...message }])).values()];
+  return [...new Map(messages.map((message) => [message.messageId, { ...message }])).values()]
+    .sort((a, b) => a.groupSeq - b.groupSeq);
 }
 
 function alignMessageBlock(
@@ -1594,4 +1681,17 @@ function failureText(reason?: string): string {
     case "empty_mention": return "@Agent 后缺少内容";
     default: return "请求处理失败";
   }
+}
+
+function normalizeDescription(value: string): string {
+  return [...value.trim().replace(/\s+/gu, " ")].slice(0, 240).join("");
+}
+
+function proactiveStatusDescription(status: SnapshotPayload["proactiveStatus"]): string {
+  if (status === "ready") return "由 Broker 判断何时邀请；Agent 仍可沉默";
+  if (status === "temporarily_unavailable") return "Router 暂时不可用，已保存的开关不变";
+  if (status === "unverified") return "Broker Key 尚未验证";
+  if (status === "invalid_key") return "Broker Key 已失效";
+  if (status === "config_error") return "Broker 配置文件无法读取";
+  return "群聊主机未配置 Proactive Router";
 }

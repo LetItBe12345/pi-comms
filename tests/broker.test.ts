@@ -18,6 +18,8 @@ import {
   type BrokerServer,
 } from "../src/broker/server.js";
 import type { TcpConnectEndpoint } from "../src/transport/tcp-endpoint.js";
+import { ProactiveConfigStore } from "../src/broker/proactive-config.js";
+import { FakeProactiveRouter } from "../src/broker/proactive-provider.js";
 
 type BrokerEnvelopeType = BrokerEnvelope["type"];
 type EnvelopeByType<T extends BrokerEnvelopeType> = Extract<
@@ -199,7 +201,12 @@ describe("Local Broker 群组与成员", () => {
     userName = "Alice",
     agentName = "Alice-Pi",
   ) {
-    client.send("group.create", { groupName, userName, agentName });
+    client.send("group.create", {
+      groupName,
+      userName,
+      agentName,
+      agentDescription: `${agentName} 测试 Agent`,
+    });
     return client.waitFor("snapshot", (message) => message.payload.group !== undefined);
   }
 
@@ -209,7 +216,12 @@ describe("Local Broker 群组与成员", () => {
     userName = "Bob",
     agentName = "Bob-Pi",
   ) {
-    client.send("group.join", { groupId, userName, agentName });
+    client.send("group.join", {
+      groupId,
+      userName,
+      agentName,
+      agentDescription: `${agentName} 测试 Agent`,
+    });
     return client.waitFor(
       "snapshot",
       (message) => message.payload.group?.groupId === groupId,
@@ -340,7 +352,12 @@ describe("Local Broker 群组与成员", () => {
     const created = await createGroup(a);
     const groupId = created.payload.group!.groupId;
     const b = await connect();
-    b.send("group.join", { groupId, userName: "alice", agentName: "Bob-Pi" }, "name-conflict");
+    b.send("group.join", {
+      groupId,
+      userName: "alice",
+      agentName: "Bob-Pi",
+      agentDescription: "负责测试",
+    }, "name-conflict");
     expect(
       await b.waitFor("error", (message) => message.payload.requestId === "name-conflict"),
     ).toMatchObject({ payload: { code: "member_name_conflict" } });
@@ -350,6 +367,7 @@ describe("Local Broker 群组与成员", () => {
       groupName: "非法 群",
       userName: "Carol",
       agentName: "Carol-Pi",
+      agentDescription: "负责测试",
     }, "invalid-name");
     expect(
       await c.waitFor("error", (message) => message.payload.requestId === "invalid-name"),
@@ -359,10 +377,54 @@ describe("Local Broker 群组与成员", () => {
       groupName: "新群",
       userName: "A2",
       agentName: "A2-Pi",
+      agentDescription: "负责测试",
     }, "already-in-group");
     expect(
       await a.waitFor("error", (message) => message.payload.requestId === "already-in-group"),
     ).toMatchObject({ payload: { code: "already_in_group" } });
+  });
+
+  it("Description 按成员持久化、规范化，入群后不可更改", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect();
+    b.send("group.join", {
+      groupId,
+      userName: "Bob",
+      agentName: "Bob-Pi",
+      agentDescription: "  负责\n SQLite   迁移  ",
+    });
+    const welcome = await b.waitFor("membership.welcome");
+    const joined = await b.waitFor(
+      "snapshot",
+      (message) => message.payload.group?.groupId === groupId,
+    );
+    expect(joined.payload.members.find(
+      (member) => member.clientId === b.clientId && member.type === "agent",
+    )?.agentDescription).toBe("负责 SQLite 迁移");
+    const visible = await a.waitFor(
+      "presence.changed",
+      (message) => message.payload.memberId === `agent:${b.clientId}`,
+    );
+    expect(visible.payload.agentDescription).toBe("负责 SQLite 迁移");
+    expect(visible.payload).not.toHaveProperty("proactiveEnabled");
+
+    await b.close();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const resumed = await connect(b.sessionId);
+    resumed.send("group.join", {
+      groupId,
+      membershipCredential: welcome.payload.membershipCredential,
+      agentDescription: "企图更改的 Description",
+    });
+    const restored = await resumed.waitFor(
+      "snapshot",
+      (message) => message.payload.group?.groupId === groupId,
+    );
+    expect(restored.payload.members.find(
+      (member) => member.clientId === resumed.clientId && member.type === "agent",
+    )?.agentDescription).toBe("负责 SQLite 迁移");
   });
 
   it("群名唯一，群主不能退出且离线群仍保留", async () => {
@@ -378,6 +440,7 @@ describe("Local Broker 群组与成员", () => {
       groupName: "team-a",
       userName: "Bob",
       agentName: "Bob-Pi",
+      agentDescription: "负责测试",
     }, "duplicate-group");
     expect(
       await b.waitFor("error", (message) => message.payload.requestId === "duplicate-group"),
@@ -794,6 +857,77 @@ describe("Local Broker 群组与成员", () => {
     expect(
       (await a.waitFor("chat.message", (message) => message.id === "after-error")).payload.text,
     ).toBe("仍然在线");
+  });
+
+  it("Fake Router 从人类消息选择一个 Agent，并隐藏其他人的开关", async () => {
+    await broker.close();
+    const config = new ProactiveConfigStore(join(directory, "config.json"));
+    config.load();
+    config.saveVerified("sk-fake-1234");
+    let targetAgentId: string | undefined;
+    let routeCalls = 0;
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath,
+      disconnectGraceMs: 80,
+      proactiveProvider: new FakeProactiveRouter(() => {
+        routeCalls += 1;
+        return targetAgentId ?? null;
+      }),
+      proactiveTimings: {
+        debounceMs: 5,
+        maxWaitMs: 10,
+        groupIntervalMs: 0,
+        cooldownMs: 0,
+        deliveryTtlMs: 500,
+      },
+    });
+    await broker.start();
+    endpoint = broker.endpoint;
+
+    const a = await connect();
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect();
+    const joined = await joinGroup(b, groupId);
+    targetAgentId = joined.payload.members.find(
+      (member) => member.clientId === b.clientId && member.type === "agent",
+    )!.memberId;
+    b.send("proactive.update", {
+      groupId,
+      enabled: true,
+      lastSeenGroupSeq: 0,
+    });
+    expect((await b.waitFor("proactive.update.ack")).payload.accepted).toBe(true);
+
+    a.send("chat.send", { text: "请检查这个数据库迁移" });
+    const delivery = await b.waitFor("proactive.deliver");
+    expect(delivery.payload).toMatchObject({
+      groupId,
+      targetAgentId,
+      triggerFromSeq: 1,
+      triggerToSeq: 1,
+      observedToSeq: 1,
+    });
+    b.send("proactive.result", {
+      proactiveId: delivery.payload.proactiveId,
+      action: "answer",
+      text: "迁移需要放在一个事务中。",
+    });
+    expect((await b.waitFor("proactive.result.ack")).payload.accepted).toBe(true);
+    const answer = await a.waitFor(
+      "chat.message",
+      (message) => message.payload.text === "迁移需要放在一个事务中。",
+    );
+    expect(answer.payload).toMatchObject({ senderType: "agent", groupSeq: 2 });
+    expect(a.messages.some((message) =>
+      message.type === "presence.changed" && "proactiveEnabled" in message.payload
+    )).toBe(false);
+
+    const callsBeforeMention = routeCalls;
+    a.send("chat.send", { text: "@Bob-Pi 请直接回答" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(routeCalls).toBe(callsBeforeMention);
   });
 
   it("拒绝同一数据库的第二个 Broker，并支持临时端口", async () => {

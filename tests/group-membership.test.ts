@@ -91,6 +91,7 @@ describe("每群邀请与长期成员", () => {
       groupName: "分布式开发组",
       userName: "Alice",
       agentName: "Alice-Pi",
+      agentDescription: "负责测试",
       visibility: "nearby",
       inviteRequired: true,
     });
@@ -124,6 +125,7 @@ describe("每群邀请与长期成员", () => {
       groupId: created.groupId,
       userName: "Bob",
       agentName: "Bob-Pi",
+      agentDescription: "负责测试",
       inviteCode: created.inviteCode,
     });
     const joined = await bob.waitFor(
@@ -168,6 +170,7 @@ describe("每群邀请与长期成员", () => {
       groupId: created.groupId,
       userName: "Bob",
       agentName: "Bob-Pi",
+      agentDescription: "负责测试",
     });
     const error = await member.waitFor(
       (message) => message.type === "error" &&
@@ -189,6 +192,7 @@ describe("每群邀请与长期成员", () => {
       groupName: "开放开发组",
       userName: "Alice",
       agentName: "Alice-Pi",
+      agentDescription: "负责测试",
       visibility: "nearby",
     });
     const created = await owner.waitFor(
@@ -216,6 +220,7 @@ describe("每群邀请与长期成员", () => {
       groupId: created.payload.groupId,
       userName: "Bob",
       agentName: "Bob-Pi",
+      agentDescription: "负责测试",
     });
     await expect(member.waitFor(
       (message) => message.type === "membership.welcome",
@@ -250,6 +255,7 @@ describe("每群邀请与长期成员", () => {
         groupId: created.groupId,
         userName: `User${index}`,
         agentName: `Agent${index}`,
+        agentDescription: "负责测试",
         inviteCode: "ZZZZZZZZZZ",
       });
       const error = await session.waitFor((message) => message.type === "error");
@@ -288,6 +294,7 @@ describe("每群邀请与长期成员", () => {
       groupId: created.groupId,
       userName: "Bob",
       agentName: "Bob-Pi",
+      agentDescription: "负责测试",
       inviteCode: created.inviteCode,
     });
     const memberWelcome = await bob.waitFor(
@@ -345,6 +352,7 @@ describe("每群邀请与长期成员", () => {
       groupId: created.groupId,
       userName: "Bob",
       agentName: "Bob-Pi",
+      agentDescription: "负责测试",
       inviteCode: created.inviteCode,
     });
     const welcome = await bob.waitFor(
