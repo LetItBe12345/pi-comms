@@ -28,6 +28,7 @@ describe("GroupState", () => {
     const membership = state.createGroup("client-a", "群组", "用户", "助手");
     expect(membership.user.memberId).toBe("user:client-a");
     expect(membership.agent.memberId).toBe("agent:client-a");
+    expect(membership.agent.proactiveEnabled).toBe(true);
     expect(state.onlineMembers(membership.groupId)).toHaveLength(2);
   });
 });

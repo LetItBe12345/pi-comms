@@ -23,3 +23,4 @@
 - [阶段 16A：跨平台自动化与局域网验收准备](./16a-cross-platform-automation.md)
 - [阶段 17：附近群组默认开放加入](./17-open-nearby-join.md)
 - [阶段 18：Proactive Agent Participation](./18-proactive-agent-participation.md)
+- [阶段 19：Proactive 默认开启](./19-proactive-default-on.md)

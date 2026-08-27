@@ -1,6 +1,6 @@
 # 阶段 18：Proactive Agent Participation 决策记录
 
-本文档记录针对 [阶段 18 TODO](../in-progress/18-proactive-agent-participation.md) 已经确认的设计决定。未完成的讨论不写入本文档。
+本文档记录针对 [阶段 18 TODO](../done/18-proactive-agent-participation.md) 已经确认的设计决定。未完成的讨论不写入本文档。
 
 ## 群组授权与 Agent Profile
 
@@ -8,7 +8,7 @@
 2. 不增加“群聊内容会发送给外部 Router”的额外提示或成员列表状态。
 3. `Agent Description` 在创建或加入群组时必填，不受 Proactive 开关影响。
 4. `Agent Description` 按 Pi Session 和群组独立保存，使用该 Session 加入该群时填写的内容，不从其他群组继承。
-5. `proactiveEnabled` 按 Pi Session 和 `groupId` 保存。首次加入新群时默认关闭，恢复同一群组时才恢复该群的原状态。
+5. `proactiveEnabled` 按 Pi Session 和 `groupId` 保存。阶段 19 将首次加入新群的默认值改为开启；恢复同一群组时恢复该群的原状态，已明确保存的关闭状态不变。
 6. 显式 `@Agent` 永远只走现有定向链路。目标 Agent 离线、忙碌、拒绝或处理失败时，Proactive 不改选其他 Agent。
 
 ## Broker 模型与本机配置
@@ -20,7 +20,7 @@
 11. 首次建群时如果尚未配置 Key，允许跳过。跳过后普通群聊和显式 `@Agent` 正常工作，可以稍后补充配置。
 12. 写入配置前先通过 DeepSeek 官方 API 验证 Key。Key 无效时不保存；网络不可用时可保存为“未验证”，但验证成功前不能开启 Proactive。
 13. 只有 Broker 本机用户可以配置、更换或删除 Key。远程客户端只能读取 `proactiveAvailable: true | false`，不能查看或修改 Key。
-14. Broker 缺少已验证的 Key 时，TUI 保留 Proactive 开关但禁止开启，并显示“群聊主机未配置 Proactive Router”。
+14. Broker 缺少已验证的 Key 时，TUI 保留 Proactive 开关并显示“群聊主机未配置 Proactive Router”。开关可以保存，但 Broker 不调用 Router。
 
 ## Router 调度
 
@@ -140,7 +140,7 @@
 92. Broker 在内存中保留已完成 `proactiveId` 10 分钟。重复结果只回 ACK，不再发布。去重记录不写 SQLite，Broker 重启后清空。
 93. Broker 发送 `proactive.deliver` 后没有收到 Extension ACK 时不重发 delivery，等 10 秒 TTL 到期后清理。显式 `agent.deliver` 继续使用现有可靠投递机制。
 94. Router 判断完成后、发送 delivery 前，Broker 把当前最新公开消息补入 Observation。协议同时保留 Router 的 `triggerToSeq` 和 Agent 实际观察的 `observedToSeq`。Freshness 只检查 `observedToSeq` 之后的新消息。
-95. 用户 fork 或 clone 一个已加群且开启 Proactive 的 Pi Session 时，新 Session 不继承 membership、Description 或 Proactive 开关。必须独立加入群组，重新填写 Description，且 Proactive 默认关闭。
+95. 用户 fork 或 clone 一个已加群的 Pi Session 时，新 Session 不继承 membership、Description 或 Proactive 开关。必须独立加入群组并重新填写 Description；独立加入后使用阶段 19 定义的默认开启状态。
 
 ## DeepSeek JSON 输出规则
 
@@ -179,13 +179,13 @@
 
 ## 重连时的权威数据
 
-119. Session 重连时，`proactiveEnabled` 以该 Session 针对当前 `groupId` 保存的 custom entry 为准。Extension 在加入或重连时发送该值，Broker 立即更新 SQLite 和 GroupState。Session 没有记录时按 `false`，Broker 不得根据 SQLite 自动反向开启。
+119. Session 重连时，`proactiveEnabled` 以该 Session 针对当前 `groupId` 保存的 custom entry 为准。Extension 在加入或重连时发送该值，Broker 立即更新 SQLite 和 GroupState。阶段 19 起，Session 没有记录时按 `true`；已有的 `false` 记录仍保持关闭，Broker 不得用 SQLite 值覆盖 Session 设置。
 120. `Agent Description` 在首次加入后以 Broker membership 中的值为准。重连时 Broker 返回该值，Extension 用它构建稳定提示词。只有 Broker 记录为空的旧数据才要求用户补填。
 
 ## Session 开关同步与建群流程
 
 121. 用户切换 Proactive 开关时，Extension 先持久化 Session custom entry，再发送 `proactive.update`。本地保存失败时不更新 Broker；Broker 断线时保留本地值，重连后重新发送。
-122. Extension 本地已保存开启，但 Broker 因 Key 失效、配置错误或权限校验拒绝 `proactive.update` 时，Broker 返回 ACK 和拒绝原因。Extension 把 custom entry 和 UI 回滚到切换前状态并显示原因。已经开启后才发生的 Broker 故障仍保留开关。
+122. Extension 本地保存开关后，Broker 只在 Session 不属于目标群组时拒绝 `proactive.update`，并返回 ACK 和原因。Key 失效或配置错误只改变 Broker 能力状态，不清除开关。Broker 拒绝时，Extension 把 custom entry 和 UI 回滚到切换前状态并显示原因。
 123. 创建群组时按顺序收集用户名称、Agent 名称、Agent Description、群组名称和加入方式，然后检查 Broker Key，允许配置或跳过，最后才真正写入并创建群组。Key 验证失败或用户取消时仍可选择跳过，不留下半创建群组。
 
 ## Description 和 Proactive 状态的可见性

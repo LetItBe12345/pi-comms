@@ -63,6 +63,7 @@ const MEMBERSHIP_REMOVED_ENTRY = "pi-comms-membership-removed";
 const DEFAULT_NAMES_ENTRY = "pi-comms-default-names";
 const PROACTIVE_ENTRY = "pi-comms-proactive";
 const PROACTIVE_CURSOR_ENTRY = "pi-comms-proactive-cursor";
+const DEFAULT_PROACTIVE_ENABLED = true;
 const DEFAULT_RESULT_RETRY_INTERVAL_MS = 1_000;
 const DEFAULT_BROKER_START_TIMEOUT_MS = 8_000;
 
@@ -644,7 +645,7 @@ export function createCommsExtension(
           activeView?.setProactive(
             currentGroup === undefined
               ? false
-              : proactiveEnabledByGroup.get(currentGroup.groupId) === true,
+              : proactiveEnabled(proactiveEnabledByGroup, currentGroup.groupId),
             proactiveStatus,
           );
           if (message.payload.message !== undefined) {
@@ -838,7 +839,11 @@ export function createCommsExtension(
             savedMemberships.set(membershipKey(savedMembership), savedMembership);
             pi.appendEntry(MEMBERSHIP_ENTRY, savedMembership);
           }
-          const desiredEnabled = proactiveEnabledByGroup.get(snapshot.group.groupId) ?? false;
+          const desiredEnabled = proactiveEnabled(
+            proactiveEnabledByGroup,
+            snapshot.group.groupId,
+          );
+          activeView?.setProactive(desiredEnabled, proactiveStatus);
           brokerClient.send("proactive.update", {
             groupId: snapshot.group.groupId,
             enabled: desiredEnabled,
@@ -905,7 +910,7 @@ export function createCommsExtension(
     }
 
     function handleProactiveDelivery(delivery: ProactiveDeliverPayload): void {
-      const enabled = proactiveEnabledByGroup.get(delivery.groupId) === true;
+      const enabled = proactiveEnabled(proactiveEnabledByGroup, delivery.groupId);
       let reason:
         | "proactive_disabled"
         | "expired"
@@ -1630,12 +1635,10 @@ export function createCommsExtension(
                 },
                 updateProactive: (enabled) => {
                   if (currentGroup === undefined) return false;
-                  const previous = proactiveEnabledByGroup.get(currentGroup.groupId) ?? false;
-                  if (
-                    enabled &&
-                    proactiveStatus !== "ready" &&
-                    proactiveStatus !== "temporarily_unavailable"
-                  ) return false;
+                  const previous = proactiveEnabled(
+                    proactiveEnabledByGroup,
+                    currentGroup.groupId,
+                  );
                   try {
                     pi.appendEntry(PROACTIVE_ENTRY, {
                       sessionId,
@@ -1868,7 +1871,7 @@ export function createCommsExtension(
                 pausedChains: [...pausedChains.values()],
                 proactiveStatus,
                 ownProactiveEnabled:
-                  proactiveEnabledByGroup.get(currentGroup.groupId) === true,
+                  proactiveEnabled(proactiveEnabledByGroup, currentGroup.groupId),
                 ...(currentGroupSettings === undefined
                   ? {}
                   : { groupSettings: currentGroupSettings }),
@@ -2098,6 +2101,13 @@ function restoreProactiveSettings(ctx: ExtensionContext): Map<string, boolean> {
     }
   }
   return result;
+}
+
+function proactiveEnabled(
+  settings: ReadonlyMap<string, boolean>,
+  groupId: string,
+): boolean {
+  return settings.get(groupId) ?? DEFAULT_PROACTIVE_ENABLED;
 }
 
 function restoreProactiveCursors(ctx: ExtensionContext): Map<string, number> {

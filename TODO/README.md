@@ -33,10 +33,11 @@
 | 16B | [三台真实设备局域网验收](./in-progress/16b-real-lan-acceptance.md) | 使用真实 macOS/Linux 设备验收局域网链路 | in-progress（等待设备） | 阶段 16A |
 | 17 | [附近群组默认开放加入](./done/17-open-nearby-join.md) | 默认直接加入，创建时可选邀请码 | done | 阶段 15 |
 | 18 | [Proactive Agent Participation](./done/18-proactive-agent-participation.md) | 用户显式授权后，由 Broker 使用 DeepSeek-V4-Flash 主动选择最多一个 Agent 参与群聊 | done | 阶段 17 |
+| 19 | [Proactive 默认开启](./done/19-proactive-default-on.md) | 默认允许 Agent 主动参与，同时保留显式关闭和旧设置 | done | 阶段 18 |
 
 ## 当前里程碑
 
-阶段 0～16A、17 和 18 已完成。阶段 16B 等待三台真实设备。
+阶段 0～16A、17～19 已完成。阶段 16B 等待三台真实设备。
 
 ## 维护规则
 
