@@ -859,6 +859,24 @@ describe("Local Broker 群组与成员", () => {
     ).toBe("仍然在线");
   });
 
+  it("未配置 Router 时仍保存默认开启和显式开关", async () => {
+    const a = await connect();
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    expect(created.payload.proactiveStatus).toBe("unconfigured");
+    expect(created.payload.ownProactiveEnabled).toBe(true);
+
+    a.send("proactive.update", { groupId, enabled: false });
+    expect(await a.waitFor("proactive.update.ack")).toMatchObject({
+      payload: { enabled: false, accepted: true },
+    });
+    a.send("proactive.update", { groupId, enabled: true });
+    expect(await a.waitFor(
+      "proactive.update.ack",
+      (message) => message.payload.enabled === true,
+    )).toMatchObject({ payload: { accepted: true } });
+  });
+
   it("Fake Router 从人类消息选择一个 Agent，并隐藏其他人的开关", async () => {
     await broker.close();
     const config = new ProactiveConfigStore(join(directory, "config.json"));
@@ -893,12 +911,7 @@ describe("Local Broker 群组与成员", () => {
     targetAgentId = joined.payload.members.find(
       (member) => member.clientId === b.clientId && member.type === "agent",
     )!.memberId;
-    b.send("proactive.update", {
-      groupId,
-      enabled: true,
-      lastSeenGroupSeq: 0,
-    });
-    expect((await b.waitFor("proactive.update.ack")).payload.accepted).toBe(true);
+    expect(joined.payload.ownProactiveEnabled).toBe(true);
 
     a.send("chat.send", { text: "请检查这个数据库迁移" });
     const delivery = await b.waitFor("proactive.deliver");

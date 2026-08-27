@@ -356,7 +356,7 @@ export class GroupState {
         agentPermission: "auto",
         pendingApprovalCount: 0,
         agentDescription,
-        proactiveEnabled: false,
+        proactiveEnabled: true,
         ...(stableSessionKey === undefined ? {} : { stableSessionKey }),
       },
     };

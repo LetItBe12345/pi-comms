@@ -163,7 +163,7 @@ export class ChatView implements Component, Focusable {
     | "help"
     | undefined;
   #permission: AgentPermission;
-  #proactiveEnabled = false;
+  #proactiveEnabled = true;
   #proactiveStatus: SnapshotPayload["proactiveStatus"] = "unconfigured";
   #pendingRequests: AgentRequestPayload[];
   #selectedRequest: AgentRequestPayload | undefined;

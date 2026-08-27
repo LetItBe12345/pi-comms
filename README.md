@@ -134,8 +134,8 @@ Pi Session 的模型和 Key。Broker 固定使用 DeepSeek 官方 API 和
 
 在 `/comms` 首页打开“Broker 设置”，输入 DeepSeek API Key。Key 验证成功后会保存在
 Broker 所在机器的 `~/.pi/comms/config.json`，以后创建群组或重启 Broker 会继续使用。
-每个 Agent 的 Proactive 开关按 Pi Session 和群组独立保存，默认关闭，由该
-Session 的用户在 `Ctrl+P` 面板中开启。
+每个 Agent 的 Proactive 开关按 Pi Session 和群组独立保存，默认开启。该
+Session 的用户可以在 `Ctrl+P` 面板中显式关闭；Broker Router 没有就绪时不会发起模型调用。
 
 ## 多用户协作
 

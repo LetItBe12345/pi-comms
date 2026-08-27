@@ -70,6 +70,7 @@ class FakePi {
   readonly handlers = new Map<string, EventHandler>();
   readonly commands = new Map<string, CommandHandler>();
   readonly sentUserMessages: string[] = [];
+  readonly appendedEntries: unknown[] = [];
 
   readonly api = {
     on: (event: string, handler: EventHandler) => {
@@ -84,7 +85,9 @@ class FakePi {
     sendUserMessage: (content: string) => {
       this.sentUserMessages.push(content);
     },
-    appendEntry: () => undefined,
+    appendEntry: (customType: string, data: unknown) => {
+      this.appendedEntries.push({ type: "custom", customType, data });
+    },
   } as unknown as ExtensionAPI;
 
   async emit(
@@ -390,7 +393,7 @@ describe("Pi Extension 群组接入", () => {
     ]);
   });
 
-  it("Proactive Invitation 写入 Session History，严格取最后 Assistant 文本", async () => {
+  it("Proactive 默认开启并保留显式关闭，Invitation 严格取最后 Assistant 文本", async () => {
     const config = new ProactiveConfigStore(join(directory, "config.json"));
     config.load();
     config.saveVerified("sk-fake-1234");
@@ -415,7 +418,6 @@ describe("Pi Extension 群组接入", () => {
     await Promise.all([start(a), start(b)]);
     const groupId = await createGroup(a);
     await joinGroup(b, groupId);
-    await command(b, "comms-proactive", "on");
     await new Promise((resolve) => setTimeout(resolve, 30));
 
     await command(a, "comms-test", "请检查迁移事务");
@@ -437,9 +439,24 @@ describe("Pi Extension 群组接入", () => {
     await b.pi.emit("input", b.ctx, { source: "interactive" });
     expect(b.aborted()).toBe(1);
     expect(b.notices.at(-1)?.message).toContain("可能留下未完成修改");
+    await command(b, "comms-proactive", "off");
+    await command(a, "comms-test", "关闭后不应参与");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(b.pi.sentUserMessages).toHaveLength(2);
+    await b.pi.emit("session_shutdown", b.ctx);
+
+    const restored = setup("session-b", b.pi.appendedEntries);
+    await start(restored);
+    await waitFor(
+      () => restored.notices.some((notice) => notice.message.includes("已加入群组")),
+      "未恢复群组",
+    );
+    await command(a, "comms-test", "恢复后仍保持关闭");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(restored.pi.sentUserMessages).toHaveLength(0);
     await Promise.all([
       a.pi.emit("session_shutdown", a.ctx),
-      b.pi.emit("session_shutdown", b.ctx),
+      restored.pi.emit("session_shutdown", restored.ctx),
     ]);
   });
 

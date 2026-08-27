@@ -713,10 +713,10 @@ pi-comms/
 - Description 属于当前 Pi Session 在当前群的 membership。加入后不可编辑；只有主动离群并重新加入时才能重新填写。
 - Description 对已入群成员公开，离线后继续可见。附近发现、完整邀请信息和未入群客户端不得获得成员 Description。
 - 旧 membership 缺少 Description 时不自动从 cwd、仓库名或 `AGENTS.md` 生成。用户下次打开 `/comms` 补填前保持未入群。
-- Proactive 是独立于 `AgentPermission` 的布尔开关，默认关闭。每个 Session 按 `groupId` 保存自己的开关；首次加入新群一律关闭，恢复同一群时恢复该群原值。
+- Proactive 是独立于 `AgentPermission` 的布尔开关，默认开启。每个 Session 按 `groupId` 保存自己的开关；首次加入新群时开启，恢复同一群时恢复该群原值。
 - 开关只由对应 Pi Session 的控制用户修改。Broker 所有者、群主、其他用户和其他 Agent 都不得代为开启或关闭。
 - 其他群成员不得在 Snapshot、presence 或 TUI 中获得 `proactiveEnabled`。Agent 主人可以看自己的值，Broker 内部保留真实值。
-- Extension 切换开关时先写 Session custom entry，再发送 `proactive.update`。Broker 拒绝时返回原因，Extension 回滚本地值和 UI。重连时以 Session custom entry 为准，缺失时按 `false`。
+- Extension 切换开关时先写 Session custom entry，再发送 `proactive.update`。Broker 拒绝时返回原因，Extension 回滚本地值和 UI。重连时以 Session custom entry 为准，缺失时按 `true`。已明确保存的 `false` 必须继续保持关闭。
 - fork 或 clone 出的新 Pi Session 不继承 membership、Description 或 Proactive 开关。
 
 ### 19.2 Broker 模型与本机配置
@@ -728,7 +728,7 @@ pi-comms/
 - 首次建群可以配置或跳过 Key。跳过不影响普通群聊和显式 `@Agent`。`DEEPSEEK_API_KEY` 只作为配置文件为空时的首次迁移来源，必须经本机用户确认。
 - Key 保存前使用最小 `deepseek-v4-flash` 请求验证 Key、账户和模型权限。首次配置遇到网络故障可保存为未验证，但不能启用 Proactive；已有有效 Key 时不得用未验证新 Key 覆盖。
 - 更换 Key 先验证新值，成功后再替换。删除 Key 立即取消在途 Router/Freshness HTTP 请求，但不强制中止已进入 Pi Session 的生成。
-- Broker 使用 `ready | unconfigured | unverified | invalid_key | temporarily_unavailable | config_error` 表示 Proactive 能力。仅 `ready` 实际调用 Router；`ready` 和 `temporarily_unavailable` 允许用户新打开开关，其他状态禁止新打开。任何状态都允许关闭。
+- Broker 使用 `ready | unconfigured | unverified | invalid_key | temporarily_unavailable | config_error` 表示 Proactive 能力。开关状态与 Broker 能力状态分开保存；任何状态都允许开启或关闭，但仅 `ready` 实际调用 Router。
 - `401/403` 把 Key 持久化标记为无效。未验证 Key 每次 Broker 启动时自动验证一次，设置页也提供手动重新验证。
 - 配置文件损坏或不可读时进入 `config_error`。重建配置前把旧文件重命名为带时间戳的 `0600` 备份，不自动删除。
 - 日志、错误、Snapshot 和协议回复不得包含完整 Key。
@@ -789,7 +789,7 @@ pi-comms/
 
 - 每群公开消息使用从 1 开始的单调 `groupSeq`，SQLite 对 `(group_id, group_seq)` 建唯一索引。Snapshot、history 和 TUI 统一按 `groupSeq ASC` 排序，timestamp 只用于显示。
 - 旧消息在一个事务中按每群 `timestamp ASC, rowid ASC` 补齐 seq，再建立唯一索引。
-- SQLite 的 `group_memberships` 增加 `agent_description TEXT NOT NULL DEFAULT ''` 和 `proactive_enabled INTEGER NOT NULL DEFAULT 0`。老数据迁移后 Proactive 一律默认关闭。
+- 新建 SQLite 数据库的 `group_memberships` 使用 `agent_description TEXT NOT NULL DEFAULT ''` 和 `proactive_enabled INTEGER NOT NULL DEFAULT 1`。从旧数据库增加该列时仍使用 `DEFAULT 0`，避免迁移过程直接改写旧成员；对应 Session 重连后，以 Session custom entry 为准，缺失时同步新的默认值 `true`。
 - Broker membership 是已入群 Description 的权威来源；Session custom entry 是重连时 Proactive 开关的权威来源。
 
 ### 19.8 测试与验收

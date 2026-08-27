@@ -585,23 +585,15 @@ export function createBrokerServer(
   ): void {
     if (envelope.type === "proactive.update") {
       const membership = groups.membershipForClient(clientId);
-      const status = currentProactiveStatus();
-      const previouslyEnabled = db().membership(
-        envelope.payload.groupId,
-        sessionKey,
-      )?.proactiveEnabled === true;
-      const allowedToEnable = status === "ready" || status === "temporarily_unavailable" ||
-        previouslyEnabled;
       if (
         membership === undefined ||
-        membership.groupId !== envelope.payload.groupId ||
-        (envelope.payload.enabled && !allowedToEnable)
+        membership.groupId !== envelope.payload.groupId
       ) {
         send(socket, createEnvelope("proactive.update.ack", {
           groupId: envelope.payload.groupId,
           enabled: envelope.payload.enabled,
           accepted: false,
-          reason: membership === undefined ? "not_in_group" : status,
+          reason: "not_in_group",
         }) as BrokerEnvelope);
         return;
       }
@@ -1337,7 +1329,7 @@ export function createBrokerServer(
       let userName: string;
       let agentName: string;
       let agentDescription: string;
-      let proactiveEnabled = false;
+      let proactiveEnabled = true;
       let membershipCredential: string | undefined;
       let isOwner = false;
       if (payload.membershipCredential !== undefined) {
@@ -1435,7 +1427,7 @@ export function createBrokerServer(
             userName,
             agentName,
             agentDescription,
-            proactiveEnabled: false,
+            proactiveEnabled: true,
             credentialHash: hashSecret(membershipCredential),
           });
         }
