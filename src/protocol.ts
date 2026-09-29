@@ -20,7 +20,7 @@ export interface Envelope<T = unknown> {
 }
 
 export const BROKER_SERVICE = "pi-comms";
-export const PI_COMMS_VERSION = "0.1.0";
+export const PI_COMMS_VERSION = "0.2.0";
 export type PiCommsBuildChannel = "release" | "development";
 export const PI_COMMS_BUILD_CHANNEL: PiCommsBuildChannel =
   process.env.PI_COMMS_BUILD_CHANNEL === "development"

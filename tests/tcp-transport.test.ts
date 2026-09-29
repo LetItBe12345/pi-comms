@@ -70,7 +70,7 @@ describe("TCP Broker 握手", () => {
       brokerId: broker.brokerId,
       brokerInstanceId: broker.instanceId,
       brokerMode: "local",
-      appVersion: "0.1.0",
+      appVersion: "0.2.0",
       buildChannel: "release",
     });
   });
