@@ -371,7 +371,7 @@ interface Envelope<T = unknown> {
 - Broker 使用保存在 SQLite `broker_metadata` 中的稳定 `brokerId` 表示内部服务身份；每次进程启动仍生成新的 `brokerInstanceId`。
 - `broker.ready` 返回 `brokerId`、`brokerInstanceId` 和运行模式。客户端保存远程 `brokerId`，同一地址身份变化时拒绝自动连接。
 - 运行元数据写入数据库旁的 `comms.db.broker.json`，包含 `brokerId`、实例 ID、PID、监听地址、端口、模式和启动时间；关闭时清理，失效内容可覆盖但不删除 SQLite。
-- 统一 launcher 由 `process.execPath` 启动；入口通过 `import.meta.url` 解析，不依赖 npm、Bash、软链接或平台命令名。
+- 统一 launcher 由真实 Node.js 22 可执行文件启动；Extension 运行在 Pi 独立二进制内时从 `PATH` 解析 Node，也允许用 `PI_COMMS_NODE_PATH` 显式指定。入口通过 `import.meta.url` 解析，不依赖 npm、Bash 或软链接。
 - mDNS 只发现内部 Broker 端点；Extension 通过只读 TCP 目录查询汇总附近群组。
 - mDNS TXT 只包含 `txtvers`、协议版本、`brokerId` 和应用版本，不包含邀请码或群组目录。
 - 加入前的群组目录只返回允许附近加入的群组 ID、名称、在线 Session 数和是否需要邀请码，不创建客户端身份，也不返回成员、Agent、消息或历史记录。

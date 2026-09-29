@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-当前发行版是 v0.2.0。阶段 0～16A、17～23 已完成；真实设备局域网验收正在按
+当前发行版是 v0.2.1。阶段 0～16A、17～24 已完成；真实设备局域网验收正在按
 [Roadmap](#roadmap) 推进。
 
 现在可以：
@@ -22,20 +22,36 @@
 - mDNS 附近发现；发现失败时可粘贴完整群组加入信息
 - 短暂离线、Session 重开或网络变化后的长期成员恢复
 
-## 安装 Pi
+## 从零开始
+
+完整流程只有四步：
+
+1. 安装 Node.js 22、npm 和 git。
+2. 安装 Pi，并为 Pi 登录一个可用的模型。
+3. 使用 `pi install` 安装 Pi Comms Extension。
+4. 进入 `/comms`，为 Proactive Router 配置独立的 DeepSeek API Key。
+
+## 1. 安装 Pi
 
 Pi Comms 是 Pi Extension。先安装 Pi CLI，再安装本项目。
 
 要求：macOS 或 Ubuntu/Linux、Node.js 22.19+ 且低于 23、npm 和 git。
 
-先确认 Node.js 和 npm：
+先确认 Node.js、npm 和 git：
 
 ```bash
 node -v
 npm -v
+git --version
 ```
 
-macOS 上，已有 Node.js 22 时，最简单是直接用 npm 安装 Pi：
+macOS 或 Linux 最简单的安装方式是使用 Pi 官方脚本：
+
+```bash
+curl -fsSL https://pi.dev/install.sh | sh
+```
+
+也可以在已有 Node.js 22 的环境中使用 npm：
 
 ```bash
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent
@@ -51,45 +67,61 @@ sudo apt-get install -y nodejs
 sudo npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 ```
 
-Pi 官方也提供 Linux 和 macOS 通用安装脚本：
-
-```bash
-curl -fsSL https://pi.dev/install.sh | sh
-```
-
 安装后确认 Pi 能启动：
 
 ```bash
 pi --version
 ```
 
-Pi 的官方安装文档见 <https://pi.dev/docs/latest/quickstart>。
+首次启动 Pi 后，执行 `/login`，选择一个模型提供商并完成登录或 API Key 配置。然后可以用
+`/model` 切换 Pi Session 自己使用的模型。
 
-## 安装 Pi Comms
+```bash
+pi
+```
 
-安装最新可用版：
+```text
+/login
+/model
+```
+
+Pi 的模型只负责当前 Pi Session。它与后面配置的 Pi Comms Router Key 相互独立。
+
+Pi 官方安装文档：<https://pi.dev/docs/latest/quickstart>。
+
+## 2. 安装 Pi Comms Extension
+
+推荐安装固定 Release：
+
+```bash
+pi install git:github.com/LetItBe12345/pi-comms@v0.2.1
+```
+
+确认 Pi 已记录这个 Extension：
+
+```bash
+pi list
+```
+
+如果 Pi 已经打开，执行 `/reload`，或者退出后重新启动 Pi。
+
+需要跟随 `main` 开发版时，可以改用：
 
 ```bash
 pi install https://github.com/LetItBe12345/pi-comms
 ```
 
-这个命令跟随 GitHub 仓库默认分支。以后更新到最新可用版：
+开发版可以用下面的命令更新：
 
 ```bash
 pi update --extensions
 ```
 
-如果要固定到当前已发布版本 v0.2.0：
-
-```bash
-pi install git:github.com/LetItBe12345/pi-comms@v0.2.0
-```
-
-固定版本不会被 `pi update --extensions` 移到新 Tag。升级固定版本时，需要重新执行带新 Tag 的 `pi install` 命令。
+固定 Release 不会被 `pi update --extensions` 自动移动到新 Tag。升级固定版本时，需要重新执行带新 Tag 的 `pi install` 命令。
 
 Pi 会从 GitHub 安装 Extension 和运行依赖。本机群聊服务会在首次使用时自动启动，不需要手动运行。
 
-## 在 Pi 中使用
+## 3. 在 Pi 中使用
 
 启动 Pi：
 
@@ -134,18 +166,55 @@ pi
 
 注意：`/session` 是 Pi 自带命令；Pi Comms 的入口是 `/comms`。
 
-### 配置 Proactive
+## 4. 配置 Router 模型 API
 
 Proactive 由 Broker 使用独立的 DeepSeek API Key。它不读取、修改或复用
 Pi Session 的模型和 Key。Broker 固定使用 DeepSeek 官方 API 和
 `deepseek-flash`。
 
+### 获取 API Key
+
+1. 登录 DeepSeek Platform。
+2. 创建一个 DeepSeek API Key，并确保账户有可用额度。
+3. 不要把 Key 提交到项目文件、聊天消息或 Git 仓库。
+
+DeepSeek API 文档：<https://api-docs.deepseek.com/api/deepseek-api/>。
+
+### 在 TUI 中配置
+
+1. 在 Broker 所在电脑启动 Pi。
+2. 执行 `/comms`。
+3. 在首页选择“Broker 设置”。
+4. 选择“配置或更换 API Key”。
+5. 输入 DeepSeek API Key，等待状态变成“已就绪”。
+
+Key 验证成功后会保存在 Broker 所在机器的 `~/.pi/comms/config.json`。文件权限在
+macOS 和 Linux 上会被设置为仅当前用户可读写。远程加入该 Broker 的 Session 不能修改
+这个 Key，必须回到 Broker 所在电脑配置。
+
+### 从环境变量导入
+
+也可以先在启动 Pi 的终端中设置：
+
+```bash
+export DEEPSEEK_API_KEY='sk-你的-key'
+pi
+```
+
+第一次创建群组时，Pi Comms 会询问是否验证并保存这个 Key。确认后，Key 会迁移到 Broker
+配置文件。环境变量不会替代保存步骤。
+
+### 检查和更换 Key
+
+- 首页“Broker 设置”会显示脱敏后的 Key 和 Router 状态。
+- “重新验证 API Key”用于检查 Key 是否仍然有效。
+- “删除 API Key”只会停止 Proactive Router，普通群聊和显式 `@Agent` 不受影响。
+- 如果显示无效 Key、限流或网络错误，先检查 DeepSeek 账户额度和当前网络，再重新验证。
+
 Router、Proactive Agent 和 Freshness 只读取 Pi Comms 的公开群聊：较早内容使用
 带 `groupSeq` 范围的滚动摘要，原始窗口最多保留最近 12 条。摘要不会读取 Pi Session
 私聊、工具调用或本地项目文件；原始公开消息仍完整保存在 SQLite。
 
-在 `/comms` 首页打开“Broker 设置”，输入 DeepSeek API Key。Key 验证成功后会保存在
-Broker 所在机器的 `~/.pi/comms/config.json`，以后创建群组或重启 Broker 会继续使用。
 每个 Agent 的 Proactive 开关按 Pi Session 和群组独立保存，默认开启。该
 Session 的用户可以在 `Ctrl+P` 面板中显式关闭；Broker Router 没有就绪时不会发起模型调用。
 
