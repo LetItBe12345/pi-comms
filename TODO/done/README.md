@@ -28,3 +28,4 @@
 - [阶段 21：完整群组角色上下文](./21-participant-context.md)
 - [阶段 22：多 Agent 显式并行投递](./22-multi-agent-mentions.md)
 - [阶段 23：DeepSeek 多 Agent 主动路由](./23-multi-agent-proactive-routing.md)
+- [阶段 24：修复 Pi 内 Broker 自动启动运行时](./24-pi-broker-autostart-runtime.md)

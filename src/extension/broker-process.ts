@@ -3,6 +3,7 @@ import { createConnection } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 import { migrateLegacyBroker } from "../broker/legacy-migration.js";
+import { resolveNodeExecutable } from "../node-executable.js";
 import {
   readBrokerRuntimeMetadata,
   type BrokerMode,
@@ -90,7 +91,7 @@ export async function startBroker(options: {
     ...(options.dbPath === undefined ? [] : ["--db", options.dbPath]),
   ];
   const child = spawn(
-    process.execPath,
+    resolveNodeExecutable(),
     args,
     {
       detached: true,

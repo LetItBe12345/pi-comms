@@ -4,6 +4,7 @@ import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { resolveNodeExecutable } from "../node-executable.js";
 
 const execFileAsync = promisify(execFile);
 const SERVICE_NAME = "pi-comms";
@@ -97,7 +98,7 @@ async function configureSystemd(
     await writeFile(
       path,
       renderSystemdUserService(
-        process.execPath,
+        resolveNodeExecutable(),
         launcherPath(),
         dbPath,
         import.meta.resolve("tsx"),
@@ -135,7 +136,7 @@ async function configureLaunchAgent(
     await writeFile(
       path,
       renderLaunchAgent(
-        process.execPath,
+        resolveNodeExecutable(),
         launcherPath(),
         dbPath,
         import.meta.resolve("tsx"),
