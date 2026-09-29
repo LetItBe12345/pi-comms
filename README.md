@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-当前发行版是 v0.1.0。阶段 0～16A、17～23 已完成；真实设备局域网验收正在按
+当前发行版是 v0.2.0。阶段 0～16A、17～23 已完成；真实设备局域网验收正在按
 [Roadmap](#roadmap) 推进。
 
 现在可以：
@@ -79,10 +79,10 @@ pi install https://github.com/LetItBe12345/pi-comms
 pi update --extensions
 ```
 
-如果要固定到当前已发布版本 v0.1.0：
+如果要固定到当前已发布版本 v0.2.0：
 
 ```bash
-pi install git:github.com/LetItBe12345/pi-comms@v0.1.0
+pi install git:github.com/LetItBe12345/pi-comms@v0.2.0
 ```
 
 固定版本不会被 `pi update --extensions` 移到新 Tag。升级固定版本时，需要重新执行带新 Tag 的 `pi install` 命令。
