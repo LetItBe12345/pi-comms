@@ -65,7 +65,7 @@ B 的 Pi Agent 处理消息
 - 图片、文件和私聊。
 - 全局可读和 Agent 持续监听所有消息；Proactive 只在 Broker 选中后按 `groupSeq` 增量注入公开上下文。
 - 群聊摘要和上下文压缩。
-- 消息优先级和多个远程请求的并行处理。
+- 消息优先级。
 
 ## 4. 技术栈与运行约束
 
@@ -79,7 +79,7 @@ B 的 Pi Agent 处理消息
 - IPv6 和主机名连接暂不支持，输入后必须给出可读提示，不能进入模糊超时。
 - 连接模式分为 `local`、`lan-host` 和 `lan-client`；配置按 Pi Session 保存。
 - 传输协议：JSON Lines。
-- 连接必须先完成 `broker.probe` / `broker.ready` 握手，并严格匹配 `service: pi-comms` 和 `protocolVersion: 7`。
+- 连接必须先完成 `broker.probe` / `broker.ready` 握手，并严格匹配 `service: pi-comms` 和 `protocolVersion: 8`。
 - 数据库：SQLite + `better-sqlite3`，开启 WAL 模式。
 - 数据库默认路径：`~/.pi/comms/comms.db`。
 - 只有 Local Broker 可以读写数据库，Extension 不直接访问数据库。
@@ -441,8 +441,8 @@ interface Envelope<T = unknown> {
 
 - 默认情况下普通群聊消息不注入 Agent，只有明确 `@Agent` 才处理。用户开启 Proactive 后，按第 19 节的独立协议注入增量公开上下文。
 - 每次只注入当前消息，不注入完整群聊历史。
-- `@用户名称` 只公开提醒；`@Agent名称` 同时注入目标 Session。
-- 只识别消息开头的一个 `@名称`，内部使用成员 ID 路由。
+- `@用户名称` 只公开提醒；`@Agent名称` 同时注入目标 Session。两类目标可以出现在同一条消息中。
+- 识别消息开头连续出现的一个或多个 `@名称`，内部使用成员 ID 路由；正文中间的 `@` 是普通文本。
 - 注入内容包含接收方身份、所属用户、发送者、群名、完整群组角色目录和消息正文。
 - 角色目录包含接收方自己以及所有有效长期成员；正文移除开头的 `@Agent名称` 后保持原样。
 - 第 2 轮起注明自动对话轮数。
@@ -505,7 +505,7 @@ seenRequestIds: Set<string>;
 
 ### 11.4 Agent 对 Agent
 
-- 只解析 Agent 最终回答开头的一个 `@名称`；允许前置空格和空行，不解析 Markdown 包裹或正文中间的 `@`。
+- 只解析 Agent 最终回答开头连续出现的一个或多个 `@名称`；允许前置空格和空行，不解析 Markdown 包裹或正文中间的 `@`。
 - `@Agent` 后必须有正文；`@` 自己、空正文和不存在的目标只公开回答并显示原因，不增加轮数。
 - `@用户` 只公开提醒并结束自动通信；`@Agent` 触发下一次请求，原回答始终完整公开。
 - 发送者是作出回答的 Agent；注入内容同时注明目标 Agent 和发送方 Agent 各自的所属用户。
@@ -744,7 +744,7 @@ pi-comms/
 - 没有 eligible Agent 时不调用模型。开启开关、上线、变为 idle 或 cooldown 到期都不追溯触发旧消息；必须等下一条新人类消息。
 - Router 每次调用前从当前 GroupState 实时构建候选。候选必须同时满足 `type=agent`、online、idle、`proactiveEnabled=true`且不在 cooldown。
 - 未入选、关闭、busy、offline 或 cooldown 中 Agent 的 Description 不得发送给 DeepSeek。候选不设数量上限。
-- 每次 Router 最多选择一个 Agent，也可以返回 `null`。同一群不限制只有一个活跃 Proactive：后续 batch 可以选择另一个 idle Agent，多个 Session 可以并行生成。
+- 每次 Router 返回 `{ "targetAgentIds": [] }`，最多选择 3 个 Agent；默认选择零个或一个，只有多个 Agent 能提供不同且具体的价值时才多选。入选 Agent 收到相同 Observation、摘要和共同入选者列表；同一群允许多个 Proactive 并行生成。
 - 每群第一条消息启动 batch；后续消息把 debounce 延后到最后一条后 800ms，但从第一条起最多等 2 秒。每群 Router 请求开始时间间隔不少于 5 秒。
 - 整个 Broker 同时只运行一个 DeepSeek 请求。用户发起的 Key 验证优先，其次是 Freshness、Summary、Router。多群 Router 按 round-robin 调度，多个 Freshness 按结果到达时间 FIFO；连续 Freshness 不得让已排队 Summary 长期饿死。
 - Router 输入包含群聊滚动摘要和最近 12 条人类或 Agent 公开文本，按 `groupSeq` 去重排序。候选为 `{ agentId, name, description }`。
@@ -755,8 +755,8 @@ pi-comms/
 
 - Router、Freshness 和 Summary 都使用 Chat Completions JSON Output：`thinking: { type: "disabled" }`、`response_format: { type: "json_object" }`、`temperature: 0`、`stream: false`。Router/Freshness 的 `max_tokens` 为 128；Summary 为 1024。
 - Router、Freshness 和 Summary Prompt 版本分别为 `router-v2`、`freshness-v2` 和 `summary-v1`。Prompt 必须明确包含 `json` 字样和合法 JSON 示例。
-- Router 只要求 `{ "targetAgentId": "agent:..." }` 或 `{ "targetAgentId": null }`。Freshness 只要求 `{ "publish": true }` 或 `{ "publish": false }`。`reason` 可选、忽略且不记录。
-- Provider 只接受纯 JSON。Markdown 代码块不自动剥离。`targetAgentId` 必须是当前 eligible ID 或 `null`；`"NONE"`、空字符串和缺少字段都非法。`publish` 必须是 JSON 布尔值。未知顶层字段允许并忽略。
+- Router 只要求 `{ "targetAgentIds": ["agent:..."] }`，空数组表示不邀请；最多 3 个、去重且必须属于本次 eligible 集合。Freshness 只要求 `{ "publish": true }` 或 `{ "publish": false }`。`reason` 可选、忽略且不记录。
+- Provider 只接受纯 JSON。Markdown 代码块不自动剥离。`targetAgentIds` 必须是最多 3 个当前 eligible ID 的数组；重复、未知 ID、非法类型和缺少字段都非法。`publish` 必须是 JSON 布尔值。未知顶层字段允许并忽略。
 - 网络错误、3 秒超时、`429` 和 `5xx` 最多共请求 3 次。两次重试分别 full jitter `0～500ms` 和 `0～1000ms`；`Retry-After` 优先，单次最多等 5 秒。
 - `400`、`401/403`、空内容、非法 JSON 和未知 Agent ID 不重试。一组重试耗尽后 Broker 全局暂停 30 秒；暂停只存内存，Broker 重启后清空。
 - Router 每次重试前重建候选和最新消息 batch。Freshness 每次重试前重新读取最新公开消息，候选回答保持不变。
@@ -785,7 +785,7 @@ pi-comms/
 - Agent 实际观察后没有新的人类或 Agent 公开文本时直接发布。有新文本时调用 Freshness，输入原始触发、完整候选回答、可用群聊摘要和最近最多 12 条新消息。若更早新增消息未被摘要连续覆盖，Freshness fail closed。
 - Freshness 失败、暂停期、超时、限流、空内容或非法结果均 fail closed，不发布。被丢弃后不向群聊或 Session 本地额外发送通知。
 - 多个 Agent 并行完成时按结果到达顺序处理。先发布的回答写入新 `groupSeq`，并进入后续回答的 Freshness 上下文。
-- Proactive 结果只有通过 Duplicate/Freshness 并成功公开写入后，才解析开头的一个 `@Agent` 并创建现有 Agent-to-Agent 下一跳。目标按现有权限、FIFO 队列和 10 轮暂停规则处理，不传播 `chainOrigin`。
+- Proactive 结果只有通过 Duplicate/Freshness 并成功公开写入后，才解析开头连续的 `@Agent` 并创建现有 Agent-to-Agent 下一跳。目标按现有权限、FIFO 队列和 10 轮暂停规则处理，不传播 `chainOrigin`。
 - Proactive 发起的链达到轮数上限后，由最初被 Broker 选中的 Agent 所属 Session 决定继续或结束。
 - 群聊不显示“主动”标记、选择理由、处理中提示、沉默、Proactive 失败或丢弃通知。只显示成功发布的普通 Agent 回答。
 
@@ -869,3 +869,32 @@ DeepSeek 实现以官方文档为准：
 
 - Broker 协议版本为 7。`AgentRequestPayload` 与 `ProactiveDeliverPayload` 必须携带 `participants`。
 - 自动测试覆盖在线、离线、群主、用户—Agent 配对、Description、成员移除、统一可用状态、Proactive 隐私、排队后刷新和跨设备 Snapshot。
+
+## 22. 多 Agent 显式并行投递
+
+### 22.1 语法与公开消息
+
+- 用户或 Agent 可以在公开消息开头连续写多个 `@名称`。正文从最后一个前置 mention 后开始；正文中的后续 `@` 不参与路由。
+- 所有能解析到的成员 ID 都写入同一条公开消息的 `mentionIds`，并按成员 ID 去重。原始消息只保存和显示一次。
+- 用户 mention 只做公开提醒。Agent mention 创建显式请求；只有用户 mention 时仍是普通公开消息，并允许 Proactive Router 判断。
+- 同一 Agent 重复出现时只投递一次。未知名称形成独立失败目标，不取消其他目标。
+
+### 22.2 独立投递与协作上下文
+
+- 每个有效 Agent 目标拥有独立 `requestId`、ACK、权限检查、投递状态、结果去重和失败原因。所有请求共享原始消息 ID、`chainId`、正文和轮数，不建立父任务或子任务关系。
+- 每个目标分别执行 `auto | approval | blocked`。某个目标离线、被拒绝、断线或执行失败，不取消其他目标。
+- 不同 Session 可以并行处理；同一 Session 继续使用既有 FIFO 串行队列。回答到达后立即分别公开，不等待其他目标，不自动汇总。
+- 成功创建的每个请求携带 `coRecipients`，只列出本批其他成功接收同一正文的 Agent。Prompt 明确共同接收者可能仍在排队或等待批准，不得假定其已开始或完成，也不应把原任务原样再次转给共同接收者。
+- 群聊消息使用 `deliveries` 显示逐目标等待批准、排队、处理、完成或失败状态；不增加整体进度、父任务页面或汇总 Agent。
+
+### 22.3 Agent-to-Agent 与轮数
+
+- Agent 最终回答和 Proactive 成功回答复用相同的多目标规则。不得向发送回答的 Agent 自己投递；自身失败不影响同批其他目标。
+- 同一批成功创建的下一跳沿用一个 `chainId`，并全部使用相同的下一轮编号。一次多目标分发只增加一轮。
+- 第 10 轮回答可以公开；准备创建第 11 轮时先暂停，不向任何目标投递。继续后仍重新检查每个目标的 membership、在线状态和权限。
+
+### 22.4 协议、数据库与验收
+
+- Broker 协议版本为 8。`AgentRequestPayload.coRecipients` 携带共同接收者；`ChatMessagePayload.deliveries` 携带逐目标状态。
+- SQLite schema 版本为 10。`agent_requests.message_id` 不再唯一，并为该列建立普通索引，使一条公开消息可以关联多个请求。
+- 自动测试覆盖多目标成功、重复 mention、用户与 Agent 混合目标、部分失败、部分审批、独立 ACK、Agent 多目标下一跳、共同接收者、10 轮暂停和 TUI 逐目标状态。

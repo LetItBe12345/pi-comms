@@ -1,9 +1,10 @@
 import type { ProactiveObservationMessage } from "../protocol.js";
+import type { GroupParticipantContext } from "../types.js";
 
 export const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 export const DEEPSEEK_MODEL = "deepseek-flash";
-export const ROUTER_PROMPT_VERSION = "router-v2";
-export const FRESHNESS_PROMPT_VERSION = "freshness-v2";
+export const ROUTER_PROMPT_VERSION = "router-v3";
+export const FRESHNESS_PROMPT_VERSION = "freshness-v3";
 export const SUMMARY_PROMPT_VERSION = "summary-v1";
 
 export interface ProactiveCandidate {
@@ -19,6 +20,8 @@ export interface ProactiveRouteInput {
   messages: ProactiveObservationMessage[];
   omitted: boolean;
   candidates: ProactiveCandidate[];
+  eligibleAgentIds?: string[];
+  participants?: GroupParticipantContext[];
 }
 
 export interface ProactiveFreshnessInput {
@@ -48,7 +51,7 @@ export interface ProactiveProvider {
     apiKey: string,
     input: ProactiveRouteInput,
     signal?: AbortSignal,
-  ): Promise<{ targetAgentId: string | null }>;
+  ): Promise<{ targetAgentIds?: string[]; targetAgentId?: string | null }>;
   isFresh(
     apiKey: string,
     input: ProactiveFreshnessInput,
@@ -114,19 +117,27 @@ export class DeepSeekProactiveProvider implements ProactiveProvider {
     apiKey: string,
     input: ProactiveRouteInput,
     signal?: AbortSignal,
-  ): Promise<{ targetAgentId: string | null }> {
-    const eligible = new Set(input.candidates.map((candidate) => candidate.agentId));
+  ): Promise<{ targetAgentIds?: string[]; targetAgentId?: string | null }> {
+    const eligible = new Set(
+      input.eligibleAgentIds ?? input.candidates.map((candidate) => candidate.agentId),
+    );
     const value = await this.#complete(apiKey, [
       { role: "system", content: ROUTER_SYSTEM_PROMPT },
       { role: "user", content: JSON.stringify(input) },
     ], signal, this.#timeoutMs, 128);
-    if (!("targetAgentId" in value)) throw invalidResponse("缺少 targetAgentId");
-    const targetAgentId = value.targetAgentId;
-    if (targetAgentId === null) return { targetAgentId: null };
-    if (typeof targetAgentId !== "string" || !eligible.has(targetAgentId)) {
-      throw invalidResponse("Router 返回了未知 Agent ID");
+    if (!("targetAgentIds" in value) && "targetAgentId" in value) {
+      const legacy = value.targetAgentId;
+      if (legacy === null) return { targetAgentId: null };
+      if (typeof legacy !== "string" || !eligible.has(legacy)) throw invalidResponse("Router 返回了未知 Agent ID");
+      return { targetAgentId: legacy };
     }
-    return { targetAgentId };
+    const raw = value.targetAgentIds;
+    if (!Array.isArray(raw) || raw.length > 3 || raw.some((id) => typeof id !== "string")) {
+      throw invalidResponse("Router 返回的 targetAgentIds 无效");
+    }
+    const ids = [...new Set(raw as string[])];
+    if (ids.some((id) => !eligible.has(id))) throw invalidResponse("Router 返回了未知 Agent ID");
+    return { targetAgentIds: ids };
   }
 
   async isFresh(
@@ -267,13 +278,17 @@ export async function withProactiveRetry<T>(
 }
 
 const ROUTER_SYSTEM_PROMPT = `${ROUTER_PROMPT_VERSION}\n` +
-  "Select at most one eligible agent only when it can answer an unresolved question, " +
+  "Select zero, one, or at most three agents from eligibleAgentIds only when each can add distinct value; " +
   "correct an important error, add missing expertise, or materially advance the discussion. " +
+  "participants is the full group directory for understanding who works on what; " +
+  "never select an agent outside eligibleAgentIds. " +
   "For greetings, agreement, repetition, or no useful contribution, select null. " +
-  "Return pure json only. Example json: {\"targetAgentId\":null}.";
+  "Default to zero or one. Return pure json only. Example json: {\"targetAgentIds\":[]}.";
 
 const FRESHNESS_SYSTEM_PROMPT = `${FRESHNESS_PROMPT_VERSION}\n` +
   "Decide whether the complete candidate answer is still useful after the newer messages. " +
+  "Publish when it reports independent edits, test results, failures or blockers, even if " +
+  "another agent already answered; only drop pure duplicates or answers invalidated by newer messages. " +
   "Return pure json only. Example json: {\"publish\":true}.";
 
 const SUMMARY_SYSTEM_PROMPT = `${SUMMARY_PROMPT_VERSION}\n` +
@@ -298,7 +313,7 @@ function parseRetryAfter(value: string | null): number | undefined {
 
 export class FakeProactiveRouter implements ProactiveProvider {
   constructor(
-    readonly route: (input: ProactiveRouteInput) => string | null = () => null,
+    readonly route: (input: ProactiveRouteInput) => string | string[] | null = () => null,
     readonly freshness: (input: ProactiveFreshnessInput) => boolean = () => true,
     readonly summary: (input: ProactiveSummaryInput) => string = (input) =>
       input.messages.map((message) => `#${message.groupSeq} ${message.senderName}: ${message.text}`).join("\n"),
@@ -309,8 +324,9 @@ export class FakeProactiveRouter implements ProactiveProvider {
   async select(
     _apiKey: string,
     input: ProactiveRouteInput,
-  ): Promise<{ targetAgentId: string | null }> {
-    return { targetAgentId: this.route(input) };
+  ): Promise<{ targetAgentIds: string[] }> {
+    const result = this.route(input);
+    return { targetAgentIds: result === null ? [] : Array.isArray(result) ? result : [result] };
   }
 
   async isFresh(

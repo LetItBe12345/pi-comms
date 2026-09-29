@@ -718,6 +718,7 @@ export function createBrokerServer(
       if (pending?.targetClientId === clientId) {
         db().markDelivered(envelope.payload.requestId);
         pending.deliveryAcknowledged = true;
+        broadcastRequestMessageStatus(pending);
       }
       return;
     }
@@ -1147,10 +1148,15 @@ export function createBrokerServer(
   function publishProactiveAnswer(pending: PendingProactive, text: string): void {
     const source = groups.membershipForClient(pending.target.clientId);
     if (source === undefined || source.groupId !== pending.groupId) return;
-    const mention = parseMention(text.trimStart());
-    const target = mention === undefined
-      ? undefined
-      : groups.findMemberByName(pending.groupId, mention.name);
+    const mention = parseMentions(text.trimStart());
+    const resolved = mention?.names.map((name) => ({
+      name, member: groups.findMemberByName(pending.groupId, name),
+    })) ?? [];
+    const targets = [...new Map(resolved.flatMap(({ member }) =>
+      member?.type === "agent" ? [[member.memberId, member] as const] : []
+    )).values()];
+    const unknownNames = [...new Set(resolved.filter(({ member }) => member === undefined)
+      .map(({ name }) => name))];
     const answerPayload: ChatMessagePayload = {
       groupId: pending.groupId,
       groupSeq: db().nextGroupSeq(pending.groupId),
@@ -1158,96 +1164,120 @@ export function createBrokerServer(
       senderName: source.agent.displayName,
       senderType: "agent",
       text,
-      mentionIds: target === undefined ? [] : [target.memberId],
+      mentionIds: [...new Set(resolved.flatMap(({ member }) =>
+        member === undefined ? [] : [member.memberId]
+      ))],
       status: "sent",
       chainId: pending.proactiveId,
       round: 1,
     };
-    let nextRequest:
-      | { request: AgentRequestPayload; targetClientId: string; awaitingApproval: boolean }
-      | undefined;
-    if (mention !== undefined && target?.type === "agent") {
-      answerPayload.routeTargetName = target.displayName;
-      answerPayload.nextRound = 2;
-      if (target.memberId === source.agent.memberId) {
-        answerPayload.routeStatus = "failed";
-        answerPayload.routeFailureReason = "target_self";
-      } else if (mention.text === undefined || !mention.text.trim()) {
-        answerPayload.routeStatus = "failed";
-        answerPayload.routeFailureReason = "empty_mention";
-      } else if (!target.online || clients.get(target.clientId) === undefined) {
-        answerPayload.routeStatus = "failed";
-        answerPayload.routeFailureReason = "target_offline";
-      } else if ((permissions.get(target.clientId) ?? "auto") === "blocked") {
-        answerPayload.routeStatus = "failed";
-        answerPayload.routeFailureReason = "target_blocked";
-      } else {
-        const targetMembership = groups.membershipForClient(target.clientId)!;
-        const awaitingApproval = (permissions.get(target.clientId) ?? "auto") === "approval";
-        const request: AgentRequestPayload = {
-          requestId: randomUUID(),
-          groupId: pending.groupId,
-          groupName: pending.groupName,
-          senderId: source.agent.memberId,
-          senderName: source.agent.displayName,
-          senderType: "agent",
-          senderOwnerUserName: source.user.displayName,
-          targetAgentId: target.memberId,
-          targetAgentName: target.displayName,
-          ownerUserName: targetMembership.user.displayName,
-          onlineMembers: groups.onlineMembers(pending.groupId)
-            .filter((member) => member.memberId !== target.memberId)
-            .map((member) => ({ displayName: member.displayName, type: member.type })),
-          participants: participantDirectory(pending.groupId),
-          text: mention.text,
-          chainId: pending.proactiveId,
-          round: 2,
-          createdAt: Date.now(),
-        };
-        answerPayload.routeRequestId = request.requestId;
-        answerPayload.routeStatus = awaitingApproval ? "waiting_approval" : "queued";
-        nextRequest = { request, targetClientId: target.clientId, awaitingApproval };
+    const taskText = mention?.text?.trim() ?? "";
+    const context: AgentChainContext = {
+      initiatorSessionKey: sessionKeyForClient(source.user.clientId)!,
+      initiatorName: source.user.displayName,
+      participants: [source.agent.displayName, ...targets.map(({ displayName }) => displayName)],
+      roundLimit: 10,
+    };
+    const requests: Array<{
+      request: AgentRequestPayload; targetClientId: string;
+      awaitingApproval: boolean; context: AgentChainContext;
+    }> = [];
+    const failed: Parameters<BrokerDatabase["insertAgentRequestBatch"]>[2] = [];
+    const deliveries: NonNullable<ChatMessagePayload["deliveries"]> = [];
+    for (const target of targets) {
+      const nextRequestId = randomUUID();
+      const targetMembership = groups.membershipForClient(target.clientId);
+      const permission = permissions.get(target.clientId) ?? "auto";
+      const failure = target.memberId === source.agent.memberId ? "target_self" as const :
+        taskText === "" ? "empty_mention" as const :
+        !target.online || clients.get(target.clientId) === undefined || targetMembership === undefined
+          ? "target_offline" as const :
+        permission === "blocked" ? "target_blocked" as const : undefined;
+      if (failure !== undefined || targetMembership === undefined) {
+        failed.push({
+          initiatorSessionKey: context.initiatorSessionKey, requestId: nextRequestId,
+          groupId: pending.groupId, messageId: "", senderId: source.agent.memberId,
+          senderName: source.agent.displayName, targetAgentId: target.memberId,
+          targetAgentName: target.displayName, text: taskText, chainId: pending.proactiveId,
+          round: 2, failureReason: failure ?? "target_offline",
+        });
+        deliveries.push({ requestId: nextRequestId, targetAgentId: target.memberId,
+          targetAgentName: target.displayName, status: "failed",
+          failureReason: failure ?? "target_offline" });
+        continue;
       }
+      const awaitingApproval = permission === "approval";
+      const request: AgentRequestPayload = {
+        requestId: nextRequestId, groupId: pending.groupId, groupName: pending.groupName,
+        senderId: source.agent.memberId, senderName: source.agent.displayName,
+        senderType: "agent", senderOwnerUserName: source.user.displayName,
+        targetAgentId: target.memberId, targetAgentName: target.displayName,
+        ownerUserName: targetMembership.user.displayName,
+        onlineMembers: groups.onlineMembers(pending.groupId)
+          .filter((member) => member.memberId !== target.memberId)
+          .map((member) => ({ displayName: member.displayName, type: member.type })),
+        participants: participantDirectory(pending.groupId), coRecipients: [], text: taskText,
+        chainId: pending.proactiveId, round: 2, createdAt: Date.now(),
+      };
+      requests.push({ request, targetClientId: target.clientId, awaitingApproval, context });
+      deliveries.push({ requestId: nextRequestId, targetAgentId: target.memberId,
+        targetAgentName: target.displayName,
+        status: awaitingApproval ? "waiting_approval" : "queued" });
+    }
+    for (const name of unknownNames) {
+      const nextRequestId = randomUUID();
+      failed.push({
+        initiatorSessionKey: context.initiatorSessionKey, requestId: nextRequestId,
+        groupId: pending.groupId, messageId: "", senderId: source.agent.memberId,
+        senderName: source.agent.displayName, targetAgentName: name, text: taskText,
+        chainId: pending.proactiveId, round: 2, failureReason: "target_not_found",
+      });
+      deliveries.push({ requestId: nextRequestId, targetAgentName: name,
+        status: "failed", failureReason: "target_not_found" });
+    }
+    const recipients = requests.map(({ request }) => ({
+      agentId: request.targetAgentId, name: request.targetAgentName,
+    }));
+    for (const item of requests) item.request.coRecipients = recipients.filter(
+      ({ agentId }) => agentId !== item.request.targetAgentId,
+    );
+    if (deliveries.length > 1) answerPayload.deliveries = deliveries;
+    if (deliveries.length === 1) {
+      const delivery = deliveries[0]!;
+      answerPayload.routeRequestId = delivery.requestId;
+      answerPayload.routeTargetName = delivery.targetAgentName;
+      answerPayload.routeStatus = delivery.status === "failed" ? "failed" : delivery.status;
+      answerPayload.routeFailureReason = delivery.failureReason;
+      answerPayload.nextRound = 2;
     }
     const answer = createEnvelope("chat.message", answerPayload);
     const stored = historyMessage(answer.id, answer.timestamp, answer.payload, "sent");
-    if (nextRequest === undefined) {
+    for (const item of failed) item.messageId = answer.id;
+    if (requests.length === 0 && failed.length === 0) {
       db().insertMessage(stored);
     } else {
-      const context: AgentChainContext = {
-        initiatorSessionKey: sessionKeyForClient(source.user.clientId)!,
-        initiatorName: source.user.displayName,
-        participants: [source.agent.displayName, nextRequest.request.targetAgentName],
-        roundLimit: 10,
-      };
-      db().insertAgentRequest(
-        stored,
-        nextRequest.request,
-        nextRequest.awaitingApproval,
-        context,
+      db().insertAgentRequestBatch(
+        stored, requests.map(({ request, awaitingApproval, context }) => ({
+          request, awaitingApproval, context,
+        })), failed,
       );
-      pendingRequests.set(nextRequest.request.requestId, {
-        targetClientId: nextRequest.targetClientId,
-        targetAgentId: nextRequest.request.targetAgentId,
-        targetName: nextRequest.request.targetAgentName,
-        groupId: nextRequest.request.groupId,
-        request: nextRequest.request,
-        message: stored,
-        state: nextRequest.awaitingApproval ? "awaiting_approval" : "delivering",
-        deliveryAcknowledged: false,
-        context,
+      for (const item of requests) pendingRequests.set(item.request.requestId, {
+        targetClientId: item.targetClientId, targetAgentId: item.request.targetAgentId,
+        targetName: item.request.targetAgentName, groupId: item.request.groupId,
+        request: item.request, message: stored,
+        state: item.awaitingApproval ? "awaiting_approval" : "delivering",
+        deliveryAcknowledged: false, context,
       });
     }
     broadcastToGroup(pending.groupId, answer as BrokerEnvelope);
-    if (nextRequest !== undefined) {
-      const targetSocket = clients.get(nextRequest.targetClientId);
+    for (const item of requests) {
+      const targetSocket = clients.get(item.targetClientId);
       if (targetSocket !== undefined) {
         send(targetSocket, createEnvelope(
-          nextRequest.awaitingApproval ? "request.pending" : "agent.deliver",
-          nextRequest.request,
+          item.awaitingApproval ? "request.pending" : "agent.deliver", item.request,
         ) as BrokerEnvelope);
       }
-      if (nextRequest.awaitingApproval) updatePendingApprovalCount(nextRequest.targetClientId);
+      if (item.awaitingApproval) updatePendingApprovalCount(item.targetClientId);
     }
   }
 
@@ -1547,11 +1577,14 @@ export function createBrokerServer(
       return;
     }
 
-    const mention = parseMention(text);
-    const target =
-      mention === undefined
-        ? undefined
-        : groups.findMemberByName(group.groupId, mention.name);
+    const mention = parseMentions(text);
+    const resolved = mention?.names.map((name) => ({
+      name,
+      member: groups.findMemberByName(group.groupId, name),
+    })) ?? [];
+    const mentionIds = [...new Set(resolved.flatMap(({ member }) =>
+      member === undefined ? [] : [member.memberId]
+    ))];
     const basePayload = {
       groupId: group.groupId,
       groupSeq: db().nextGroupSeq(group.groupId),
@@ -1559,7 +1592,7 @@ export function createBrokerServer(
       senderName: membership.user.displayName,
       senderType: "user" as const,
       text,
-      mentionIds: target === undefined ? [] : [target.memberId],
+      mentionIds,
       ...(mention === undefined ? {} : { requestId }),
     };
 
@@ -1582,80 +1615,12 @@ export function createBrokerServer(
       return;
     }
 
-    const failMention = (
-      reason:
-        | "target_not_found"
-        | "target_offline"
-        | "target_blocked"
-        | "delivery_failed",
-    ): void => {
-      const messagePayload: ChatMessagePayload = {
-        ...basePayload,
-        status: "failed",
-        failureReason: reason,
-      };
-      const message = createEnvelope("chat.message", messagePayload, {
-        id: requestId,
-      });
-      try {
-        db().insertFailedAgentRequest(
-          historyMessage(
-            message.id,
-            message.timestamp,
-            message.payload,
-            "failed",
-            reason,
-          ),
-          {
-            initiatorSessionKey: sessionKeyForClient(clientId)!,
-            requestId,
-            groupId: group.groupId,
-            messageId: message.id,
-            senderId: membership.user.memberId,
-            senderName: membership.user.displayName,
-            ...(target?.type === "agent"
-              ? { targetAgentId: target.memberId }
-              : {}),
-            targetAgentName: target?.displayName ?? mention.name,
-            ...(target?.type === "agent"
-              ? {
-                  ownerUserName: groups.membershipForClient(target.clientId)?.user
-                    .displayName,
-                }
-              : {}),
-            text: mention.text ?? "",
-            chainId: requestId,
-            round: 1,
-            failureReason: reason,
-          },
-        );
-      } catch (error) {
-        sendGroupError(socket, requestId, error);
-        return;
-      }
-      closedRequestIds.add(requestId);
-      broadcastToGroup(group.groupId, message as BrokerEnvelope);
-      broadcastFailure({
-        requestId,
-        groupId: group.groupId,
-        targetName: target?.displayName ?? mention.name,
-        ...(target?.type === "agent" ? { targetAgentId: target.memberId } : {}),
-        reason,
-      });
-      if (target?.type !== "agent") {
-        proactive?.trigger(group.groupId, basePayload.groupSeq);
-      }
-    };
-
-    if (target === undefined) {
-      failMention("target_not_found");
-      return;
-    }
-    if (!target.online) {
-      failMention("target_offline");
-      return;
-    }
-    if (target.type === "user") {
+    const uniqueAgents = [...new Map(resolved.flatMap(({ member }) =>
+      member?.type === "agent" ? [[member.memberId, member] as const] : []
+    )).values()];
+    const unknownNames = [...new Set(resolved.filter(({ member }) => member === undefined)
+      .map(({ name }) => name))];
+    if (uniqueAgents.length === 0 && unknownNames.length === 0) {
       const message = createEnvelope(
         "chat.message",
         { ...basePayload, status: "sent" as const },
@@ -1673,59 +1638,98 @@ export function createBrokerServer(
       proactive?.trigger(group.groupId, basePayload.groupSeq);
       return;
     }
-    if (mention.text === undefined || !mention.text.trim()) {
-      failMention("delivery_failed");
-      return;
+    const taskText = mention.text?.trim() ?? "";
+    const createdAt = Date.now();
+    const active: Array<{
+      request: AgentRequestPayload;
+      awaitingApproval: boolean;
+      context: AgentChainContext;
+      targetClientId: string;
+    }> = [];
+    const failed: Parameters<BrokerDatabase["insertAgentRequestBatch"]>[2] = [];
+    const deliveryStates: NonNullable<ChatMessagePayload["deliveries"]> = [];
+    const initiatorSessionKey = sessionKeyForClient(clientId) ?? createSessionKey(deviceId, clientId);
+    const makeRequestId = (): string => uniqueAgents.length === 1 && unknownNames.length === 0
+      ? requestId : randomUUID();
+    for (const target of uniqueAgents) {
+      const targetRequestId = makeRequestId();
+      const targetSocket = clients.get(target.clientId);
+      const targetMembership = groups.membershipForClient(target.clientId);
+      const permission = permissions.get(target.clientId) ?? "auto";
+      const failure = taskText === "" ? "delivery_failed" as const :
+        !target.online || targetSocket === undefined || targetMembership === undefined
+          ? "target_offline" as const :
+        permission === "blocked" ? "target_blocked" as const : undefined;
+      if (failure !== undefined || targetMembership === undefined) {
+        const reason = failure ?? "target_offline";
+        failed.push({
+          initiatorSessionKey, requestId: targetRequestId, groupId: group.groupId,
+          messageId: requestId, senderId: membership.user.memberId,
+          senderName: membership.user.displayName, targetAgentId: target.memberId,
+          targetAgentName: target.displayName, text: taskText, chainId: requestId,
+          round: 1, failureReason: reason,
+        });
+        deliveryStates.push({ requestId: targetRequestId, targetAgentId: target.memberId,
+          targetAgentName: target.displayName, status: "failed", failureReason: reason });
+        continue;
+      }
+      const awaitingApproval = permission === "approval";
+      const request: AgentRequestPayload = {
+        requestId: targetRequestId, groupId: group.groupId, groupName: group.groupName,
+        senderId: membership.user.memberId, senderName: membership.user.displayName,
+        senderType: "user", targetAgentId: target.memberId,
+        targetAgentName: target.displayName, ownerUserName: targetMembership.user.displayName,
+        onlineMembers: groups.onlineMembers(group.groupId)
+          .filter((member) => member.memberId !== target.memberId)
+          .map((member) => ({ displayName: member.displayName, type: member.type })),
+        participants: participantDirectory(group.groupId), coRecipients: [], text: taskText,
+        chainId: requestId, round: 1, createdAt,
+      };
+      const context: AgentChainContext = {
+        initiatorSessionKey, initiatorName: membership.user.displayName,
+        participants: uniqueAgents.map((agent) => agent.displayName), roundLimit: 10,
+      };
+      active.push({ request, awaitingApproval, context, targetClientId: target.clientId });
+      deliveryStates.push({ requestId: targetRequestId, targetAgentId: target.memberId,
+        targetAgentName: target.displayName,
+        status: awaitingApproval ? "waiting_approval" : "queued" });
     }
-
-    const targetSocket = clients.get(target.clientId);
-    const targetMembership = groups.membershipForClient(target.clientId);
-    if (targetSocket === undefined || targetMembership === undefined) {
-      failMention("target_offline");
-      return;
+    for (const name of unknownNames) {
+      const targetRequestId = uniqueAgents.length === 0 && unknownNames.length === 1
+        ? requestId : randomUUID();
+      failed.push({
+        initiatorSessionKey, requestId: targetRequestId, groupId: group.groupId,
+        messageId: requestId, senderId: membership.user.memberId,
+        senderName: membership.user.displayName, targetAgentName: name,
+        text: taskText, chainId: requestId, round: 1, failureReason: "target_not_found",
+      });
+      deliveryStates.push({ requestId: targetRequestId, targetAgentName: name,
+        status: "failed", failureReason: "target_not_found" });
     }
-    const permission = permissions.get(target.clientId) ?? "auto";
-    if (permission === "blocked") {
-      failMention("target_blocked");
-      return;
+    const recipients = active.map(({ request }) => ({
+      agentId: request.targetAgentId, name: request.targetAgentName,
+    }));
+    for (const item of active) {
+      item.request.coRecipients = recipients.filter(({ agentId }) =>
+        agentId !== item.request.targetAgentId
+      );
     }
-    const request: AgentRequestPayload = {
-      requestId,
-      groupId: group.groupId,
-      groupName: group.groupName,
-      senderId: membership.user.memberId,
-      senderName: membership.user.displayName,
-      senderType: "user",
-      targetAgentId: target.memberId,
-      targetAgentName: target.displayName,
-      ownerUserName: targetMembership.user.displayName,
-      onlineMembers: groups
-        .onlineMembers(group.groupId)
-        .filter((member) => member.memberId !== target.memberId)
-        .map((member) => ({
-          displayName: member.displayName,
-          type: member.type,
-        })),
-      participants: participantDirectory(group.groupId),
-      text: mention.text,
-      chainId: requestId,
-      round: 1,
-      createdAt: Date.now(),
-    };
     const context: AgentChainContext = {
-      initiatorSessionKey: sessionKeyForClient(clientId) ?? createSessionKey(deviceId, clientId),
+      initiatorSessionKey,
       initiatorName: membership.user.displayName,
-      participants: [target.displayName],
+      participants: recipients.map(({ name }) => name),
       roundLimit: 10,
     };
-    const awaitingApproval = permission === "approval";
+    for (const item of active) item.context = context;
+    const status = active.some(({ awaitingApproval }) => !awaitingApproval)
+      ? "processing" as const
+      : active.length > 0 ? "waiting_approval" as const : "failed" as const;
     const message = createEnvelope(
       "chat.message",
       {
         ...basePayload,
-        status: awaitingApproval
-          ? "waiting_approval" as const
-          : "processing" as const,
+        status,
+        deliveries: deliveryStates,
       },
       { id: requestId },
     );
@@ -1736,29 +1740,38 @@ export function createBrokerServer(
       message.payload.status,
     );
     try {
-      db().insertAgentRequest(storedMessage, request, awaitingApproval, context);
+      db().insertAgentRequestBatch(
+        storedMessage,
+        active.map(({ request, awaitingApproval, context }) => ({ request, awaitingApproval, context })),
+        failed,
+      );
     } catch (error) {
       sendGroupError(socket, requestId, error);
       return;
     }
-    pendingRequests.set(requestId, {
-      targetClientId: target.clientId,
-      targetAgentId: target.memberId,
-      targetName: target.displayName,
-      groupId: group.groupId,
-      request,
-      message: storedMessage,
-      state: awaitingApproval ? "awaiting_approval" : "delivering",
-      deliveryAcknowledged: false,
-      context,
+    for (const item of active) pendingRequests.set(item.request.requestId, {
+      targetClientId: item.targetClientId, targetAgentId: item.request.targetAgentId,
+      targetName: item.request.targetAgentName, groupId: group.groupId,
+      request: item.request, message: storedMessage,
+      state: item.awaitingApproval ? "awaiting_approval" : "delivering",
+      deliveryAcknowledged: false, context,
     });
+    for (const item of failed) closedRequestIds.add(item.requestId);
     broadcastToGroup(group.groupId, message as BrokerEnvelope);
-    if (awaitingApproval) {
-      updatePendingApprovalCount(target.clientId);
-      send(targetSocket, createEnvelope("request.pending", request) as BrokerEnvelope);
-    } else {
-      send(targetSocket, createEnvelope("agent.deliver", request) as BrokerEnvelope);
+    for (const item of active) {
+      const targetSocket = clients.get(item.targetClientId);
+      if (targetSocket === undefined) continue;
+      send(targetSocket, createEnvelope(
+        item.awaitingApproval ? "request.pending" : "agent.deliver", item.request,
+      ) as BrokerEnvelope);
+      if (item.awaitingApproval) updatePendingApprovalCount(item.targetClientId);
     }
+    for (const item of failed) broadcastFailure({
+      requestId: item.requestId, groupId: group.groupId,
+      targetName: item.targetAgentName, ...(item.targetAgentId === undefined ? {} : {
+        targetAgentId: item.targetAgentId,
+      }), reason: item.failureReason as SendFailedPayload["reason"],
+    });
   }
 
   function resendUnacknowledgedDeliveries(
@@ -1831,15 +1844,8 @@ export function createBrokerServer(
         return;
       }
       pending.state = "delivering";
-      if (pending.message.kind === "agent") pending.message.routeStatus = "queued";
-      else pending.message.status = "queued";
       updatePendingApprovalCount(clientId);
-      broadcastToGroup(pending.groupId, {
-        id: pending.message.messageId,
-        type: "chat.message",
-        timestamp: pending.message.timestamp,
-        payload: pending.message,
-      });
+      broadcastRequestMessageStatus(pending);
       const targetSocket = clients.get(clientId);
       if (targetSocket !== undefined) {
         send(
@@ -1907,15 +1913,21 @@ export function createBrokerServer(
 
     if (result.ok) {
       const sourceMembership = groups.membershipForClient(clientId);
-      const mention = parseMention(result.text.trimStart());
-      const target = mention === undefined
-        ? undefined
-        : groups.findMemberByName(pending.groupId, mention.name);
+      const mention = parseMentions(result.text.trimStart());
+      const resolved = mention?.names.map((name) => ({
+        name,
+        member: groups.findMemberByName(pending.groupId, name),
+      })) ?? [];
+      const targets = [...new Map(resolved.flatMap(({ member }) =>
+        member?.type === "agent" ? [[member.memberId, member] as const] : []
+      )).values()];
+      const unknownNames = [...new Set(resolved.filter(({ member }) => member === undefined)
+        .map(({ name }) => name))];
       const nextRound = pending.request.round + 1;
-      const nextRequestId = randomUUID();
-      const participants = target?.type === "agent"
-        ? [...new Set([...pending.context.participants, target.displayName])]
-        : pending.context.participants;
+      const participants = [...new Set([
+        ...pending.context.participants,
+        ...targets.map(({ displayName }) => displayName),
+      ])];
       const answerPayload: ChatMessagePayload = {
         groupId: pending.groupId,
         groupSeq: db().nextGroupSeq(pending.groupId),
@@ -1923,7 +1935,9 @@ export function createBrokerServer(
         senderName: pending.request.targetAgentName,
         senderType: "agent",
         text: result.text,
-        mentionIds: target === undefined ? [pending.request.senderId] : [target.memberId],
+        mentionIds: resolved.length === 0
+          ? [pending.request.senderId]
+          : [...new Set(resolved.flatMap(({ member }) => member === undefined ? [] : [member.memberId]))],
         requestId: result.requestId,
         kind: "agent",
         status: "sent",
@@ -1931,96 +1945,123 @@ export function createBrokerServer(
         round: pending.request.round,
       };
       let next:
-        | { request: AgentRequestPayload; awaitingApproval: boolean; context: AgentChainContext }
+        | {
+            requests: Array<{
+              request: AgentRequestPayload;
+              awaitingApproval: boolean;
+              context: AgentChainContext;
+              targetClientId: string;
+            }>;
+            failed: Parameters<BrokerDatabase["insertAgentRequestBatch"]>[2];
+          }
         | { paused: StoredPausedChain }
         | undefined;
-      let nextTargetClientId: string | undefined;
-
-      const failRoute = (reason: ChatMessagePayload["routeFailureReason"], name: string): void => {
-        answerPayload.routeStatus = "failed";
-        answerPayload.routeFailureReason = reason;
-        answerPayload.routeTargetName = name;
+      const taskText = mention?.text?.trim() ?? "";
+      if (targets.length > 0 || unknownNames.length > 0) {
         answerPayload.nextRound = nextRound;
-      };
-
-      if (mention !== undefined) {
-        if (target === undefined) {
-          failRoute("target_not_found", mention.name);
-        } else if (target.type === "agent" && target.memberId === pending.request.targetAgentId) {
-          failRoute("target_self", target.displayName);
-        } else if (target.type === "agent" && (mention.text === undefined || !mention.text.trim())) {
-          failRoute("empty_mention", target.displayName);
-        } else if (target.type === "agent") {
-          answerPayload.routeTargetName = target.displayName;
-          answerPayload.nextRound = nextRound;
-          if (nextRound > pending.context.roundLimit) {
-            answerPayload.routeStatus = "paused";
-          } else if (!target.online) {
-            failRoute("target_offline", target.displayName);
-          } else {
+        if (nextRound > pending.context.roundLimit && targets.length > 0) {
+          const target = targets[0]!;
+          answerPayload.routeStatus = "paused";
+          answerPayload.routeTargetName = targets.map(({ displayName }) => displayName).join("、");
+          next = { paused: {
+            chainId: pending.request.chainId, groupId: pending.groupId,
+            messageId: "", initiatorSessionKey: pending.context.initiatorSessionKey,
+            initiatorName: pending.context.initiatorName,
+            sourceAgentName: pending.request.targetAgentName,
+            sourceOwnerUserName: sourceMembership?.user.displayName ?? "",
+            targetAgentId: target.memberId, targetAgentName: target.displayName,
+            text: taskText, nextRound, roundLimit: pending.context.roundLimit,
+            participants, pausedAt: 0,
+          } };
+        } else {
+          const requests: Extract<typeof next, { requests: unknown }>["requests"] = [];
+          const failed: Parameters<BrokerDatabase["insertAgentRequestBatch"]>[2] = [];
+          const deliveries: NonNullable<ChatMessagePayload["deliveries"]> = [];
+          for (const target of targets) {
+            const nextRequestId = randomUUID();
             const targetSocket = clients.get(target.clientId);
             const targetMembership = groups.membershipForClient(target.clientId);
             const permission = permissions.get(target.clientId) ?? "auto";
-            if (targetSocket === undefined || targetMembership === undefined) {
-              failRoute("target_offline", target.displayName);
-            } else if (permission === "blocked") {
-              failRoute("target_blocked", target.displayName);
-            } else {
-              const awaitingApproval = permission === "approval";
-              answerPayload.routeRequestId = nextRequestId;
-              answerPayload.routeStatus = awaitingApproval ? "waiting_approval" : "queued";
-              const request: AgentRequestPayload = {
-                requestId: nextRequestId,
-                groupId: pending.groupId,
-                groupName: pending.request.groupName,
+            const failure = target.memberId === pending.request.targetAgentId
+              ? "target_self" as const
+              : taskText === "" ? "empty_mention" as const
+              : !target.online || targetSocket === undefined || targetMembership === undefined
+                ? "target_offline" as const
+                : permission === "blocked" ? "target_blocked" as const : undefined;
+            if (failure !== undefined || targetMembership === undefined) {
+              failed.push({
+                initiatorSessionKey: pending.context.initiatorSessionKey,
+                requestId: nextRequestId, groupId: pending.groupId, messageId: "",
                 senderId: pending.request.targetAgentId,
-                senderName: pending.request.targetAgentName,
-                senderType: "agent",
-                ...(sourceMembership === undefined ? {} : {
-                  senderOwnerUserName: sourceMembership.user.displayName,
-                }),
-                targetAgentId: target.memberId,
-                targetAgentName: target.displayName,
-                ownerUserName: targetMembership.user.displayName,
-                onlineMembers: groups.onlineMembers(pending.groupId)
-                  .filter((member) => member.memberId !== target.memberId)
-                  .map((member) => ({ displayName: member.displayName, type: member.type })),
-                participants: participantDirectory(pending.groupId),
-                text: mention.text!,
-                chainId: pending.request.chainId,
-                round: nextRound,
-                createdAt: Date.now(),
-              };
-              next = {
-                request,
-                awaitingApproval,
-                context: { ...pending.context, participants },
-              };
-              nextTargetClientId = target.clientId;
+                senderName: pending.request.targetAgentName, targetAgentId: target.memberId,
+                targetAgentName: target.displayName, text: taskText,
+                chainId: pending.request.chainId, round: nextRound, failureReason: failure ?? "target_offline",
+              });
+              deliveries.push({ requestId: nextRequestId, targetAgentId: target.memberId,
+                targetAgentName: target.displayName, status: "failed",
+                failureReason: failure ?? "target_offline" });
+              continue;
             }
+            const awaitingApproval = permission === "approval";
+            const request: AgentRequestPayload = {
+              requestId: nextRequestId, groupId: pending.groupId,
+              groupName: pending.request.groupName, senderId: pending.request.targetAgentId,
+              senderName: pending.request.targetAgentName, senderType: "agent",
+              ...(sourceMembership === undefined ? {} : {
+                senderOwnerUserName: sourceMembership.user.displayName,
+              }),
+              targetAgentId: target.memberId, targetAgentName: target.displayName,
+              ownerUserName: targetMembership.user.displayName,
+              onlineMembers: groups.onlineMembers(pending.groupId)
+                .filter((member) => member.memberId !== target.memberId)
+                .map((member) => ({ displayName: member.displayName, type: member.type })),
+              participants: participantDirectory(pending.groupId), coRecipients: [],
+              text: taskText, chainId: pending.request.chainId, round: nextRound,
+              createdAt: Date.now(),
+            };
+            requests.push({ request, awaitingApproval,
+              context: { ...pending.context, participants }, targetClientId: target.clientId });
+            deliveries.push({ requestId: nextRequestId, targetAgentId: target.memberId,
+              targetAgentName: target.displayName,
+              status: awaitingApproval ? "waiting_approval" : "queued" });
           }
+          for (const name of unknownNames) {
+            const nextRequestId = randomUUID();
+            failed.push({
+              initiatorSessionKey: pending.context.initiatorSessionKey,
+              requestId: nextRequestId, groupId: pending.groupId, messageId: "",
+              senderId: pending.request.targetAgentId, senderName: pending.request.targetAgentName,
+              targetAgentName: name, text: taskText, chainId: pending.request.chainId,
+              round: nextRound, failureReason: "target_not_found",
+            });
+            deliveries.push({ requestId: nextRequestId, targetAgentName: name,
+              status: "failed", failureReason: "target_not_found" });
+          }
+          const recipients = requests.map(({ request }) => ({
+            agentId: request.targetAgentId, name: request.targetAgentName,
+          }));
+          for (const item of requests) item.request.coRecipients = recipients.filter(
+            ({ agentId }) => agentId !== item.request.targetAgentId,
+          );
+          if (deliveries.length > 1) answerPayload.deliveries = deliveries;
+          if (deliveries.length === 1) {
+            const delivery = deliveries[0]!;
+            answerPayload.routeRequestId = delivery.requestId;
+            answerPayload.routeTargetName = delivery.targetAgentName;
+            answerPayload.routeStatus = delivery.status === "failed" ? "failed" : delivery.status;
+            answerPayload.routeFailureReason = delivery.failureReason;
+          }
+          next = { requests, failed };
         }
       }
 
       const answer = createEnvelope("chat.message", answerPayload);
       const storedAnswer = historyMessage(answer.id, answer.timestamp, answer.payload, "sent");
-      if (answerPayload.routeStatus === "paused" && target?.type === "agent") {
-        next = { paused: {
-          chainId: pending.request.chainId,
-          groupId: pending.groupId,
-          messageId: answer.id,
-          initiatorSessionKey: pending.context.initiatorSessionKey,
-          initiatorName: pending.context.initiatorName,
-          sourceAgentName: pending.request.targetAgentName,
-          sourceOwnerUserName: sourceMembership?.user.displayName ?? "",
-          targetAgentId: target.memberId,
-          targetAgentName: target.displayName,
-          text: mention!.text!,
-          nextRound,
-          roundLimit: pending.context.roundLimit,
-          participants,
-          pausedAt: answer.timestamp,
-        } };
+      if (next !== undefined && "paused" in next) {
+        next.paused.messageId = answer.id;
+        next.paused.pausedAt = answer.timestamp;
+      } else if (next !== undefined) {
+        for (const failed of next.failed) failed.messageId = answer.id;
       }
       try {
         db().completeAndRoute(result.requestId, storedAnswer, next);
@@ -2030,29 +2071,24 @@ export function createBrokerServer(
       }
       pendingRequests.delete(result.requestId);
       completedRequests.set(result.requestId, clientId);
+      broadcastRequestMessageStatus(pending);
       broadcastToGroup(pending.groupId, answer as BrokerEnvelope);
 
-      if (next !== undefined && "request" in next && nextTargetClientId !== undefined) {
-        const nextPending: PendingRequest = {
-          targetClientId: nextTargetClientId,
-          targetAgentId: next.request.targetAgentId,
-          targetName: next.request.targetAgentName,
-          groupId: next.request.groupId,
-          request: next.request,
-          message: storedAnswer,
-          state: next.awaitingApproval ? "awaiting_approval" : "delivering",
-          deliveryAcknowledged: false,
-          context: next.context,
-        };
-        pendingRequests.set(next.request.requestId, nextPending);
-        const targetSocket = clients.get(nextTargetClientId);
-        if (targetSocket !== undefined) {
-          send(targetSocket, createEnvelope(
-            next.awaitingApproval ? "request.pending" : "agent.deliver",
-            next.request,
+      if (next !== undefined && "requests" in next) {
+        for (const item of next.requests) {
+          pendingRequests.set(item.request.requestId, {
+            targetClientId: item.targetClientId, targetAgentId: item.request.targetAgentId,
+            targetName: item.request.targetAgentName, groupId: item.request.groupId,
+            request: item.request, message: storedAnswer,
+            state: item.awaitingApproval ? "awaiting_approval" : "delivering",
+            deliveryAcknowledged: false, context: item.context,
+          });
+          const targetSocket = clients.get(item.targetClientId);
+          if (targetSocket !== undefined) send(targetSocket, createEnvelope(
+            item.awaitingApproval ? "request.pending" : "agent.deliver", item.request,
           ) as BrokerEnvelope);
+          if (item.awaitingApproval) updatePendingApprovalCount(item.targetClientId);
         }
-        if (next.awaitingApproval) updatePendingApprovalCount(nextTargetClientId);
       } else if (next !== undefined && "paused" in next) {
         sendPausedChain(next.paused);
       }
@@ -2098,6 +2134,15 @@ export function createBrokerServer(
         ...(accepted ? {} : { reason: "unknown_request" as const }),
       }) as BrokerEnvelope,
     );
+  }
+
+  function broadcastRequestMessageStatus(pending: PendingRequest): void {
+    const refreshed = db().message(pending.message.messageId);
+    if (refreshed === undefined) return;
+    for (const current of pendingRequests.values()) {
+      if (current.message.messageId === refreshed.messageId) current.message = refreshed;
+    }
+    broadcastToGroup(pending.groupId, messageEnvelope(refreshed));
   }
 
   function failRequestsForTarget(
@@ -2168,51 +2213,18 @@ export function createBrokerServer(
       return;
     }
 
-    const target = groups.findMemberByName(paused.groupId, paused.targetAgentName);
-    const targetMembership = target?.type === "agent"
-      ? groups.membershipForClient(target.clientId)
-      : undefined;
-    const permission = target?.type === "agent"
-      ? permissions.get(target.clientId) ?? "auto"
-      : "blocked";
-    const failure =
-      target === undefined || target.type !== "agent" ? "target_not_found" as const :
-      !target.online || clients.get(target.clientId) === undefined || targetMembership === undefined
-        ? "target_offline" as const :
-      permission === "blocked" ? "target_blocked" as const : undefined;
-    if (failure !== undefined) {
-      const failed = { ...message, routeStatus: "failed" as const, routeFailureReason: failure };
-      if (!db().resolvePausedChain(chainId, failed)) return;
-      broadcastToGroup(paused.groupId, messageEnvelope(failed));
-      broadcastChainResolved(paused, "failed");
-      return;
-    }
-    if (target === undefined || target.type !== "agent" || targetMembership === undefined) {
-      return;
-    }
-
-    const requestId = randomUUID();
-    const request: AgentRequestPayload = {
-      requestId,
-      groupId: paused.groupId,
-      groupName: group.groupName,
-      senderId: message.senderId,
-      senderName: paused.sourceAgentName,
-      senderType: "agent",
-      senderOwnerUserName: paused.sourceOwnerUserName,
-      targetAgentId: target.memberId,
-      targetAgentName: target.displayName,
-      ownerUserName: targetMembership.user.displayName,
-      onlineMembers: groups.onlineMembers(paused.groupId)
-        .filter((member) => member.memberId !== target.memberId)
-        .map((member) => ({ displayName: member.displayName, type: member.type })),
-      participants: participantDirectory(paused.groupId),
-      text: paused.text,
-      chainId,
-      round: paused.nextRound,
-      createdAt: Date.now(),
-    };
-    const awaitingApproval = permission === "approval";
+    const parsed = parseMentions(message.text.trimStart());
+    const names = parsed?.names ?? [paused.targetAgentName];
+    const taskText = parsed?.text?.trim() || paused.text;
+    const resolved = names.map((name) => ({
+      name,
+      member: groups.findMemberByName(paused.groupId, name),
+    }));
+    const targets = [...new Map(resolved.flatMap(({ member }) =>
+      member?.type === "agent" ? [[member.memberId, member] as const] : []
+    )).values()];
+    const unknownNames = [...new Set(resolved.filter(({ member }) => member === undefined)
+      .map(({ name }) => name))];
     const roundLimit = paused.roundLimit + 10;
     const context: AgentChainContext = {
       initiatorSessionKey: paused.initiatorSessionKey,
@@ -2220,39 +2232,114 @@ export function createBrokerServer(
       participants: paused.participants,
       roundLimit,
     };
-    const updated: HistoryMessage = {
-      ...message,
-      routeRequestId: requestId,
-      routeStatus: awaitingApproval ? "waiting_approval" : "queued",
-      routeFailureReason: undefined,
-    };
+    const requests: Array<{
+      request: AgentRequestPayload; awaitingApproval: boolean;
+      context: AgentChainContext; targetClientId: string;
+    }> = [];
+    const failed: Parameters<BrokerDatabase["insertAgentRequestBatch"]>[2] = [];
+    const deliveries: NonNullable<ChatMessagePayload["deliveries"]> = [];
+    for (const target of targets) {
+      const requestId = randomUUID();
+      const targetMembership = groups.membershipForClient(target.clientId);
+      const permission = permissions.get(target.clientId) ?? "auto";
+      const failure = target.memberId === message.senderId ? "target_self" as const :
+        !target.online || clients.get(target.clientId) === undefined || targetMembership === undefined
+          ? "target_offline" as const :
+        permission === "blocked" ? "target_blocked" as const : undefined;
+      if (failure !== undefined || targetMembership === undefined) {
+        failed.push({
+          initiatorSessionKey: paused.initiatorSessionKey, requestId,
+          groupId: paused.groupId, messageId: paused.messageId,
+          senderId: message.senderId, senderName: paused.sourceAgentName,
+          targetAgentId: target.memberId, targetAgentName: target.displayName,
+          text: taskText, chainId, round: paused.nextRound,
+          failureReason: failure ?? "target_offline",
+        });
+        deliveries.push({ requestId, targetAgentId: target.memberId,
+          targetAgentName: target.displayName, status: "failed",
+          failureReason: failure ?? "target_offline" });
+        continue;
+      }
+      const awaitingApproval = permission === "approval";
+      const request: AgentRequestPayload = {
+        requestId, groupId: paused.groupId, groupName: group.groupName,
+        senderId: message.senderId, senderName: paused.sourceAgentName,
+        senderType: "agent", senderOwnerUserName: paused.sourceOwnerUserName,
+        targetAgentId: target.memberId, targetAgentName: target.displayName,
+        ownerUserName: targetMembership.user.displayName,
+        onlineMembers: groups.onlineMembers(paused.groupId)
+          .filter((member) => member.memberId !== target.memberId)
+          .map((member) => ({ displayName: member.displayName, type: member.type })),
+        participants: participantDirectory(paused.groupId), coRecipients: [],
+        text: taskText, chainId, round: paused.nextRound, createdAt: Date.now(),
+      };
+      requests.push({ request, awaitingApproval, context, targetClientId: target.clientId });
+      deliveries.push({ requestId, targetAgentId: target.memberId,
+        targetAgentName: target.displayName,
+        status: awaitingApproval ? "waiting_approval" : "queued" });
+    }
+    for (const name of unknownNames) {
+      const requestId = randomUUID();
+      failed.push({
+        initiatorSessionKey: paused.initiatorSessionKey, requestId,
+        groupId: paused.groupId, messageId: paused.messageId,
+        senderId: message.senderId, senderName: paused.sourceAgentName,
+        targetAgentName: name, text: taskText, chainId, round: paused.nextRound,
+        failureReason: "target_not_found",
+      });
+      deliveries.push({ requestId, targetAgentName: name, status: "failed",
+        failureReason: "target_not_found" });
+    }
+    const recipients = requests.map(({ request }) => ({
+      agentId: request.targetAgentId, name: request.targetAgentName,
+    }));
+    for (const item of requests) item.request.coRecipients = recipients.filter(
+      ({ agentId }) => agentId !== item.request.targetAgentId,
+    );
+    const updated: HistoryMessage = { ...message, routeFailureReason: undefined };
+    if (deliveries.length > 1) {
+      updated.deliveries = deliveries;
+      updated.routeRequestId = undefined;
+      updated.routeTargetName = undefined;
+      updated.routeStatus = undefined;
+    } else {
+      const delivery = deliveries[0];
+      updated.routeRequestId = delivery?.requestId;
+      updated.routeTargetName = delivery?.targetAgentName;
+      updated.routeStatus = delivery === undefined ? "failed" :
+        delivery.status === "failed" ? "failed" : delivery.status;
+      updated.routeFailureReason = delivery?.failureReason ??
+        (delivery === undefined ? "target_not_found" : undefined);
+    }
     try {
-      db().resumePausedChain(paused, request, awaitingApproval, context, updated);
+      db().resumePausedChain(
+        paused,
+        requests.map(({ request, awaitingApproval, context }) => ({
+          request, awaitingApproval, context,
+        })),
+        failed,
+        updated,
+      );
     } catch (error) {
       sendGroupError(socket, chainId, error);
       return;
     }
-    pendingRequests.set(requestId, {
-      targetClientId: target.clientId,
-      targetAgentId: target.memberId,
-      targetName: target.displayName,
-      groupId: paused.groupId,
-      request,
-      message: updated,
-      state: awaitingApproval ? "awaiting_approval" : "delivering",
-      deliveryAcknowledged: false,
-      context,
+    for (const item of requests) pendingRequests.set(item.request.requestId, {
+      targetClientId: item.targetClientId, targetAgentId: item.request.targetAgentId,
+      targetName: item.request.targetAgentName, groupId: paused.groupId,
+      request: item.request, message: updated,
+      state: item.awaitingApproval ? "awaiting_approval" : "delivering",
+      deliveryAcknowledged: false, context,
     });
     broadcastToGroup(paused.groupId, messageEnvelope(updated));
-    broadcastChainResolved({ ...paused, roundLimit }, "continued");
-    const targetSocket = clients.get(target.clientId);
-    if (targetSocket !== undefined) {
-      send(targetSocket, createEnvelope(
-        awaitingApproval ? "request.pending" : "agent.deliver",
-        request,
+    broadcastChainResolved({ ...paused, roundLimit }, requests.length > 0 ? "continued" : "failed");
+    for (const item of requests) {
+      const targetSocket = clients.get(item.targetClientId);
+      if (targetSocket !== undefined) send(targetSocket, createEnvelope(
+        item.awaitingApproval ? "request.pending" : "agent.deliver", item.request,
       ) as BrokerEnvelope);
+      if (item.awaitingApproval) updatePendingApprovalCount(item.targetClientId);
     }
-    if (awaitingApproval) updatePendingApprovalCount(target.clientId);
   }
 
   function broadcastChainResolved(
@@ -2761,16 +2848,28 @@ export function createBrokerServer(
   };
 }
 
-function parseMention(
+export function parseMentions(
   text: string,
-): { name: string; text?: string } | undefined {
-  if (!text.startsWith("@")) {
-    return undefined;
+): { names: string[]; text?: string } | undefined {
+  if (!text.startsWith("@")) return undefined;
+  const names: string[] = [];
+  let rest = text;
+  while (rest.startsWith("@")) {
+    const match = rest.match(/^@([^\s]+)(?:[ \t]+|$)/u);
+    if (match === null) break;
+    names.push(match[1]!);
+    rest = rest.slice(match[0].length);
   }
-  const match = text.match(/^@([^\s]+)(?:[ \t]+([\s\S]*))?$/);
-  return match === null
-    ? { name: text.slice(1) }
-    : { name: match[1], ...(match[2] === undefined ? {} : { text: match[2] }) };
+  return names.length === 0
+    ? undefined
+    : { names, ...(rest === "" ? {} : { text: rest }) };
+}
+
+function parseMention(text: string): { name: string; text?: string } | undefined {
+  const parsed = parseMentions(text);
+  return parsed === undefined
+    ? undefined
+    : { name: parsed.names[0]!, ...(parsed.text === undefined ? {} : { text: parsed.text }) };
 }
 
 function send(socket: Socket, envelope: Envelope): void {

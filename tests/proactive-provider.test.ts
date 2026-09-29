@@ -13,6 +13,51 @@ function response(content: string, status = 200, headers?: HeadersInit): Respons
 }
 
 describe("DeepSeek Proactive Provider", () => {
+  it("严格解析最多三个去重后的多 Agent 目标", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(response('{"targetAgentIds":["agent:a","agent:b","agent:a"]}'));
+    const provider = new DeepSeekProactiveProvider({ fetch: fetchMock });
+    await expect(provider.select("secret", {
+      groupName: "开发组", summaryIncomplete: false, messages: [], omitted: false,
+      candidates: [
+        { agentId: "agent:a", name: "A", description: "后端" },
+        { agentId: "agent:b", name: "B", description: "测试" },
+      ],
+    })).resolves.toEqual({ targetAgentIds: ["agent:a", "agent:b"] });
+  });
+
+  it("拒绝超过三个目标", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(response('{"targetAgentIds":["a","b","c","d"]}'));
+    const provider = new DeepSeekProactiveProvider({ fetch: fetchMock });
+    await expect(provider.select("secret", {
+      groupName: "开发组", summaryIncomplete: false, messages: [], omitted: false,
+      candidates: ["a", "b", "c", "d"].map((agentId) => ({ agentId, name: agentId, description: "" })),
+    })).rejects.toMatchObject({ kind: "invalid_response" });
+  });
+  it("只能选择 eligibleAgentIds，完整角色目录仅作背景", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(response('{"targetAgentIds":["agent:c"]}'));
+    const provider = new DeepSeekProactiveProvider({ fetch: fetchMock });
+    await expect(provider.select("secret", {
+      groupName: "开发组", summaryIncomplete: false, messages: [], omitted: false,
+      candidates: [{ agentId: "agent:a", name: "A", description: "后端" }],
+      eligibleAgentIds: ["agent:a"],
+      participants: [{
+        user: { name: "Alice", isOwner: true, online: true },
+        agent: {
+          name: "C",
+          description: "文档",
+          online: true,
+          activity: "idle",
+          availability: "available",
+        },
+      }],
+    })).rejects.toMatchObject({ kind: "invalid_response" });
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1]!.body));
+    expect(JSON.parse(body.messages[1].content)).toMatchObject({
+      eligibleAgentIds: ["agent:a"],
+      participants: [{ agent: { name: "C", description: "文档" } }],
+    });
+  });
+
   it("使用官方 deepseek-flash，并严格解析独立 Summary JSON", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(response('{"summary":"  摘要内容  "}'));
     const provider = new DeepSeekProactiveProvider({ fetch: fetchMock });

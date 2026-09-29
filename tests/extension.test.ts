@@ -17,6 +17,7 @@ import type { TcpConnectEndpoint } from "../src/transport/tcp-endpoint.js";
 import {
   createCommsExtension,
   formatAgentRequest,
+  formatProactiveInvitation,
   restoreMemberships,
 } from "../src/extension/index.js";
 import type { ConnectionConfig } from "../src/extension/connection-config.js";
@@ -455,6 +456,50 @@ describe("Pi Extension 群组接入", () => {
     ]);
   });
 
+  it("执行过工具的 Proactive 即使返回沉默标记也会公开结果", async () => {
+    const config = new ProactiveConfigStore(join(directory, "config.json"));
+    config.load();
+    config.saveVerified("sk-fake-1234");
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath,
+      proactiveProvider: new FakeProactiveRouter((input) =>
+        input.candidates.find((candidate) => candidate.name === "Bob-Pi")?.agentId ?? null
+      ),
+      proactiveTimings: {
+        debounceMs: 5,
+        maxWaitMs: 10,
+        groupIntervalMs: 0,
+        cooldownMs: 0,
+        deliveryTtlMs: 500,
+      },
+    });
+    await broker.start();
+    endpoint = broker.endpoint;
+    const a = setup("session-a");
+    const b = setup("session-b");
+    await Promise.all([start(a), start(b)]);
+    const groupId = await createGroup(a);
+    await joinGroup(b, groupId);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    await command(a, "comms-test", "请检查迁移事务");
+    await waitFor(() => b.pi.sentUserMessages.length === 1, "Proactive 未注入");
+    await b.pi.emit("tool_execution_end", b.ctx, { toolName: "bash" });
+    await b.pi.emit("message_end", b.ctx, {
+      message: { role: "assistant", content: [{ type: "text", text: "[PI_COMMS_NO_REPLY]" }] },
+    });
+    await b.pi.emit("agent_settled", b.ctx);
+    await waitFor(
+      () => a.notices.some((notice) => notice.message.includes("执行了工具")),
+      "工具执行后的沉默标记未被公开",
+    );
+    await Promise.all([
+      a.pi.emit("session_shutdown", a.ctx),
+      b.pi.emit("session_shutdown", b.ctx),
+    ]);
+  });
+
   it("从 Session 恢复需要批准权限，未批准前不注入", async () => {
     await launchBroker();
     const a = setup("session-a");
@@ -623,6 +668,7 @@ describe("Agent 注入格式", () => {
           availability: "available",
         },
       }],
+      coRecipients: [{ agentId: "agent:c", name: "Carol-Pi" }],
       text: "继续",
       chainId: "c",
       round: 2,
@@ -633,6 +679,36 @@ describe("Agent 注入格式", () => {
     expect(text).toContain("群组角色目录：");
     expect(text).toContain("Agent Bob-Pi：在线；activity=idle；availability=available");
     expect(text).toContain("Description：负责后端");
+    expect(text).toContain("共同接收者：Carol-Pi");
+    expect(text).toContain("不要假定他们已经开始或完成");
     expect(text).not.toContain("目标：");
+  });
+
+  it("Proactive 邀请标明共同入选者", () => {
+    const text = formatProactiveInvitation({
+      proactiveId: "p",
+      groupId: "g",
+      groupName: "开发组",
+      targetAgentId: "agent:b",
+      targetAgentName: "Bob-Pi",
+      triggerFromSeq: 1,
+      triggerToSeq: 1,
+      observedToSeq: 1,
+      participants: [],
+      coRecipients: [{ agentId: "agent:c", name: "Carol-Pi" }],
+      messages: [{
+        groupSeq: 1,
+        senderType: "user",
+        senderName: "Alice",
+        text: "多目标投递改完了，请回归测试并更新 README",
+      }],
+      summaryIncomplete: false,
+      omitted: false,
+      createdAt: 0,
+      expiresAt: 0,
+    });
+    expect(text).toContain("共同接收者：Carol-Pi");
+    expect(text).toContain("不要假定他们已经开始或完成");
+    expect(text).toContain("[Pi Comms Proactive Invitation]");
   });
 });

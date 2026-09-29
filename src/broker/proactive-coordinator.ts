@@ -72,6 +72,7 @@ export interface PendingProactive {
   createdAt: number;
   expiresAt: number;
   configVersion: number;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 export class ProactiveCoordinator {
@@ -170,13 +171,25 @@ export class ProactiveCoordinator {
   }
 
   acknowledge(proactiveId: string): void {
-    if (!this.#pending.has(proactiveId)) return;
-    this.#log("proactive.delivery.ack", { proactiveId });
+    const pending = this.#pending.get(proactiveId);
+    if (pending === undefined) return;
+    clearTimeout(pending.timer);
+    pending.timer = undefined;
+    this.#log("proactive.delivery.ack", {
+      proactiveId,
+      targetAgentId: pending.target.agentId,
+    });
   }
 
   decline(proactiveId: string, reason: string): void {
+    const pending = this.#pending.get(proactiveId);
+    if (pending !== undefined) clearTimeout(pending.timer);
     if (this.#pending.delete(proactiveId)) {
-      this.#log("proactive.delivery.declined", { proactiveId, reason });
+      this.#log("proactive.delivery.declined", {
+        proactiveId,
+        targetAgentId: pending?.target.agentId,
+        reason,
+      });
     }
   }
 
@@ -187,17 +200,24 @@ export class ProactiveCoordinator {
     this.#resultQueue = this.#resultQueue.then(async () => {
       const pending = this.#pending.get(result.proactiveId);
       if (pending === undefined) return;
+      clearTimeout(pending.timer);
       this.#pending.delete(result.proactiveId);
       this.#rememberCompleted(result.proactiveId);
       this.#cooldownUntil.set(pending.target.agentId, this.#now() + this.#cooldownMs);
       accepted = true;
       if (result.action === "silent") {
-        this.#log("proactive.agent.silent", { proactiveId: result.proactiveId });
+        this.#log("proactive.agent.silent", {
+          proactiveId: result.proactiveId,
+          targetAgentId: pending.target.agentId,
+        });
         return;
       }
       const normalized = normalizeAnswer(result.text);
       if (this.#isDuplicate(pending.groupId, normalized)) {
-        this.#log("proactive.result.duplicate", { proactiveId: result.proactiveId });
+        this.#log("proactive.result.duplicate", {
+          proactiveId: result.proactiveId,
+          targetAgentId: pending.target.agentId,
+        });
         return;
       }
       const newMessages = this.#messages(pending.groupId, pending.observedToSeq, 13);
@@ -206,6 +226,7 @@ export class ProactiveCoordinator {
         if (credentials.proactiveStatus !== "ready" || credentials.apiKey === undefined) {
           this.#log("proactive.result.stale", {
             proactiveId: result.proactiveId,
+            targetAgentId: pending.target.agentId,
             promptVersion: FRESHNESS_PROMPT_VERSION,
           });
           return;
@@ -227,6 +248,7 @@ export class ProactiveCoordinator {
           ) {
             this.#log("proactive.result.stale", {
               proactiveId: result.proactiveId,
+              targetAgentId: pending.target.agentId,
               promptVersion: FRESHNESS_PROMPT_VERSION,
               reason: "summary_incomplete",
             });
@@ -262,26 +284,38 @@ export class ProactiveCoordinator {
             })
           );
           if (!fresh.publish || credentials.configVersion !== this.#credentials().configVersion) {
-            this.#log("proactive.result.stale", { proactiveId: result.proactiveId });
+            this.#log("proactive.result.stale", {
+              proactiveId: result.proactiveId,
+              targetAgentId: pending.target.agentId,
+            });
             return;
           }
         } catch (error) {
           if (credentials.configVersion === this.#credentials().configVersion) {
             this.#handleProviderError(error);
           }
-          this.#log("proactive.result.stale", { proactiveId: result.proactiveId });
+          this.#log("proactive.result.stale", {
+            proactiveId: result.proactiveId,
+            targetAgentId: pending.target.agentId,
+          });
           return;
         }
       }
       await this.#publish(pending, result.text);
-      this.#log("proactive.result.published", { proactiveId: result.proactiveId });
+      this.#log("proactive.result.published", {
+        proactiveId: result.proactiveId,
+        targetAgentId: pending.target.agentId,
+      });
     });
     return this.#resultQueue.then(() => accepted);
   }
 
   cancelForClient(clientId: string): void {
     for (const [id, pending] of this.#pending) {
-      if (pending.target.clientId === clientId) this.#pending.delete(id);
+      if (pending.target.clientId === clientId) {
+        clearTimeout(pending.timer);
+        this.#pending.delete(id);
+      }
     }
   }
 
@@ -292,6 +326,7 @@ export class ProactiveCoordinator {
     this.#batches.clear();
     this.#routerQueue.length = 0;
     this.#queuedGroups.clear();
+    for (const pending of this.#pending.values()) clearTimeout(pending.timer);
     this.#pending.clear();
     this.#cooldownUntil.clear();
     this.#completed.clear();
@@ -357,7 +392,7 @@ export class ProactiveCoordinator {
         withProactiveRetry(async () => {
           this.#mergeLatestBatch(batch);
           const current = this.eligibleCandidates(batch.groupId);
-          if (current.length === 0) return { targetAgentId: null };
+          if (current.length === 0) return { targetAgentIds: [] };
           const routeContext = this.#contextSnapshot?.(
             batch.groupId,
             this.#latestSeq(batch.groupId),
@@ -369,11 +404,14 @@ export class ProactiveCoordinator {
             messages: routeContext.messages.map(toObservation),
             omitted: routeContext.omitted,
             candidates: current.map(({ clientId: _clientId, ...candidate }) => candidate),
+            eligibleAgentIds: current.map((candidate) => candidate.agentId),
+            participants: this.#participants(batch.groupId),
           }, signal);
         })
       );
       if (credentials.configVersion !== this.#credentials().configVersion) return;
-      if (selected.targetAgentId === null) {
+      const selectedIds = selected.targetAgentIds ?? (selected.targetAgentId == null ? [] : [selected.targetAgentId]);
+      if (selectedIds.length === 0) {
         this.#log("proactive.router.none", {
           groupId: batch.groupId,
           promptVersion: ROUTER_PROMPT_VERSION,
@@ -382,18 +420,20 @@ export class ProactiveCoordinator {
         });
         return;
       }
-      const target = this.eligibleCandidates(batch.groupId).find(
-        (candidate) => candidate.agentId === selected.targetAgentId,
-      );
-      if (target === undefined) return;
-      const createdAt = this.#now();
+      const targets = selectedIds
+        .map((id) => this.eligibleCandidates(batch.groupId).find((candidate) => candidate.agentId === id))
+        .filter((target): target is EligibleProactiveAgent => target !== undefined)
+        .slice(0, 3);
       const observedToSeq = this.#latestSeq(batch.groupId);
       const triggerMessages = this.#messages(batch.groupId, batch.fromSeq - 1, 12)
         .filter((message) => message.groupSeq <= batch.toSeq);
       const deliveryContext = observedToSeq === context.messages.at(-1)?.groupSeq
         ? context
         : await this.#context(batch.groupId, observedToSeq, credentials.apiKey);
-      const pending: PendingProactive = {
+      const recipients = targets.map(({ agentId, name }) => ({ agentId, name }));
+      for (const target of targets) {
+        const createdAt = this.#now();
+        const pending: PendingProactive = {
         proactiveId: randomUUID(),
         groupId: batch.groupId,
         groupName,
@@ -405,9 +445,9 @@ export class ProactiveCoordinator {
         createdAt,
         expiresAt: createdAt + this.#deliveryTtlMs,
         configVersion: credentials.configVersion,
-      };
-      this.#pending.set(pending.proactiveId, pending);
-      const delivered = this.#deliver(target.clientId, {
+        };
+        this.#pending.set(pending.proactiveId, pending);
+        const delivered = this.#deliver(target.clientId, {
         proactiveId: pending.proactiveId,
         groupId: pending.groupId,
         groupName,
@@ -417,29 +457,35 @@ export class ProactiveCoordinator {
         triggerToSeq: pending.triggerToSeq,
         observedToSeq,
         participants: this.#participants(batch.groupId),
+        coRecipients: recipients.filter(({ agentId }) => agentId !== target.agentId),
         ...(deliveryContext.summary === undefined ? {} : { summary: deliveryContext.summary }),
         summaryIncomplete: deliveryContext.summaryIncomplete,
         messages: deliveryContext.messages.map(toObservation),
         omitted: deliveryContext.omitted,
         createdAt,
         expiresAt: pending.expiresAt,
-      });
-      if (!delivered) this.#pending.delete(pending.proactiveId);
+        });
+        if (!delivered) this.#pending.delete(pending.proactiveId);
+        const ttlTimer = setTimeout(() => {
+          const current = this.#pending.get(pending.proactiveId);
+          if (current !== undefined && this.#now() >= current.expiresAt) {
+            this.#pending.delete(pending.proactiveId);
+            this.#log("proactive.delivery.expired", {
+              proactiveId: pending.proactiveId,
+              targetAgentId: pending.target.agentId,
+            });
+          }
+        }, this.#deliveryTtlMs);
+        ttlTimer.unref?.();
+        pending.timer = ttlTimer;
+      }
       this.#log("proactive.router.selected", {
         groupId: batch.groupId,
-        targetAgentId: target.agentId,
+        targetAgentIds: targets.map((target) => target.agentId),
         promptVersion: ROUTER_PROMPT_VERSION,
         resultType: "selected",
         durationMs: this.#now() - requestStartedAt,
       });
-      const ttlTimer = setTimeout(() => {
-        const current = this.#pending.get(pending.proactiveId);
-        if (current !== undefined && this.#now() >= current.expiresAt) {
-          this.#pending.delete(pending.proactiveId);
-          this.#log("proactive.delivery.expired", { proactiveId: pending.proactiveId });
-        }
-      }, this.#deliveryTtlMs);
-      ttlTimer.unref?.();
     } catch (error) {
       if (credentials.configVersion === this.#credentials().configVersion) {
         this.#handleProviderError(error);

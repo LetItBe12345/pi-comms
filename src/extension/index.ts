@@ -149,6 +149,7 @@ export function createCommsExtension(
     let proactiveCursorByGroup = new Map<string, number>();
     let activeProactive: ProactiveDeliverPayload | undefined;
     let proactiveAssistantText: string | undefined;
+    let proactiveToolsUsedFor: string | undefined;
     let pendingProactiveToggle:
       | { groupId: string; previous: boolean }
       | undefined;
@@ -576,6 +577,9 @@ export function createCommsExtension(
           activeView?.removeMembers(message.payload.memberIds);
           return;
         case "chat.message":
+          for (const delivery of message.payload.deliveries ?? []) {
+            if (delivery.status !== "waiting_approval") pendingApprovals.delete(delivery.requestId);
+          }
           if (
             message.payload.routeRequestId !== undefined &&
             message.payload.routeStatus !== "waiting_approval"
@@ -1362,6 +1366,12 @@ export function createCommsExtension(
       publishAgentStatus();
     });
 
+    pi.on("tool_execution_end", () => {
+      if (activeProactive !== undefined) {
+        proactiveToolsUsedFor = activeProactive.proactiveId;
+      }
+    });
+
     pi.on("agent_settled", (_event, ctx) => {
       updateContext(ctx);
       if (activeProactive !== undefined) {
@@ -1375,10 +1385,16 @@ export function createCommsExtension(
           publishAgentStatus();
           return;
         }
+        const silent = proactiveAssistantText.trim() === "[PI_COMMS_NO_REPLY]";
+        const usedTools = proactiveToolsUsedFor === proactiveId;
         completeProactive(
-          proactiveAssistantText.trim() === "[PI_COMMS_NO_REPLY]"
+          silent && !usedTools
             ? { proactiveId, action: "silent" }
-            : { proactiveId, action: "answer", text: proactiveAssistantText },
+            : {
+                proactiveId,
+                action: "answer",
+                text: silent ? PROACTIVE_TOOLS_WITHOUT_REPLY : proactiveAssistantText,
+              },
         );
         return;
       }
@@ -1934,7 +1950,11 @@ export function createCommsExtension(
   };
 }
 
+const PROACTIVE_TOOLS_WITHOUT_REPLY =
+  "执行了工具，但没有给出结果说明，可能已修改本地状态。";
+
 export function formatAgentRequest(request: AgentRequestPayload): string {
+  const coRecipients = request.coRecipients ?? [];
   return [
     "[Pi Comms Remote Request]",
     `你是：${request.targetAgentName}（Agent）`,
@@ -1945,17 +1965,24 @@ export function formatAgentRequest(request: AgentRequestPayload): string {
       : []),
     `群组：${request.groupName}`,
     ...formatParticipantDirectory(request.participants),
+    ...(coRecipients.length === 0
+      ? []
+      : [`共同接收者：${coRecipients.map(({ name }) => name).join("、")}`]),
     ...(request.round > 1 ? [`这是第 ${request.round} 轮自动对话。`] : []),
     "",
     request.text,
     "",
     "你可以使用工具、修改本地项目并运行测试。",
     `你的回答会作为公开消息发送到群组「${request.groupName}」，用于回应 ${request.senderName}。请直接回答。`,
-    `如果这个问题更适合群里其他在线 Agent 处理，可在回答开头 @Agent名称 并附上要转交的问题，任务会转给该 Agent；每次只转一次。`,
+    ...(coRecipients.length === 0 ? [] : [
+      "共同接收者可能仍在排队或等待批准；不要假定他们已经开始或完成，也不要把原任务原样再次转给他们。",
+    ]),
+    `如果这个问题更适合群里其他在线 Agent 处理，可在回答开头连续 @多个Agent名称 并附上要转交的问题，任务会分别转给他们；同一批只转一次。`,
   ].join("\n");
 }
 
 export function formatProactiveInvitation(delivery: ProactiveDeliverPayload): string {
+  const coRecipients = delivery.coRecipients ?? [];
   const messages = delivery.messages.map((message) =>
     `#${message.groupSeq} [${message.senderType}] ${message.senderName}: ${message.text}`
   );
@@ -1981,6 +2008,12 @@ export function formatProactiveInvitation(delivery: ProactiveDeliverPayload): st
     "",
     ...messages,
     "",
+    ...(coRecipients.length === 0
+      ? []
+      : [`共同接收者：${coRecipients.map(({ name }) => name).join("、")}`]),
+    ...(coRecipients.length === 0 ? [] : [
+      "共同接收者可能仍在排队或等待批准；不要假定他们已经开始或完成，也不要把原任务原样再次转给他们。",
+    ]),
     "Broker 认为你可能可以推进讨论。请结合当前项目上下文自行判断是否发言。",
     "你可以使用工具、修改本地项目并运行测试，但不要主动 git push、创建 PR、发布 Release、发邮件或进行其他外部写操作。",
     "如果不应发言，最终完整输出 [PI_COMMS_NO_REPLY]。如果使用过工具或修改过本地状态，必须正常说明结果，不能沉默。",

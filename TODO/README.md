@@ -36,12 +36,12 @@
 | 19 | [Proactive 默认开启](./done/19-proactive-default-on.md) | 默认允许 Agent 主动参与，同时保留显式关闭和旧设置 | done | 阶段 18 |
 | 20 | [群聊上下文摘要与 12 条窗口](./done/20-group-context-summary.md) | 用滚动摘要和最近 12 条公开消息统一模型上下文 | done | 阶段 19 |
 | 21 | [完整群组角色上下文](./done/21-participant-context.md) | 向 Coding Agent 提供成员关系和 Agent Description | done | 阶段 20 |
-| 22 | [多 Agent 显式并行投递](./in-progress/22-multi-agent-mentions.md) | 一条消息并行投递给多个 Agent | in-progress | 阶段 21 |
-| 23 | [DeepSeek 多 Agent 主动路由](./in-progress/23-multi-agent-proactive-routing.md) | Router 一次选择多个 Agent 并独立邀请 | in-progress | 阶段 20、21、22 |
+| 22 | [多 Agent 显式并行投递](./done/22-multi-agent-mentions.md) | 一条消息并行投递给多个 Agent | done | 阶段 21 |
+| 23 | [DeepSeek 多 Agent 主动路由](./done/23-multi-agent-proactive-routing.md) | Router 一次选择多个 Agent 并独立邀请 | done | 阶段 20、21、22 |
 
 ## 当前里程碑
 
-阶段 0～16A、17～21 已完成。阶段 16B 等待三台真实设备。阶段 22～23 已规划，尚未实施。
+阶段 0～16A、17～23 已完成。阶段 16B 等待三台真实设备。
 
 ## 维护规则
 

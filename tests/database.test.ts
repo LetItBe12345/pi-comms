@@ -26,7 +26,7 @@ describe("Broker SQLite", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  it("初始化 v9 Schema、WAL 和 FULL，并恢复群组", () => {
+  it("初始化 v10 Schema、WAL 和 FULL，并恢复群组", () => {
     const store = new BrokerDatabase(dbPath);
     expect(store.configuration()).toEqual({
       journalMode: "wal",
@@ -36,7 +36,7 @@ describe("Broker SQLite", () => {
     store.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(9);
+    expect(raw.pragma("user_version", { simple: true })).toBe(10);
     expect(raw.pragma("journal_mode", { simple: true })).toBe("wal");
     const tables = raw
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -146,7 +146,7 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(9);
+    expect(raw.pragma("user_version", { simple: true })).toBe(10);
     const columns = raw
       .prepare("PRAGMA table_info(agent_requests)")
       .all() as Array<{ name: string }>;
@@ -198,7 +198,7 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(9);
+    expect(raw.pragma("user_version", { simple: true })).toBe(10);
     expect((raw.prepare(
       "SELECT initiator_session_key AS value FROM agent_requests WHERE request_id = ?",
     ).get("release-request") as { value: string }).value).toBe(
@@ -241,7 +241,7 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(9);
+    expect(raw.pragma("user_version", { simple: true })).toBe(10);
     raw.close();
   });
 

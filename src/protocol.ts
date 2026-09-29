@@ -26,7 +26,7 @@ export const PI_COMMS_BUILD_CHANNEL: PiCommsBuildChannel =
   process.env.PI_COMMS_BUILD_CHANNEL === "development"
     ? "development"
     : "release";
-export const BROKER_PROTOCOL_VERSION = 7;
+export const BROKER_PROTOCOL_VERSION = 8;
 export const MAX_JSONL_FRAME_BYTES = 8 * 1024 * 1024;
 
 export interface BrokerProbePayload {
@@ -206,6 +206,20 @@ export interface ChatMessagePayload {
   routeFailureReason?: MessageFailureReason;
   routeTargetName?: string;
   nextRound?: number;
+  deliveries?: AgentDeliveryState[];
+}
+
+export interface AgentDeliveryState {
+  requestId: string;
+  targetAgentId?: string;
+  targetAgentName: string;
+  status: "waiting_approval" | "queued" | "processing" | "completed" | "failed";
+  failureReason?: MessageFailureReason;
+}
+
+export interface AgentCoRecipient {
+  agentId: string;
+  name: string;
 }
 
 export type AgentRouteStatus =
@@ -261,6 +275,7 @@ export interface AgentRequestPayload {
   ownerUserName: string;
   onlineMembers: OnlineMember[];
   participants: GroupParticipantContext[];
+  coRecipients?: AgentCoRecipient[];
   text: string;
   chainId: string;
   round: number;
@@ -352,6 +367,7 @@ export interface ProactiveDeliverPayload {
   triggerToSeq: number;
   observedToSeq: number;
   participants: GroupParticipantContext[];
+  coRecipients: AgentCoRecipient[];
   summary?: ProactiveContextSummaryPayload;
   summaryIncomplete: boolean;
   messages: ProactiveObservationMessage[];

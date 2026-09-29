@@ -347,6 +347,23 @@ describe("最小群聊 TUI", () => {
     expect(screen).toContain("? 快捷键");
   });
 
+  it("在一条公开消息下显示多 Agent 的独立状态", () => {
+    const { view } = createView();
+    view.applySnapshot(snapshot([message({
+      messageId: "multi",
+      text: "@Bob-Pi @Carol-Pi 检查",
+      status: "processing",
+      deliveries: [
+        { requestId: "b", targetAgentId: "agent:b", targetAgentName: "Bob-Pi", status: "processing" },
+        { requestId: "c", targetAgentId: "agent:c", targetAgentName: "Carol-Pi", status: "failed", failureReason: "target_blocked" },
+      ],
+    })]));
+    view.setConnection("connected");
+    const screen = view.render(80).join("\n");
+    expect(screen).toContain("Bob-Pi：处理中");
+    expect(screen).toContain("Carol-Pi：失败（目标 Agent 已禁止接收）");
+  });
+
   it("通过 Ctrl+P 切换权限并批准待处理请求", () => {
     const updatePermission = vi.fn(() => true);
     const approveRequest = vi.fn(() => "approve-1");

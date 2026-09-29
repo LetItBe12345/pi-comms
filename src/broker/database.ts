@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import type {
   AgentFailureReason,
+  AgentDeliveryState,
   AgentRequestPayload,
   ChatMessagePayload,
   HistoryMessage,
@@ -508,41 +509,47 @@ export class BrokerDatabase {
     awaitingApproval = false,
     context?: AgentChainContext,
   ): void {
+    this.insertAgentRequests(message, [{ request, awaitingApproval, context }]);
+  }
+
+  insertAgentRequests(
+    message: HistoryMessage,
+    requests: Array<{
+      request: AgentRequestPayload;
+      awaitingApproval: boolean;
+      context?: AgentChainContext;
+    }>,
+  ): void {
+    this.insertAgentRequestBatch(message, requests, []);
+  }
+
+  insertAgentRequestBatch(
+    message: HistoryMessage,
+    requests: Array<{
+      request: AgentRequestPayload;
+      awaitingApproval: boolean;
+      context?: AgentChainContext;
+    }>,
+    failed: FailedAgentRequest[],
+  ): void {
     this.#db.transaction(() => {
       this.#insertMessage(message);
-      this.#db
-        .prepare(
-          `INSERT INTO agent_requests (
-             request_id, group_id, message_id, sender_id, sender_name,
-             target_agent_id, target_agent_name, owner_user_name,
-             sender_type, sender_owner_user_name, online_members, text,
-             chain_id, round, status, initiator_session_key, initiator_name,
-             participants, round_limit, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          request.requestId,
-          request.groupId,
+      for (const item of requests) {
+        const context = item.context ?? {
+          initiatorSessionKey: createSessionKey(this.migrationDeviceId, item.request.requestId),
+          initiatorName: item.request.senderName,
+          participants: [item.request.targetAgentName],
+          roundLimit: 10,
+        };
+        this.#insertRequest(
+          item.request,
           message.messageId,
-          request.senderId,
-          request.senderName,
-          request.targetAgentId,
-          request.targetAgentName,
-          request.ownerUserName,
-          request.senderType ?? "user",
-          request.senderOwnerUserName ?? null,
-          JSON.stringify(request.onlineMembers),
-          request.text,
-          request.chainId,
-          request.round,
-          awaitingApproval ? "awaiting_approval" : "pending",
-          context?.initiatorSessionKey ?? createSessionKey(this.migrationDeviceId, request.requestId),
-          context?.initiatorName ?? request.senderName,
-          JSON.stringify(context?.participants ?? [request.targetAgentName]),
-          context?.roundLimit ?? 10,
           message.timestamp,
-          message.timestamp,
+          item.awaitingApproval,
+          context,
         );
+      }
+      for (const request of failed) this.#insertFailedRequest(request, message.timestamp);
     })();
   }
 
@@ -551,9 +558,12 @@ export class BrokerDatabase {
     answer: HistoryMessage,
     next:
       | {
-          request: AgentRequestPayload;
-          awaitingApproval: boolean;
-          context: AgentChainContext;
+          requests: Array<{
+            request: AgentRequestPayload;
+            awaitingApproval: boolean;
+            context: AgentChainContext;
+          }>;
+          failed: FailedAgentRequest[];
         }
       | { paused: StoredPausedChain }
       | undefined,
@@ -588,8 +598,11 @@ export class BrokerDatabase {
         );
         return;
       }
-      this.#insertRequest(next.request, answer.messageId, answer.timestamp,
-        next.awaitingApproval, next.context);
+      for (const item of next.requests) {
+        this.#insertRequest(item.request, answer.messageId, answer.timestamp,
+          item.awaitingApproval, item.context);
+      }
+      for (const failed of next.failed) this.#insertFailedRequest(failed, answer.timestamp);
     })();
   }
 
@@ -625,15 +638,28 @@ export class BrokerDatabase {
 
   resumePausedChain(
     paused: StoredPausedChain,
-    request: AgentRequestPayload,
-    awaitingApproval: boolean,
-    context: AgentChainContext,
+    requests: Array<{
+      request: AgentRequestPayload;
+      awaitingApproval: boolean;
+      context: AgentChainContext;
+    }>,
+    failed: FailedAgentRequest[],
     message: HistoryMessage,
   ): void {
     this.#db.transaction(() => {
       this.#db.prepare("DELETE FROM paused_chains WHERE chain_id = ?").run(paused.chainId);
       this.#updateMessageRoute(message);
-      this.#insertRequest(request, paused.messageId, Date.now(), awaitingApproval, context);
+      const timestamp = Date.now();
+      for (const item of requests) {
+        this.#insertRequest(
+          item.request,
+          paused.messageId,
+          timestamp,
+          item.awaitingApproval,
+          item.context,
+        );
+      }
+      for (const item of failed) this.#insertFailedRequest(item, timestamp);
     })();
   }
 
@@ -654,40 +680,30 @@ export class BrokerDatabase {
     message: HistoryMessage,
     request: FailedAgentRequest,
   ): void {
+    this.#db.transaction(() => {
+      this.#insertMessage(message);
+      this.#insertFailedRequest(request, message.timestamp);
+    })();
+  }
+
+  #insertFailedRequest(request: FailedAgentRequest, timestamp: number): void {
     const status =
       request.failureReason === "target_blocked" ? "blocked" :
       request.failureReason === "request_rejected" ? "rejected" :
       request.failureReason === "request_invalid" ? "invalid" : "failed";
-    this.#db.transaction(() => {
-      this.#insertMessage(message);
-      this.#db
-        .prepare(
-          `INSERT INTO agent_requests (
-             request_id, group_id, message_id, sender_id, sender_name,
-             target_agent_id, target_agent_name, owner_user_name,
-             online_members, text, chain_id, round, status, failure_reason,
-             initiator_session_key, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          request.requestId,
-          request.groupId,
-          request.messageId,
-          request.senderId,
-          request.senderName,
-          request.targetAgentId ?? null,
-          request.targetAgentName,
-          request.ownerUserName ?? null,
-          request.text,
-          request.chainId,
-          request.round,
-          status,
-          request.failureReason,
-          request.initiatorSessionKey,
-          message.timestamp,
-          message.timestamp,
-        );
-    })();
+    this.#db.prepare(
+      `INSERT INTO agent_requests (
+         request_id, group_id, message_id, sender_id, sender_name,
+         target_agent_id, target_agent_name, owner_user_name,
+         online_members, text, chain_id, round, status, failure_reason,
+         initiator_session_key, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      request.requestId, request.groupId, request.messageId, request.senderId,
+      request.senderName, request.targetAgentId ?? null, request.targetAgentName,
+      request.ownerUserName ?? null, request.text, request.chainId, request.round,
+      status, request.failureReason, request.initiatorSessionKey, timestamp, timestamp,
+    );
   }
 
   markDelivered(requestId: string): void {
@@ -698,6 +714,7 @@ export class BrokerDatabase {
          WHERE request_id = ? AND status = 'pending'`,
       )
       .run(Date.now(), requestId);
+    this.#refreshMessageStatusForRequest(requestId);
   }
 
   approveRequest(requestId: string): boolean {
@@ -718,6 +735,7 @@ export class BrokerDatabase {
            WHERE message_id = (SELECT message_id FROM agent_requests WHERE request_id = ?)`,
         )
         .run(requestId);
+      this.#refreshMessageStatusForRequest(requestId);
       return true;
     })();
   }
@@ -773,6 +791,7 @@ export class BrokerDatabase {
            WHERE message_id = (SELECT message_id FROM agent_requests WHERE request_id = ?)`,
         )
         .run(reason, reason, requestId);
+      this.#refreshMessageStatusForRequest(requestId);
       return true;
     })();
   }
@@ -909,7 +928,23 @@ export class BrokerDatabase {
            route_status = CASE WHEN route_request_id = ? THEN 'completed' ELSE route_status END
        WHERE request_id = ? OR route_request_id = ?`,
     ).run(requestId, requestId, requestId, requestId);
+    this.#refreshMessageStatusForRequest(requestId);
     this.#insertMessage(answer);
+  }
+
+  #refreshMessageStatusForRequest(requestId: string): void {
+    this.#db.prepare(
+      `UPDATE messages
+       SET status = CASE
+         WHEN EXISTS (SELECT 1 FROM agent_requests r WHERE r.message_id = messages.message_id AND r.status = 'delivered') THEN 'processing'
+         WHEN EXISTS (SELECT 1 FROM agent_requests r WHERE r.message_id = messages.message_id AND r.status = 'pending') THEN 'queued'
+         WHEN EXISTS (SELECT 1 FROM agent_requests r WHERE r.message_id = messages.message_id AND r.status = 'awaiting_approval') THEN 'waiting_approval'
+         WHEN EXISTS (SELECT 1 FROM agent_requests r WHERE r.message_id = messages.message_id AND r.status = 'completed') THEN 'completed'
+         ELSE 'failed'
+       END
+       WHERE message_id = (SELECT message_id FROM agent_requests WHERE request_id = ?)
+         AND kind IS NULL`,
+    ).run(requestId);
   }
 
   #updateMessageRoute(message: HistoryMessage): void {
@@ -945,6 +980,30 @@ export class BrokerDatabase {
       for (const key of ["requestId", "chainId", "round", "failureReason", "kind",
         "routeRequestId", "routeStatus", "routeFailureReason", "routeTargetName", "nextRound"] as const) {
         if (result[key] === null) delete result[key];
+      }
+      const deliveries = this.#db.prepare(
+        `SELECT request_id AS requestId, target_agent_id AS targetAgentId,
+                target_agent_name AS targetAgentName, status, failure_reason AS failureReason
+         FROM agent_requests WHERE message_id = ? ORDER BY created_at, request_id`,
+      ).all(result.messageId) as Array<{
+        requestId: string;
+        targetAgentId: string | null;
+        targetAgentName: string;
+        status: AgentRequestStatus;
+        failureReason: MessageFailureReason | null;
+      }>;
+      if (deliveries.length > 1) {
+        result.deliveries = deliveries.map((delivery): AgentDeliveryState => ({
+          requestId: delivery.requestId,
+          ...(delivery.targetAgentId === null ? {} : { targetAgentId: delivery.targetAgentId }),
+          targetAgentName: delivery.targetAgentName,
+          status:
+            delivery.status === "awaiting_approval" ? "waiting_approval" :
+            delivery.status === "pending" ? "queued" :
+            delivery.status === "delivered" ? "processing" :
+            delivery.status === "completed" ? "completed" : "failed",
+          ...(delivery.failureReason === null ? {} : { failureReason: delivery.failureReason }),
+        }));
       }
       return result;
     });
@@ -1047,10 +1106,63 @@ export class BrokerDatabase {
 
   #migrate(): void {
     const version = this.#db.pragma("user_version", { simple: true }) as number;
-    if (version > 9) {
+    if (version > 10) {
       throw new Error(`数据库版本不受支持：${version}`);
     }
+    if (version === 10) {
+      return;
+    }
     if (version === 9) {
+      this.#db.pragma("foreign_keys = OFF");
+      this.#db.exec(`
+        BEGIN;
+        ALTER TABLE agent_requests RENAME TO agent_requests_v9;
+        CREATE TABLE agent_requests (
+          request_id TEXT PRIMARY KEY,
+          group_id TEXT NOT NULL REFERENCES groups(group_id),
+          message_id TEXT NOT NULL REFERENCES messages(message_id),
+          sender_id TEXT NOT NULL,
+          sender_name TEXT NOT NULL,
+          target_agent_id TEXT,
+          target_agent_name TEXT NOT NULL,
+          owner_user_name TEXT,
+          sender_type TEXT NOT NULL DEFAULT 'user',
+          sender_owner_user_name TEXT,
+          online_members TEXT NOT NULL,
+          text TEXT NOT NULL,
+          chain_id TEXT NOT NULL,
+          round INTEGER NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('awaiting_approval', 'pending', 'delivered', 'completed', 'failed', 'interrupted', 'rejected', 'blocked', 'invalid')),
+          initiator_session_key TEXT NOT NULL DEFAULT '',
+          initiator_name TEXT NOT NULL DEFAULT '',
+          participants TEXT NOT NULL DEFAULT '[]',
+          round_limit INTEGER NOT NULL DEFAULT 10,
+          result_text TEXT,
+          failure_reason TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        INSERT INTO agent_requests (
+          request_id, group_id, message_id, sender_id, sender_name,
+          target_agent_id, target_agent_name, owner_user_name,
+          sender_type, sender_owner_user_name, online_members, text,
+          chain_id, round, status, initiator_session_key, initiator_name,
+          participants, round_limit, result_text, failure_reason, created_at, updated_at
+        ) SELECT
+          request_id, group_id, message_id, sender_id, sender_name,
+          target_agent_id, target_agent_name, owner_user_name,
+          sender_type, sender_owner_user_name, online_members, text,
+          chain_id, round, status, initiator_session_key, initiator_name,
+          participants, round_limit, result_text, failure_reason, created_at, updated_at
+        FROM agent_requests_v9;
+        DROP TABLE agent_requests_v9;
+        CREATE INDEX agent_requests_group_status_idx ON agent_requests(group_id, status, updated_at DESC);
+        CREATE INDEX agent_requests_chain_round_idx ON agent_requests(chain_id, round);
+        CREATE INDEX agent_requests_message_idx ON agent_requests(message_id);
+        PRAGMA user_version = 10;
+        COMMIT;
+      `);
+      this.#db.pragma("foreign_keys = ON");
       return;
     }
     if (version === 8) {
@@ -1067,6 +1179,7 @@ export class BrokerDatabase {
         PRAGMA user_version = 9;
         COMMIT;
       `);
+      this.#migrate();
       return;
     }
     if (version === 7) {
@@ -1233,7 +1346,7 @@ export class BrokerDatabase {
         CREATE TABLE paused_chains (
           chain_id TEXT PRIMARY KEY,
           group_id TEXT NOT NULL REFERENCES groups(group_id),
-          message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id),
+          message_id TEXT NOT NULL REFERENCES messages(message_id),
           initiator_session_id TEXT NOT NULL,
           initiator_name TEXT NOT NULL,
           source_agent_name TEXT NOT NULL,
@@ -1278,11 +1391,11 @@ export class BrokerDatabase {
           kind TEXT CHECK (kind IS NULL OR kind = 'agent')
         );
 
-        CREATE TABLE agent_requests (
-          request_id TEXT PRIMARY KEY,
-          group_id TEXT NOT NULL REFERENCES groups(group_id),
-          message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id),
-          sender_id TEXT NOT NULL,
+      CREATE TABLE agent_requests (
+        request_id TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL REFERENCES groups(group_id),
+        message_id TEXT NOT NULL REFERENCES messages(message_id),
+        sender_id TEXT NOT NULL,
           sender_name TEXT NOT NULL,
           target_agent_id TEXT,
           target_agent_name TEXT NOT NULL,
@@ -1371,7 +1484,7 @@ export class BrokerDatabase {
       CREATE TABLE agent_requests (
         request_id TEXT PRIMARY KEY,
         group_id TEXT NOT NULL REFERENCES groups(group_id),
-        message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id),
+        message_id TEXT NOT NULL REFERENCES messages(message_id),
         sender_id TEXT NOT NULL,
         sender_name TEXT NOT NULL,
         target_agent_id TEXT,
@@ -1441,11 +1554,13 @@ export class BrokerDatabase {
         ON agent_requests(group_id, status, updated_at DESC);
       CREATE INDEX agent_requests_chain_round_idx
         ON agent_requests(chain_id, round);
+      CREATE INDEX agent_requests_message_idx
+        ON agent_requests(message_id);
       CREATE INDEX paused_chains_owner_group_idx
         ON paused_chains(initiator_session_key, group_id, paused_at DESC);
       CREATE INDEX group_memberships_group_status_idx
         ON group_memberships(group_id, status, last_active_at DESC);
-      PRAGMA user_version = 9;
+      PRAGMA user_version = 10;
       COMMIT;
     `);
   }
