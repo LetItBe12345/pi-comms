@@ -572,6 +572,12 @@ describe("Local Broker 群组与成员", () => {
       "agent.deliver",
       (item) => item.payload.requestId === bobPending.payload.requestId,
     );
+    await a.waitFor("chat.message", (item) =>
+      item.id === "multi-request"
+      && item.payload.deliveries?.some((delivery) =>
+        delivery.targetAgentName === "Bob-Pi" && delivery.status === "queued"
+      ) === true
+    );
     expect(a.messages.filter((item) => item.type === "chat.message" && item.id === "multi-request"))
       .toHaveLength(2);
     b.sendResult({ requestId: bobDelivery.payload.requestId, ok: true, text: "Bob 结果" });
