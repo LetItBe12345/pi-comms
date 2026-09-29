@@ -1,4 +1,4 @@
-export type ProactiveCallPriority = "validation" | "freshness" | "router";
+export type ProactiveCallPriority = "validation" | "freshness" | "summary" | "router";
 
 interface QueuedCall<T> {
   run(signal: AbortSignal): Promise<T>;
@@ -10,10 +10,12 @@ export class ProactiveCallScheduler {
   readonly #queues: Record<ProactiveCallPriority, QueuedCall<unknown>[]> = {
     validation: [],
     freshness: [],
+    summary: [],
     router: [],
   };
   #running = false;
   #controller: AbortController | undefined;
+  #freshnessBurst = 0;
 
   schedule<T>(
     priority: ProactiveCallPriority,
@@ -57,10 +59,23 @@ export class ProactiveCallScheduler {
   }
 
   #next(remove = true): QueuedCall<unknown> | undefined {
-    for (const priority of ["validation", "freshness", "router"] as const) {
-      const call = this.#queues[priority][0];
-      if (call !== undefined) return remove ? this.#queues[priority].shift() : call;
+    const validation = this.#queues.validation[0];
+    if (validation !== undefined) return remove ? this.#queues.validation.shift() : validation;
+    const summary = this.#queues.summary[0];
+    const freshness = this.#queues.freshness[0];
+    if (summary !== undefined && (freshness === undefined || this.#freshnessBurst >= 3)) {
+      if (remove) this.#freshnessBurst = 0;
+      return remove ? this.#queues.summary.shift() : summary;
     }
-    return undefined;
+    if (freshness !== undefined) {
+      if (remove) this.#freshnessBurst += 1;
+      return remove ? this.#queues.freshness.shift() : freshness;
+    }
+    if (summary !== undefined) {
+      if (remove) this.#freshnessBurst = 0;
+      return remove ? this.#queues.summary.shift() : summary;
+    }
+    const router = this.#queues.router[0];
+    return router === undefined ? undefined : remove ? this.#queues.router.shift() : router;
   }
 }

@@ -73,6 +73,7 @@ import {
   type PendingProactive,
 } from "./proactive-coordinator.js";
 import { ProactiveCallScheduler } from "./proactive-scheduler.js";
+import { GroupContextSummary } from "./group-context-summary.js";
 
 export const DEFAULT_DATABASE_PATH = join(
   homedir(),
@@ -171,6 +172,21 @@ export function createBrokerServer(
   const proactiveConfig = new ProactiveConfigStore(proactiveConfigPath);
   const proactiveProvider = options.proactiveProvider ?? new DeepSeekProactiveProvider();
   const proactiveScheduler = new ProactiveCallScheduler();
+  const proactiveLog = options.proactiveLog ?? (
+    options.proactiveProvider === undefined
+      ? (event: string, fields?: Record<string, unknown>) => console.error(JSON.stringify({
+          component: "pi-comms-proactive",
+          event,
+          ...fields,
+        }))
+      : undefined
+  );
+  const groupContext = new GroupContextSummary({
+    database: () => db(),
+    provider: proactiveProvider,
+    scheduler: proactiveScheduler,
+    log: proactiveLog,
+  });
   const localDisconnectGraceMs = options.disconnectGraceMs ??
     options.localDisconnectGraceMs ?? DEFAULT_LOCAL_DISCONNECT_GRACE_MS;
   const lanDisconnectGraceMs = options.disconnectGraceMs ??
@@ -1074,6 +1090,9 @@ export function createBrokerServer(
       messages: (groupId, afterSeq = 0, limit = 20) =>
         db().publicMessages(groupId, { afterSeq, limit }),
       latestSeq: (groupId) => db().latestGroupSeq(groupId),
+      context: (groupId, throughSeq, apiKey) =>
+        groupContext.prepare(groupId, apiKey, throughSeq),
+      contextSnapshot: (groupId, throughSeq) => groupContext.snapshot(groupId, throughSeq),
       deliver: (clientId, payload) => {
         const target = groups.membershipForClient(clientId)?.agent;
         const targetSocket = clients.get(clientId);
@@ -1085,9 +1104,11 @@ export function createBrokerServer(
         const cursor = proactiveCursors.get(clientId) ?? 0;
         const delta = db().publicMessages(payload.groupId, {
           afterSeq: cursor,
-          limit: 21,
+          limit: 13,
         });
-        const messages = delta.length > 20 ? delta.slice(-12) : delta;
+        const messages = delta.slice(-12);
+        const omitted = delta.length > 12;
+        const omittedThroughSeq = omitted ? delta[0]!.groupSeq : undefined;
         send(targetSocket, createEnvelope("proactive.deliver", {
           ...payload,
           observedToSeq: db().latestGroupSeq(payload.groupId),
@@ -1097,7 +1118,11 @@ export function createBrokerServer(
             senderType: message.senderType,
             text: message.text,
           })),
-          omitted: delta.length > 20,
+          omitted,
+          summaryIncomplete: payload.summaryIncomplete || (
+            omittedThroughSeq !== undefined &&
+            (payload.summary === undefined || payload.summary.throughSeq < omittedThroughSeq)
+          ),
         }) as BrokerEnvelope);
         return true;
       },
@@ -1108,15 +1133,7 @@ export function createBrokerServer(
         broadcastConfigStatus();
       },
       onStatusChanged: broadcastConfigStatus,
-      log: options.proactiveLog ?? (
-        options.proactiveProvider === undefined
-          ? (event, fields) => console.error(JSON.stringify({
-              component: "pi-comms-proactive",
-              event,
-              ...fields,
-            }))
-          : undefined
-      ),
+      log: proactiveLog,
       ...(options.proactiveTimings ?? {}),
     });
   }

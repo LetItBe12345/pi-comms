@@ -1959,11 +1959,23 @@ export function formatProactiveInvitation(delivery: ProactiveDeliverPayload): st
   const messages = delivery.messages.map((message) =>
     `#${message.groupSeq} [${message.senderType}] ${message.senderName}: ${message.text}`
   );
+  const summary = delivery.summary === undefined
+    ? []
+    : [
+        `群聊摘要（#${delivery.summary.fromSeq}-#${delivery.summary.throughSeq}，${delivery.summary.promptVersion}）：`,
+        delivery.summary.text,
+        "",
+      ];
   return [
     "[Pi Comms Proactive Invitation]",
     `群组：${delivery.groupName}`,
     `你是：${delivery.targetAgentName}（Agent）`,
-    ...(delivery.omitted ? ["较早的群聊消息已省略。"] : []),
+    ...summary,
+    ...(delivery.summaryIncomplete
+      ? ["注意：较早的群聊摘要不完整。"]
+      : delivery.omitted && delivery.summary === undefined
+      ? ["较早的群聊消息已省略。"]
+      : []),
     "",
     ...messages,
     "",

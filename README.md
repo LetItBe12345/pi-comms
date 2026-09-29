@@ -130,7 +130,11 @@ pi
 
 Proactive 由 Broker 使用独立的 DeepSeek API Key。它不读取、修改或复用
 Pi Session 的模型和 Key。Broker 固定使用 DeepSeek 官方 API 和
-`deepseek-v4-flash`。
+`deepseek-flash`。
+
+Router、Proactive Agent 和 Freshness 只读取 Pi Comms 的公开群聊：较早内容使用
+带 `groupSeq` 范围的滚动摘要，原始窗口最多保留最近 12 条。摘要不会读取 Pi Session
+私聊、工具调用或本地项目文件；原始公开消息仍完整保存在 SQLite。
 
 在 `/comms` 首页打开“Broker 设置”，输入 DeepSeek API Key。Key 验证成功后会保存在
 Broker 所在机器的 `~/.pi/comms/config.json`，以后创建群组或重启 Broker 会继续使用。

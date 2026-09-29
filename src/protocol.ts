@@ -25,7 +25,7 @@ export const PI_COMMS_BUILD_CHANNEL: PiCommsBuildChannel =
   process.env.PI_COMMS_BUILD_CHANNEL === "development"
     ? "development"
     : "release";
-export const BROKER_PROTOCOL_VERSION = 5;
+export const BROKER_PROTOCOL_VERSION = 6;
 export const MAX_JSONL_FRAME_BYTES = 8 * 1024 * 1024;
 
 export interface BrokerProbePayload {
@@ -333,6 +333,13 @@ export interface ProactiveObservationMessage {
   text: string;
 }
 
+export interface ProactiveContextSummaryPayload {
+  text: string;
+  fromSeq: number;
+  throughSeq: number;
+  promptVersion: string;
+}
+
 export interface ProactiveDeliverPayload {
   proactiveId: string;
   groupId: string;
@@ -342,6 +349,8 @@ export interface ProactiveDeliverPayload {
   triggerFromSeq: number;
   triggerToSeq: number;
   observedToSeq: number;
+  summary?: ProactiveContextSummaryPayload;
+  summaryIncomplete: boolean;
   messages: ProactiveObservationMessage[];
   omitted: boolean;
   createdAt: number;

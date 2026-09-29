@@ -28,6 +28,92 @@ async function waitFor(check: () => boolean): Promise<void> {
 }
 
 describe("Proactive Coordinator", () => {
+  it("Router 和 Delivery 复用摘要与最近 12 条原始消息", async () => {
+    const history = Array.from({ length: 15 }, (_, index) => message(index + 1, `消息 ${index + 1}`));
+    const routeInputs: number[][] = [];
+    const provider = new FakeProactiveRouter((input) => {
+      routeInputs.push(input.messages.map((item) => item.groupSeq));
+      expect(input.summary).toMatchObject({ fromSeq: 1, throughSeq: 3 });
+      return "agent:a";
+    });
+    let delivery: ProactiveDeliverPayload | undefined;
+    const context = {
+      summary: { text: "前三条摘要", fromSeq: 1, throughSeq: 3, promptVersion: "summary-v1" },
+      messages: history.slice(-12),
+      omitted: true,
+      summaryIncomplete: false,
+    };
+    const coordinator = new ProactiveCoordinator({
+      provider,
+      credentials: () => ({ proactiveStatus: "ready", configVersion: 1, apiKey: "key" }),
+      groupName: () => "开发组",
+      candidates: () => [{
+        agentId: "agent:a", clientId: "client-a", name: "Agent-A", description: "后端",
+      }],
+      messages: (_groupId, afterSeq = 0, limit = 20) =>
+        history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
+      latestSeq: () => 15,
+      context: async () => context,
+      deliver: (_clientId, payload) => (delivery = payload, true),
+      publish: vi.fn(),
+      onInvalidKey: vi.fn(),
+      debounceMs: 1,
+      maxWaitMs: 1,
+      groupIntervalMs: 0,
+    });
+    coordinator.trigger("g", 15);
+    await waitFor(() => delivery !== undefined);
+    expect(routeInputs[0]).toEqual(Array.from({ length: 12 }, (_, index) => index + 4));
+    expect(delivery).toMatchObject({
+      summary: { fromSeq: 1, throughSeq: 3 },
+      summaryIncomplete: false,
+      omitted: true,
+    });
+    expect(delivery!.messages).toHaveLength(12);
+    coordinator.clear();
+  });
+
+  it("Freshness 缺少被省略新增消息的摘要时 fail closed", async () => {
+    const history = [message(1, "原问题")];
+    let delivery: ProactiveDeliverPayload | undefined;
+    const freshness = vi.fn(() => true);
+    const provider = new FakeProactiveRouter(() => "agent:a", freshness);
+    const publish = vi.fn();
+    const coordinator = new ProactiveCoordinator({
+      provider,
+      credentials: () => ({ proactiveStatus: "ready", configVersion: 1, apiKey: "key" }),
+      groupName: () => "开发组",
+      candidates: () => [{
+        agentId: "agent:a", clientId: "client-a", name: "Agent-A", description: "后端",
+      }],
+      messages: (_groupId, afterSeq = 0, limit = 20) =>
+        history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
+      latestSeq: () => history.at(-1)?.groupSeq ?? 0,
+      context: async () => ({
+        messages: history.slice(-12),
+        omitted: true,
+        summaryIncomplete: true,
+      }),
+      deliver: (_clientId, payload) => (delivery = payload, true),
+      publish,
+      onInvalidKey: vi.fn(),
+      debounceMs: 1,
+      maxWaitMs: 1,
+      groupIntervalMs: 0,
+    });
+    coordinator.trigger("g", 1);
+    await waitFor(() => delivery !== undefined);
+    for (let seq = 2; seq <= 14; seq += 1) history.push(message(seq, `新增 ${seq}`));
+    await coordinator.result({
+      proactiveId: delivery!.proactiveId,
+      action: "answer",
+      text: "候选回答",
+    });
+    expect(freshness).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    coordinator.clear();
+  });
+
   it("合并 batch、投递、发布并启动 cooldown", async () => {
     const history = [message(1, "请检查数据库"), message(2, "重点看迁移")];
     const deliveries: ProactiveDeliverPayload[] = [];
@@ -43,6 +129,7 @@ describe("Proactive Coordinator", () => {
       messages: (_groupId, afterSeq = 0, limit = 20) =>
         history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
       latestSeq: () => history.at(-1)?.groupSeq ?? 0,
+      context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
       deliver: (_clientId, payload) => (deliveries.push(payload), true),
       publish: (_pending, text) => {
         published.push(text);
@@ -84,6 +171,7 @@ describe("Proactive Coordinator", () => {
       messages: (_groupId, afterSeq = 0, limit = 20) =>
         history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
       latestSeq: () => history.at(-1)?.groupSeq ?? 0,
+      context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
       deliver: (_clientId, payload) => (delivery = payload, true),
       publish,
       onInvalidKey: vi.fn(),
@@ -142,6 +230,7 @@ describe("Proactive Coordinator", () => {
       messages: (_groupId, afterSeq = 0, limit = 20) =>
         history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
       latestSeq: () => history.at(-1)?.groupSeq ?? 0,
+      context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
       deliver: (_clientId, payload) => (deliveries.push(payload), true),
       publish: (pending, text) => {
         history.push({

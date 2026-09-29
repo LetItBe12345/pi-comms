@@ -74,6 +74,15 @@ export interface StoredMembership {
   lastActiveAt: number;
 }
 
+export interface StoredGroupSummary {
+  groupId: string;
+  summary: string;
+  fromSeq: number;
+  throughSeq: number;
+  promptVersion: string;
+  updatedAt: number;
+}
+
 export class BrokerDatabase {
   readonly #db: Database.Database;
 
@@ -427,6 +436,7 @@ export class BrokerDatabase {
       }
       this.#db.prepare("DELETE FROM paused_chains WHERE group_id = ?").run(groupId);
       this.#db.prepare("DELETE FROM agent_requests WHERE group_id = ?").run(groupId);
+      this.#db.prepare("DELETE FROM group_summaries WHERE group_id = ?").run(groupId);
       this.#db.prepare("DELETE FROM messages WHERE group_id = ?").run(groupId);
       this.#db.prepare("DELETE FROM group_memberships WHERE group_id = ?").run(groupId);
       this.#db.prepare("DELETE FROM groups WHERE group_id = ?").run(groupId);
@@ -785,21 +795,69 @@ export class BrokerDatabase {
 
   publicMessages(
     groupId: string,
-    options: { afterSeq?: number; limit?: number } = {},
+    options: { afterSeq?: number; throughSeq?: number; limit?: number } = {},
   ): HistoryMessage[] {
     const afterSeq = options.afterSeq ?? 0;
+    const throughSeq = options.throughSeq ?? Number.MAX_SAFE_INTEGER;
     const limit = options.limit ?? 20;
     return this.#readMessages(
       `WHERE message_id IN (
          SELECT message_id FROM (
            SELECT message_id
              FROM messages
-            WHERE group_id = ? AND group_seq > ? AND sender_id <> 'system'
+            WHERE group_id = ? AND group_seq > ? AND group_seq <= ?
+              AND sender_id <> 'system'
             ORDER BY group_seq DESC
             LIMIT ?
          )
        ) ORDER BY group_seq ASC`,
-      [groupId, afterSeq, limit],
+      [groupId, afterSeq, throughSeq, limit],
+    );
+  }
+
+  publicMessagesRange(groupId: string, afterSeq: number, throughSeq: number): HistoryMessage[] {
+    return this.publicMessages(groupId, {
+      afterSeq,
+      throughSeq,
+      limit: Number.MAX_SAFE_INTEGER,
+    });
+  }
+
+  firstPublicMessageSeq(groupId: string): number | undefined {
+    const row = this.#db.prepare(
+      `SELECT MIN(group_seq) AS value FROM messages
+       WHERE group_id = ? AND sender_id <> 'system'`,
+    ).get(groupId) as { value: number | null };
+    return row.value ?? undefined;
+  }
+
+  groupSummary(groupId: string): StoredGroupSummary | undefined {
+    return this.#db.prepare(
+      `SELECT group_id AS groupId, summary, from_seq AS fromSeq,
+              through_seq AS throughSeq, prompt_version AS promptVersion,
+              updated_at AS updatedAt
+         FROM group_summaries WHERE group_id = ?`,
+    ).get(groupId) as StoredGroupSummary | undefined;
+  }
+
+  saveGroupSummary(summary: StoredGroupSummary): void {
+    this.#db.prepare(
+      `INSERT INTO group_summaries
+         (group_id, summary, from_seq, through_seq, prompt_version, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(group_id) DO UPDATE SET
+         summary = excluded.summary,
+         from_seq = excluded.from_seq,
+         through_seq = excluded.through_seq,
+         prompt_version = excluded.prompt_version,
+         updated_at = excluded.updated_at`,
+    ).run(
+      summary.groupId,
+      summary.summary,
+      summary.fromSeq,
+      summary.throughSeq,
+      summary.promptVersion,
+      summary.updatedAt,
     );
   }
 
@@ -989,10 +1047,26 @@ export class BrokerDatabase {
 
   #migrate(): void {
     const version = this.#db.pragma("user_version", { simple: true }) as number;
-    if (version > 8) {
+    if (version > 9) {
       throw new Error(`数据库版本不受支持：${version}`);
     }
+    if (version === 9) {
+      return;
+    }
     if (version === 8) {
+      this.#db.exec(`
+        BEGIN;
+        CREATE TABLE IF NOT EXISTS group_summaries (
+          group_id TEXT PRIMARY KEY REFERENCES groups(group_id),
+          summary TEXT NOT NULL,
+          from_seq INTEGER NOT NULL,
+          through_seq INTEGER NOT NULL,
+          prompt_version TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        PRAGMA user_version = 9;
+        COMMIT;
+      `);
       return;
     }
     if (version === 7) {
@@ -1036,6 +1110,7 @@ export class BrokerDatabase {
           PRAGMA user_version = 8;
         `);
       })();
+      this.#migrate();
       return;
     }
     if (version === 6) {
@@ -1349,6 +1424,15 @@ export class BrokerDatabase {
         PRIMARY KEY (group_id, session_key)
       );
 
+      CREATE TABLE group_summaries (
+        group_id TEXT PRIMARY KEY REFERENCES groups(group_id),
+        summary TEXT NOT NULL,
+        from_seq INTEGER NOT NULL,
+        through_seq INTEGER NOT NULL,
+        prompt_version TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
       CREATE INDEX messages_group_time_idx
         ON messages(group_id, timestamp DESC);
       CREATE UNIQUE INDEX messages_group_seq_idx
@@ -1361,7 +1445,7 @@ export class BrokerDatabase {
         ON paused_chains(initiator_session_key, group_id, paused_at DESC);
       CREATE INDEX group_memberships_group_status_idx
         ON group_memberships(group_id, status, last_active_at DESC);
-      PRAGMA user_version = 8;
+      PRAGMA user_version = 9;
       COMMIT;
     `);
   }

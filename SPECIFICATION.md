@@ -79,7 +79,7 @@ B 的 Pi Agent 处理消息
 - IPv6 和主机名连接暂不支持，输入后必须给出可读提示，不能进入模糊超时。
 - 连接模式分为 `local`、`lan-host` 和 `lan-client`；配置按 Pi Session 保存。
 - 传输协议：JSON Lines。
-- 连接必须先完成 `broker.probe` / `broker.ready` 握手，并严格匹配 `service: pi-comms` 和 `protocolVersion: 5`。
+- 连接必须先完成 `broker.probe` / `broker.ready` 握手，并严格匹配 `service: pi-comms` 和 `protocolVersion: 6`。
 - 数据库：SQLite + `better-sqlite3`，开启 WAL 模式。
 - 数据库默认路径：`~/.pi/comms/comms.db`。
 - 只有 Local Broker 可以读写数据库，Extension 不直接访问数据库。
@@ -721,12 +721,12 @@ pi-comms/
 
 ### 19.2 Broker 模型与本机配置
 
-- Broker Router 和 Freshness 默认且只使用 DeepSeek 官方 `deepseek-v4-flash`。Base URL 固定为 `https://api.deepseek.com`，不允许自定义模型或中转 endpoint。
+- Broker Router、Freshness 和 Summary 默认且只使用 DeepSeek 官方 `deepseek-flash`。Base URL 固定为 `https://api.deepseek.com`，不允许自定义模型或中转 endpoint。
 - Pi Session 自己的模型与 Broker 模型严格分开。Pi Comms 不读取、修改或复用 Session 的模型配置和 Key。
 - DeepSeek API Key 由 Broker 本机用户提供并承担费用，只保存在 `~/.pi/comms/config.json`。文件使用临时文件原子替换，macOS/Linux 权限为 `0600`。
 - 本机设置页可以配置、验证、更换、删除 Key。保存后只显示 `****abcd` 形式的遮罩值，不提供完整值回显。远程客户端不显示设置入口。
 - 首次建群可以配置或跳过 Key。跳过不影响普通群聊和显式 `@Agent`。`DEEPSEEK_API_KEY` 只作为配置文件为空时的首次迁移来源，必须经本机用户确认。
-- Key 保存前使用最小 `deepseek-v4-flash` 请求验证 Key、账户和模型权限。首次配置遇到网络故障可保存为未验证，但不能启用 Proactive；已有有效 Key 时不得用未验证新 Key 覆盖。
+- Key 保存前使用最小 `deepseek-flash` 请求验证 Key、账户和模型权限。首次配置遇到网络故障可保存为未验证，但不能启用 Proactive；已有有效 Key 时不得用未验证新 Key 覆盖。
 - 更换 Key 先验证新值，成功后再替换。删除 Key 立即取消在途 Router/Freshness HTTP 请求，但不强制中止已进入 Pi Session 的生成。
 - Broker 使用 `ready | unconfigured | unverified | invalid_key | temporarily_unavailable | config_error` 表示 Proactive 能力。开关状态与 Broker 能力状态分开保存；任何状态都允许开启或关闭，但仅 `ready` 实际调用 Router。
 - `401/403` 把 Key 持久化标记为无效。未验证 Key 每次 Broker 启动时自动验证一次，设置页也提供手动重新验证。
@@ -742,28 +742,28 @@ pi-comms/
 - 未入选、关闭、busy、offline 或 cooldown 中 Agent 的 Description 不得发送给 DeepSeek。候选不设数量上限。
 - 每次 Router 最多选择一个 Agent，也可以返回 `null`。同一群不限制只有一个活跃 Proactive：后续 batch 可以选择另一个 idle Agent，多个 Session 可以并行生成。
 - 每群第一条消息启动 batch；后续消息把 debounce 延后到最后一条后 800ms，但从第一条起最多等 2 秒。每群 Router 请求开始时间间隔不少于 5 秒。
-- 整个 Broker 同时只运行一个 DeepSeek 请求。用户发起的 Key 验证优先，其次是 Freshness，最后是 Router。多群 Router 按 round-robin 调度，多个 Freshness 按结果到达时间 FIFO。
-- Router 输入只包含最近 20 条人类或 Agent 公开文本，按 `groupSeq` 去重排序；超出部分标记省略。候选为 `{ agentId, name, description }`。
+- 整个 Broker 同时只运行一个 DeepSeek 请求。用户发起的 Key 验证优先，其次是 Freshness、Summary、Router。多群 Router 按 round-robin 调度，多个 Freshness 按结果到达时间 FIFO；连续 Freshness 不得让已排队 Summary 长期饿死。
+- Router 输入包含群聊滚动摘要和最近 12 条人类或 Agent 公开文本，按 `groupSeq` 去重排序。候选为 `{ agentId, name, description }`。
 - Router Prompt 要求只在能回答未解决问题、纠正重要错误、补充缺失专业知识或明显推进讨论时选择 Agent；寒暄、附和、重复和无实质内容应返回 `null`。
 - Router 返回后再次检查目标的当前授权、online、idle 和 membership。不再满足时丢弃，不改选第二名。
 
 ### 19.4 DeepSeek Provider
 
-- Router 和 Freshness 都使用 Chat Completions JSON Output：`thinking: { type: "disabled" }`、`response_format: { type: "json_object" }`、`temperature: 0`、`max_tokens: 128`、`stream: false`。
-- Router 和 Freshness Prompt 版本分别为 `router-v1` 和 `freshness-v1`。Prompt 必须明确包含 `json` 字样和合法 JSON 示例。
+- Router、Freshness 和 Summary 都使用 Chat Completions JSON Output：`thinking: { type: "disabled" }`、`response_format: { type: "json_object" }`、`temperature: 0`、`stream: false`。Router/Freshness 的 `max_tokens` 为 128；Summary 为 1024。
+- Router、Freshness 和 Summary Prompt 版本分别为 `router-v2`、`freshness-v2` 和 `summary-v1`。Prompt 必须明确包含 `json` 字样和合法 JSON 示例。
 - Router 只要求 `{ "targetAgentId": "agent:..." }` 或 `{ "targetAgentId": null }`。Freshness 只要求 `{ "publish": true }` 或 `{ "publish": false }`。`reason` 可选、忽略且不记录。
 - Provider 只接受纯 JSON。Markdown 代码块不自动剥离。`targetAgentId` 必须是当前 eligible ID 或 `null`；`"NONE"`、空字符串和缺少字段都非法。`publish` 必须是 JSON 布尔值。未知顶层字段允许并忽略。
 - 网络错误、3 秒超时、`429` 和 `5xx` 最多共请求 3 次。两次重试分别 full jitter `0～500ms` 和 `0～1000ms`；`Retry-After` 优先，单次最多等 5 秒。
 - `400`、`401/403`、空内容、非法 JSON 和未知 Agent ID 不重试。一组重试耗尽后 Broker 全局暂停 30 秒；暂停只存内存，Broker 重启后清空。
 - Router 每次重试前重建候选和最新消息 batch。Freshness 每次重试前重新读取最新公开消息，候选回答保持不变。
-- Router/Freshness 不写 SQLite。结构化日志可以记录 Prompt 版本、目标 ID、结果类型、错误码和耗时，不记录完整 Prompt、群聊副本、reasoning 或 `reason`。
+- Router/Freshness 不写 SQLite；Summary 只写群聊摘要表。结构化日志可以记录 Prompt 版本、目标 ID、摘要覆盖范围、结果类型、错误码和耗时，不记录完整 Prompt、群聊副本、reasoning 或 `reason`。
 
 ### 19.5 Delivery 与 Session 行为
 
 - `proactive.deliver` 从 Broker 创建起 10 秒内有效，不重发。无 ACK 时 TTL 到期后清理。Proactive 不进入 `RemoteQueue`。
 - Extension 注入前最后检查本地 `proactiveEnabled`、`context.isIdle()`、活动显式任务、待批准请求和 TTL。任一不满足就 `proactive.decline`，不进 cooldown。
 - Broker 发送 delivery 前把当前最新公开消息补入 Observation。负载同时记录 Router 的 `triggerFromSeq/triggerToSeq` 和 Agent 实际看到的 `observedToSeq`。
-- 每个 Session/群组持久化 `lastSeenGroupSeq`。未观察增量不超过 20 条时全量注入；超过时只注入最近约 12 条并标记前文省略。
+- 每个 Session/群组持久化 `lastSeenGroupSeq`。Proactive Observation 最多注入最近 12 条未观察公开消息；更早内容由群聊摘要覆盖并标记范围，摘要不完整时明确标记。
 - Observation 使用 `pi.sendUserMessage()` 追加到真实 Session History。每条消息使用 `#seq [user|agent] Name: text` 格式。注入成功后立即持久化 `lastSeenGroupSeq=observedToSeq`；后续中断不回滚，注入失败不推进。
 - Pi Comms 稳定提示词只在 Session 已入群时注入，包含 Agent 群聊名称、Description 和两种触发方式。显式请求使用 `[Pi Comms Remote Request]`，主动邀请使用 `[Pi Comms Proactive Invitation]`。
 - Proactive 与显式请求都可以使用工具、修改本地项目和运行测试。Proactive Prompt 明确禁止主动 `git push`、创建 PR、发布 Release、发邮件或其他外部写操作；该限制只由 Prompt 约束，不做工具层拦截。
@@ -778,7 +778,7 @@ pi-comms/
 - Broker 在内存中保留已完成 `proactiveId` 10 分钟。重复结果只回 ACK，不再发布；Broker 重启后清空。
 - Broker 收到正常结果或 `silent` 时立即从当前时间开始 30 秒 cooldown，在 Duplicate/Freshness 前就移出候选。发布、沉默或被 Freshness 丢弃都进 cooldown；拒绝、过期或中断不进。cooldown 只存内存。
 - 先对当前群最近 20 条 Agent 回答做 exact duplicate：trim 并统一连续空白后完全相等就丢弃，不调用 Freshness，不创建下一跳，但仍进 cooldown。
-- Agent 实际观察后没有新的人类或 Agent 公开文本时直接发布。有新文本时调用 Freshness，输入原始触发、完整候选回答和最近 20 条新消息；更早新消息标记省略。
+- Agent 实际观察后没有新的人类或 Agent 公开文本时直接发布。有新文本时调用 Freshness，输入原始触发、完整候选回答、可用群聊摘要和最近最多 12 条新消息。若更早新增消息未被摘要连续覆盖，Freshness fail closed。
 - Freshness 失败、暂停期、超时、限流、空内容或非法结果均 fail closed，不发布。被丢弃后不向群聊或 Session 本地额外发送通知。
 - 多个 Agent 并行完成时按结果到达顺序处理。先发布的回答写入新 `groupSeq`，并进入后续回答的 Freshness 上下文。
 - Proactive 结果只有通过 Duplicate/Freshness 并成功公开写入后，才解析开头的一个 `@Agent` 并创建现有 Agent-to-Agent 下一跳。目标按现有权限、FIFO 队列和 10 轮暂停规则处理，不传播 `chainOrigin`。
@@ -805,3 +805,34 @@ DeepSeek 实现以官方文档为准：
 - [Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion/)
 - [Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/)
 - [JSON Output](https://api-docs.deepseek.com/guides/json_mode)
+
+## 20. 群聊上下文摘要与 12 条窗口
+
+### 20.1 数据边界
+
+- 摘要只处理 SQLite 中已经公开的普通用户消息和 Agent 回答。系统通知、成员变化、错误、权限状态、Pi Session 私人历史、工具调用和本地文件内容不得进入摘要。
+- 原始公开消息继续完整保存。摘要只提供派生上下文，不删除、覆盖或替代原始消息。
+- 每群最多保存一份滚动摘要，字段为 `groupId`、正文、`fromSeq`、`throughSeq`、Prompt 版本和更新时间。群组解散时随群组数据一起删除。
+- Broker 重启后从 SQLite 恢复摘要。范围无效、端点不存在或覆盖范围与公开历史不一致时，旧摘要不可继续扩展，后续调用按摘要不完整处理并从可验证的公开历史重建。
+
+### 20.2 滚动规则
+
+- Router、Proactive Observation 和 Freshness 的原始公开消息窗口统一为最近 12 条。Duplicate 仍在本地比较最近 20 条 Agent 回答，不属于模型窗口。
+- 摘要输入是“上一次成功摘要 + 尚未纳入摘要且已经落出最近 12 条窗口的公开消息”。每次成功后原子更新到新的连续 `throughSeq`。
+- 摘要保留已确认目标、约束、决定及后续修改、关键事实、已完成结果、正在处理的工作、未解决问题、说话者，以及必要的文件名、接口名、错误信息和消息编号。
+- Summary Prompt 禁止把计划写成已完成、把 Agent 建议写成用户决定、凭空补充事实，或遗漏后来对旧决定的修改。
+- 提供给模型的摘要与最近 12 条原始消息在 `groupSeq` 上不得重叠。若无法证明较早公开消息已连续纳入摘要，必须设置摘要不完整标记。
+- 同一批路由选择复用同一份摘要结果。摘要生成按群组合并并发请求，不为每个候选 Agent 重复调用模型。
+
+### 20.3 故障行为
+
+- Summary 使用独立 Prompt、返回校验、3 秒超时和与 Router/Freshness 相同的最多三次临时错误重试。合法结果只能是包含非空字符串 `summary` 的纯 JSON 对象。
+- Summary 失败不得阻塞普通群聊或显式 `@Agent`。Router 和 Proactive Delivery 继续使用上一次成功摘要及最近 12 条消息，并标记摘要不完整。
+- Freshness 输入保留原始触发内容、完整候选回答、Agent 当时的 `observedToSeq`、可用摘要和最近最多 12 条新增消息。存在被省略但未被摘要覆盖的新增公开消息时，不调用 Freshness，直接不发布。
+- Summary 的结构化日志只记录 Prompt 版本、群组 ID、覆盖范围、结果类型、错误类型和耗时，不记录摘要正文或输入消息副本。
+- Pi Session 自身的 compaction 行为保持不变；Pi Comms 不注册或接管 `session_before_compact`。
+
+### 20.4 协议与数据库
+
+- Broker 协议版本为 6。`proactive.deliver` 可携带摘要正文、覆盖范围、Prompt 版本和 `summaryIncomplete`。
+- SQLite schema 版本为 9，新增 `group_summaries` 表。旧数据库升级只新增摘要表，不改写原始消息。

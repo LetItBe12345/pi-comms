@@ -13,6 +13,24 @@ function response(content: string, status = 200, headers?: HeadersInit): Respons
 }
 
 describe("DeepSeek Proactive Provider", () => {
+  it("使用官方 deepseek-flash，并严格解析独立 Summary JSON", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(response('{"summary":"  摘要内容  "}'));
+    const provider = new DeepSeekProactiveProvider({ fetch: fetchMock });
+    await expect(provider.summarize("secret", { messages: [] })).resolves.toEqual({
+      summary: "摘要内容",
+    });
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1]!.body));
+    expect(DEEPSEEK_MODEL).toBe("deepseek-flash");
+    expect(body).toMatchObject({ model: "deepseek-flash", max_tokens: 1_024 });
+    expect(JSON.stringify(body.messages)).toContain("summary-v1");
+
+    const invalid = new DeepSeekProactiveProvider({
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(response('{"summary":""}')),
+    });
+    await expect(invalid.summarize("key", { messages: [] }))
+      .rejects.toMatchObject({ kind: "invalid_response" });
+  });
+
   it("发送固定非思考 JSON Output 参数并严格解析 Router", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
       response('{"targetAgentId":"agent:a","reason":"ignored"}'),
@@ -20,6 +38,7 @@ describe("DeepSeek Proactive Provider", () => {
     const provider = new DeepSeekProactiveProvider({ fetch: fetchMock });
     await expect(provider.select("secret", {
       groupName: "开发组",
+      summaryIncomplete: false,
       messages: [],
       omitted: false,
       candidates: [{ agentId: "agent:a", name: "A", description: "后端" }],
@@ -43,14 +62,14 @@ describe("DeepSeek Proactive Provider", () => {
       fetch: vi.fn<typeof fetch>().mockResolvedValue(response('```json\n{"targetAgentId":null}\n```')),
     });
     await expect(markdown.select("key", {
-      groupName: "g", messages: [], omitted: false, candidates: [],
+      groupName: "g", summaryIncomplete: false, messages: [], omitted: false, candidates: [],
     })).rejects.toMatchObject({ kind: "invalid_response" });
 
     const unknown = new DeepSeekProactiveProvider({
       fetch: vi.fn<typeof fetch>().mockResolvedValue(response('{"targetAgentId":"agent:x"}')),
     });
     await expect(unknown.select("key", {
-      groupName: "g", messages: [], omitted: false,
+      groupName: "g", summaryIncomplete: false, messages: [], omitted: false,
       candidates: [{ agentId: "agent:a", name: "A", description: "A" }],
     })).rejects.toMatchObject({ kind: "invalid_response" });
 
@@ -58,7 +77,7 @@ describe("DeepSeek Proactive Provider", () => {
       fetch: vi.fn<typeof fetch>().mockResolvedValue(response('{"publish":"true"}')),
     });
     await expect(stringBoolean.isFresh("key", {
-      triggerMessages: [], answer: "answer", newMessages: [], omitted: false,
+      triggerMessages: [], answer: "answer", observedToSeq: 0, newMessages: [], omitted: false,
     })).rejects.toMatchObject({ kind: "invalid_response" });
   });
 

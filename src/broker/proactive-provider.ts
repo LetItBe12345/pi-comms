@@ -1,9 +1,10 @@
 import type { ProactiveObservationMessage } from "../protocol.js";
 
 export const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
-export const DEEPSEEK_MODEL = "deepseek-v4-flash";
-export const ROUTER_PROMPT_VERSION = "router-v1";
-export const FRESHNESS_PROMPT_VERSION = "freshness-v1";
+export const DEEPSEEK_MODEL = "deepseek-flash";
+export const ROUTER_PROMPT_VERSION = "router-v2";
+export const FRESHNESS_PROMPT_VERSION = "freshness-v2";
+export const SUMMARY_PROMPT_VERSION = "summary-v1";
 
 export interface ProactiveCandidate {
   agentId: string;
@@ -13,6 +14,8 @@ export interface ProactiveCandidate {
 
 export interface ProactiveRouteInput {
   groupName: string;
+  summary?: ProactiveContextSummary;
+  summaryIncomplete: boolean;
   messages: ProactiveObservationMessage[];
   omitted: boolean;
   candidates: ProactiveCandidate[];
@@ -21,8 +24,22 @@ export interface ProactiveRouteInput {
 export interface ProactiveFreshnessInput {
   triggerMessages: ProactiveObservationMessage[];
   answer: string;
+  observedToSeq: number;
+  summary?: ProactiveContextSummary;
   newMessages: ProactiveObservationMessage[];
   omitted: boolean;
+}
+
+export interface ProactiveContextSummary {
+  text: string;
+  fromSeq: number;
+  throughSeq: number;
+  promptVersion: string;
+}
+
+export interface ProactiveSummaryInput {
+  previousSummary?: ProactiveContextSummary;
+  messages: ProactiveObservationMessage[];
 }
 
 export interface ProactiveProvider {
@@ -37,6 +54,11 @@ export interface ProactiveProvider {
     input: ProactiveFreshnessInput,
     signal?: AbortSignal,
   ): Promise<{ publish: boolean }>;
+  summarize(
+    apiKey: string,
+    input: ProactiveSummaryInput,
+    signal?: AbortSignal,
+  ): Promise<{ summary: string }>;
 }
 
 export type ProactiveProviderErrorKind =
@@ -67,22 +89,25 @@ export class ProactiveProviderError extends Error {
 export interface DeepSeekProviderOptions {
   fetch?: typeof fetch;
   timeoutMs?: number;
+  summaryTimeoutMs?: number;
 }
 
 export class DeepSeekProactiveProvider implements ProactiveProvider {
   readonly #fetch: typeof fetch;
   readonly #timeoutMs: number;
+  readonly #summaryTimeoutMs: number;
 
   constructor(options: DeepSeekProviderOptions = {}) {
     this.#fetch = options.fetch ?? fetch;
     this.#timeoutMs = options.timeoutMs ?? 3_000;
+    this.#summaryTimeoutMs = options.summaryTimeoutMs ?? 3_000;
   }
 
   async validate(apiKey: string, signal?: AbortSignal): Promise<void> {
     await this.#complete(apiKey, [
       { role: "system", content: "Reply with json only. Example: {\"ok\":true}" },
       { role: "user", content: "Return {\"ok\":true} as json." },
-    ], signal);
+    ], signal, this.#timeoutMs, 128);
   }
 
   async select(
@@ -94,7 +119,7 @@ export class DeepSeekProactiveProvider implements ProactiveProvider {
     const value = await this.#complete(apiKey, [
       { role: "system", content: ROUTER_SYSTEM_PROMPT },
       { role: "user", content: JSON.stringify(input) },
-    ], signal);
+    ], signal, this.#timeoutMs, 128);
     if (!("targetAgentId" in value)) throw invalidResponse("缺少 targetAgentId");
     const targetAgentId = value.targetAgentId;
     if (targetAgentId === null) return { targetAgentId: null };
@@ -112,19 +137,36 @@ export class DeepSeekProactiveProvider implements ProactiveProvider {
     const value = await this.#complete(apiKey, [
       { role: "system", content: FRESHNESS_SYSTEM_PROMPT },
       { role: "user", content: JSON.stringify(input) },
-    ], signal);
+    ], signal, this.#timeoutMs, 128);
     if (typeof value.publish !== "boolean") {
       throw invalidResponse("Freshness publish 必须是 JSON 布尔值");
     }
     return { publish: value.publish };
   }
 
+  async summarize(
+    apiKey: string,
+    input: ProactiveSummaryInput,
+    signal?: AbortSignal,
+  ): Promise<{ summary: string }> {
+    const value = await this.#complete(apiKey, [
+      { role: "system", content: SUMMARY_SYSTEM_PROMPT },
+      { role: "user", content: JSON.stringify(input) },
+    ], signal, this.#summaryTimeoutMs, 1_024);
+    if (typeof value.summary !== "string" || !value.summary.trim()) {
+      throw invalidResponse("Summary summary 必须是非空字符串");
+    }
+    return { summary: value.summary.trim() };
+  }
+
   async #complete(
     apiKey: string,
     messages: Array<{ role: "system" | "user"; content: string }>,
     outerSignal?: AbortSignal,
+    timeoutMs = this.#timeoutMs,
+    maxTokens = 128,
   ): Promise<Record<string, unknown>> {
-    const timeout = AbortSignal.timeout(this.#timeoutMs);
+    const timeout = AbortSignal.timeout(timeoutMs);
     const signal = outerSignal === undefined
       ? timeout
       : AbortSignal.any([outerSignal, timeout]);
@@ -142,7 +184,7 @@ export class DeepSeekProactiveProvider implements ProactiveProvider {
           thinking: { type: "disabled" },
           response_format: { type: "json_object" },
           temperature: 0,
-          max_tokens: 128,
+          max_tokens: maxTokens,
           stream: false,
         }),
         signal,
@@ -234,6 +276,14 @@ const FRESHNESS_SYSTEM_PROMPT = `${FRESHNESS_PROMPT_VERSION}\n` +
   "Decide whether the complete candidate answer is still useful after the newer messages. " +
   "Return pure json only. Example json: {\"publish\":true}.";
 
+const SUMMARY_SYSTEM_PROMPT = `${SUMMARY_PROMPT_VERSION}\n` +
+  "Update the rolling summary of a public group chat. Preserve confirmed goals, constraints, " +
+  "decisions and later changes, key facts, completed results, active work, unresolved questions, " +
+  "speaker attribution, and necessary file names, API names, errors, and message numbers. " +
+  "Never turn a plan into a completed result, an agent suggestion into a user decision, invent facts, " +
+  "or omit a later change to an earlier decision. Return pure json only. " +
+  "Example json: {\"summary\":\"#1-#4: Alice confirmed the API name.\"}.";
+
 function invalidResponse(message: string): ProactiveProviderError {
   return new ProactiveProviderError("invalid_response", message);
 }
@@ -250,6 +300,8 @@ export class FakeProactiveRouter implements ProactiveProvider {
   constructor(
     readonly route: (input: ProactiveRouteInput) => string | null = () => null,
     readonly freshness: (input: ProactiveFreshnessInput) => boolean = () => true,
+    readonly summary: (input: ProactiveSummaryInput) => string = (input) =>
+      input.messages.map((message) => `#${message.groupSeq} ${message.senderName}: ${message.text}`).join("\n"),
   ) {}
 
   async validate(): Promise<void> {}
@@ -266,5 +318,12 @@ export class FakeProactiveRouter implements ProactiveProvider {
     input: ProactiveFreshnessInput,
   ): Promise<{ publish: boolean }> {
     return { publish: this.freshness(input) };
+  }
+
+  async summarize(
+    _apiKey: string,
+    input: ProactiveSummaryInput,
+  ): Promise<{ summary: string }> {
+    return { summary: this.summary(input) };
   }
 }
