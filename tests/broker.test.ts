@@ -475,6 +475,8 @@ describe("Local Broker 群组与成员", () => {
     await joinGroup(b, groupId);
     const c = await connect();
     await joinGroup(c, groupId, "Carol", "Carol-Pi");
+    c.send("proactive.update", { groupId, enabled: false });
+    await c.waitFor("proactive.update.ack");
 
     a.send("chat.send", { text: "@bob-pi  原样正文" }, "agent-request");
     const [publicMessage, delivery] = await Promise.all([
@@ -505,7 +507,115 @@ describe("Local Broker 群组与成员", () => {
       displayName: "Bob",
       type: "user",
     });
+    expect(delivery.payload.participants).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        user: expect.objectContaining({ name: "Alice", isOwner: true }),
+        agent: expect.objectContaining({
+          name: "Alice-Pi",
+          description: "Alice-Pi 测试 Agent",
+          availability: "available",
+        }),
+      }),
+      expect.objectContaining({
+        user: expect.objectContaining({ name: "Bob" }),
+        agent: expect.objectContaining({
+          name: "Bob-Pi",
+          description: "Bob-Pi 测试 Agent",
+        }),
+      }),
+      expect.objectContaining({
+        user: expect.objectContaining({ name: "Carol" }),
+        agent: expect.objectContaining({ name: "Carol-Pi" }),
+      }),
+    ]));
+    expect(JSON.stringify(delivery.payload.participants)).not.toContain("proactiveEnabled");
     expect(c.messages.some((message) => message.type === "agent.deliver")).toBe(false);
+  });
+
+  it("一条消息去重并独立投递给多个 Agent，同时保留用户 mention", async () => {
+    const a = await connect("session-a");
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect("session-b");
+    await joinGroup(b, groupId);
+    const c = await connect("session-c");
+    await joinGroup(c, groupId, "Carol", "Carol-Pi");
+    b.send("permission.update", { permission: "approval" });
+    await a.waitFor("presence.changed", (item) =>
+      item.payload.displayName === "Bob-Pi" && item.payload.agentPermission === "approval"
+    );
+
+    a.send("chat.send", {
+      text: "@Bob-Pi @Carol-Pi @Bob-Pi @Carol 共同检查，正文中的 @Alice-Pi 保留",
+    }, "multi-request");
+    const [message, bobPending, carolDelivery] = await Promise.all([
+      a.waitFor("chat.message", (item) => item.id === "multi-request"),
+      b.waitFor("request.pending", (item) => item.payload.chainId === "multi-request"),
+      c.waitFor("agent.deliver", (item) => item.payload.chainId === "multi-request"),
+    ]);
+    expect(message.payload.mentionIds).toHaveLength(3);
+    expect(message.payload.deliveries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ targetAgentName: "Bob-Pi", status: "waiting_approval" }),
+      expect.objectContaining({ targetAgentName: "Carol-Pi", status: "queued" }),
+    ]));
+    expect(message.payload.deliveries).toHaveLength(2);
+    expect(bobPending.payload.text).toBe("共同检查，正文中的 @Alice-Pi 保留");
+    expect(carolDelivery.payload.text).toBe("共同检查，正文中的 @Alice-Pi 保留");
+    expect(bobPending.payload.coRecipients).toEqual([
+      expect.objectContaining({ name: "Carol-Pi" }),
+    ]);
+    expect(carolDelivery.payload.coRecipients).toEqual([
+      expect.objectContaining({ name: "Bob-Pi" }),
+    ]);
+    b.send("request.approve", { requestId: bobPending.payload.requestId });
+    const bobDelivery = await b.waitFor(
+      "agent.deliver",
+      (item) => item.payload.requestId === bobPending.payload.requestId,
+    );
+    await a.waitFor("chat.message", (item) =>
+      item.id === "multi-request"
+      && item.payload.deliveries?.some((delivery) =>
+        delivery.targetAgentName === "Bob-Pi" && delivery.status === "queued"
+      ) === true
+    );
+    expect(a.messages.filter((item) => item.type === "chat.message" && item.id === "multi-request"))
+      .toHaveLength(2);
+    b.sendResult({ requestId: bobDelivery.payload.requestId, ok: true, text: "Bob 结果" });
+    c.sendResult({ requestId: carolDelivery.payload.requestId, ok: true, text: "Carol 结果" });
+    await Promise.all([
+      a.waitFor("chat.message", (item) => item.payload.kind === "agent" && item.payload.text === "Bob 结果"),
+      a.waitFor("chat.message", (item) => item.payload.kind === "agent" && item.payload.text === "Carol 结果"),
+    ]);
+  });
+
+  it("多目标的离线、禁止和未知失败不取消可用目标", async () => {
+    const a = await connect("session-a");
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect("session-b");
+    await joinGroup(b, groupId);
+    const c = await connect("session-c");
+    await joinGroup(c, groupId, "Carol", "Carol-Pi");
+    b.send("permission.update", { permission: "blocked" });
+    await a.waitFor("presence.changed", (item) =>
+      item.payload.displayName === "Bob-Pi" && item.payload.agentPermission === "blocked"
+    );
+
+    a.send("chat.send", { text: "@Bob-Pi @Carol-Pi @Nobody 分别检查" }, "partial-request");
+    const [message, delivery] = await Promise.all([
+      a.waitFor("chat.message", (item) => item.id === "partial-request"),
+      c.waitFor("agent.deliver", (item) => item.payload.chainId === "partial-request"),
+    ]);
+    expect(delivery.payload.targetAgentName).toBe("Carol-Pi");
+    expect(message.payload.deliveries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ targetAgentName: "Bob-Pi", failureReason: "target_blocked" }),
+      expect.objectContaining({ targetAgentName: "Carol-Pi", status: "queued" }),
+      expect.objectContaining({ targetAgentName: "Nobody", failureReason: "target_not_found" }),
+    ]));
+    await Promise.all([
+      a.waitFor("send.failed", (item) => item.payload.reason === "target_blocked"),
+      a.waitFor("send.failed", (item) => item.payload.reason === "target_not_found"),
+    ]);
   });
 
   it("需要批准时不注入，批准后只投递一次", async () => {
@@ -728,6 +838,42 @@ describe("Local Broker 群组与成员", () => {
     });
   });
 
+  it("Agent 一次可把同一轮独立转给多个其他 Agent", async () => {
+    const a = await connect("session-a");
+    const created = await createGroup(a);
+    const groupId = created.payload.group!.groupId;
+    const b = await connect("session-b");
+    await joinGroup(b, groupId);
+    const c = await connect("session-c");
+    await joinGroup(c, groupId, "Carol", "Carol-Pi");
+
+    a.send("chat.send", { text: "@Bob-Pi 开始" }, "multi-chain");
+    const first = await b.waitFor("agent.deliver", (item) => item.payload.requestId === "multi-chain");
+    b.sendResult({
+      requestId: first.payload.requestId,
+      ok: true,
+      text: "@Alice-Pi @Carol-Pi 并行复核",
+    });
+    const [aliceDelivery, carolDelivery, answer] = await Promise.all([
+      a.waitFor("agent.deliver", (item) => item.payload.round === 2),
+      c.waitFor("agent.deliver", (item) => item.payload.round === 2),
+      a.waitFor("chat.message", (item) => item.payload.kind === "agent" && item.payload.chainId === "multi-chain"),
+    ]);
+    expect(aliceDelivery.payload).toMatchObject({
+      chainId: "multi-chain", round: 2, text: "并行复核",
+    });
+    expect(carolDelivery.payload).toMatchObject({
+      chainId: "multi-chain", round: 2, text: "并行复核",
+    });
+    expect(aliceDelivery.payload.coRecipients).toEqual([
+      expect.objectContaining({ name: "Carol-Pi" }),
+    ]);
+    expect(carolDelivery.payload.coRecipients).toEqual([
+      expect.objectContaining({ name: "Alice-Pi" }),
+    ]);
+    expect(answer.payload.deliveries).toHaveLength(2);
+  });
+
   it("Agent 自动路由拒绝自身和空任务，并遵守目标审批权限", async () => {
     const a = await connect();
     const created = await createGroup(a);
@@ -795,7 +941,7 @@ describe("Local Broker 群组与成员", () => {
     currentClient.sendResult({
       requestId: delivery.payload.requestId,
       ok: true,
-      text: "@Bob-Pi 请进入第 11 轮",
+      text: "@Bob-Pi @Alice-Pi 请进入第 11 轮",
     });
     const paused = await a.waitFor("chain.paused", (item) => item.payload.chainId === "limited-chain");
     expect(paused.payload).toMatchObject({
@@ -807,6 +953,9 @@ describe("Local Broker 群组与成员", () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(
       b.messages.some((item) => item.type === "agent.deliver" && item.payload.round === 11),
+    ).toBe(false);
+    expect(
+      a.messages.some((item) => item.type === "agent.deliver" && item.payload.round === 11),
     ).toBe(false);
 
     const sameSessionOnOtherDevice = await connect(
@@ -824,8 +973,19 @@ describe("Local Broker 群组与成员", () => {
     expect((await b.waitFor("error", (item) => item.payload.requestId === "limited-chain")).payload.code)
       .toBe("request_invalid");
     a.send("chain.continue", { chainId: "limited-chain" });
-    const resumed = await b.waitFor("agent.deliver", (item) => item.payload.round === 11);
+    const [resumed, resumedForAlice] = await Promise.all([
+      b.waitFor("agent.deliver", (item) => item.payload.round === 11),
+      a.waitFor("agent.deliver", (item) => item.payload.round === 11),
+    ]);
     expect(resumed.payload.chainId).toBe("limited-chain");
+    expect(resumedForAlice.payload).toMatchObject({
+      chainId: "limited-chain",
+      targetAgentName: "Alice-Pi",
+      text: "请进入第 11 轮",
+    });
+    expect(resumed.payload.coRecipients).toEqual([
+      expect.objectContaining({ name: "Alice-Pi" }),
+    ]);
     expect(
       (await a.waitFor("chain.resolved", (item) => item.payload.chainId === "limited-chain"))
         .payload,

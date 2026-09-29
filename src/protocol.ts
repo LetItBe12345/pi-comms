@@ -9,6 +9,7 @@ import type {
   AgentPermission,
   GroupSettings,
   GroupVisibility,
+  GroupParticipantContext,
 } from "./types.js";
 
 export interface Envelope<T = unknown> {
@@ -25,7 +26,7 @@ export const PI_COMMS_BUILD_CHANNEL: PiCommsBuildChannel =
   process.env.PI_COMMS_BUILD_CHANNEL === "development"
     ? "development"
     : "release";
-export const BROKER_PROTOCOL_VERSION = 5;
+export const BROKER_PROTOCOL_VERSION = 8;
 export const MAX_JSONL_FRAME_BYTES = 8 * 1024 * 1024;
 
 export interface BrokerProbePayload {
@@ -205,6 +206,20 @@ export interface ChatMessagePayload {
   routeFailureReason?: MessageFailureReason;
   routeTargetName?: string;
   nextRound?: number;
+  deliveries?: AgentDeliveryState[];
+}
+
+export interface AgentDeliveryState {
+  requestId: string;
+  targetAgentId?: string;
+  targetAgentName: string;
+  status: "waiting_approval" | "queued" | "processing" | "completed" | "failed";
+  failureReason?: MessageFailureReason;
+}
+
+export interface AgentCoRecipient {
+  agentId: string;
+  name: string;
 }
 
 export type AgentRouteStatus =
@@ -259,6 +274,8 @@ export interface AgentRequestPayload {
   targetAgentName: string;
   ownerUserName: string;
   onlineMembers: OnlineMember[];
+  participants: GroupParticipantContext[];
+  coRecipients?: AgentCoRecipient[];
   text: string;
   chainId: string;
   round: number;
@@ -333,6 +350,13 @@ export interface ProactiveObservationMessage {
   text: string;
 }
 
+export interface ProactiveContextSummaryPayload {
+  text: string;
+  fromSeq: number;
+  throughSeq: number;
+  promptVersion: string;
+}
+
 export interface ProactiveDeliverPayload {
   proactiveId: string;
   groupId: string;
@@ -342,6 +366,10 @@ export interface ProactiveDeliverPayload {
   triggerFromSeq: number;
   triggerToSeq: number;
   observedToSeq: number;
+  participants: GroupParticipantContext[];
+  coRecipients: AgentCoRecipient[];
+  summary?: ProactiveContextSummaryPayload;
+  summaryIncomplete: boolean;
   messages: ProactiveObservationMessage[];
   omitted: boolean;
   createdAt: number;

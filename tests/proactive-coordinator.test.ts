@@ -28,6 +28,162 @@ async function waitFor(check: () => boolean): Promise<void> {
 }
 
 describe("Proactive Coordinator", () => {
+  it("一次路由可独立投递最多三个 Agent，单个目标失效不影响其他目标", async () => {
+    const history = [message(1, "请分别检查后端和测试")];
+    const deliveries: ProactiveDeliverPayload[] = [];
+    const provider = new FakeProactiveRouter(() => ["agent:a", "agent:b", "agent:c"]);
+    const coordinator = new ProactiveCoordinator({
+      provider,
+      credentials: () => ({ proactiveStatus: "ready", configVersion: 1, apiKey: "key" }),
+      groupName: () => "开发组",
+      candidates: () => [
+        { agentId: "agent:a", clientId: "client-a", name: "A", description: "后端" },
+        { agentId: "agent:b", clientId: "client-b", name: "B", description: "测试" },
+        { agentId: "agent:c", clientId: "client-c", name: "C", description: "文档", },
+      ],
+      messages: (_groupId, afterSeq = 0, limit = 20) => history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
+      latestSeq: () => history.at(-1)?.groupSeq ?? 0,
+      context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
+      participants: () => [],
+      deliver: (clientId, payload) => { if (clientId !== "client-b") deliveries.push(payload); return clientId !== "client-b"; },
+      publish: vi.fn(), onInvalidKey: vi.fn(), debounceMs: 1, maxWaitMs: 1, groupIntervalMs: 0,
+    });
+    coordinator.trigger("g", 1);
+    await waitFor(() => deliveries.length === 2);
+    expect(deliveries.map((item) => item.targetAgentId)).toEqual(["agent:a", "agent:c"]);
+    expect(deliveries.map((item) => item.coRecipients.map(({ name }) => name)))
+      .toEqual([["B", "C"], ["A", "B"]]);
+    coordinator.clear();
+  });
+  it("Router 收到 eligibleAgentIds 和完整角色目录，非 eligible 目标被丢弃", async () => {
+    const history = [message(1, "请检查文档")];
+    const deliveries: ProactiveDeliverPayload[] = [];
+    const directory = [{
+      user: { name: "Alice", isOwner: true, online: true },
+      agent: {
+        name: "B",
+        description: "测试",
+        online: true,
+        activity: "busy" as const,
+        availability: "busy" as const,
+      },
+    }];
+    let seen: { eligibleAgentIds?: string[]; participants?: unknown } = {};
+    const provider = new FakeProactiveRouter((input) => {
+      seen = { eligibleAgentIds: input.eligibleAgentIds, participants: input.participants };
+      return ["agent:a", "agent:b"];
+    });
+    const coordinator = new ProactiveCoordinator({
+      provider,
+      credentials: () => ({ proactiveStatus: "ready", configVersion: 1, apiKey: "key" }),
+      groupName: () => "开发组",
+      candidates: () => [
+        { agentId: "agent:a", clientId: "client-a", name: "A", description: "后端" },
+      ],
+      messages: (_groupId, afterSeq = 0, limit = 20) =>
+        history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
+      latestSeq: () => 1,
+      context: async () => ({ messages: history, omitted: false, summaryIncomplete: false }),
+      participants: () => directory,
+      deliver: (_clientId, payload) => { deliveries.push(payload); return true; },
+      publish: vi.fn(), onInvalidKey: vi.fn(), debounceMs: 1, maxWaitMs: 1, groupIntervalMs: 0,
+    });
+    coordinator.trigger("g", 1);
+    await waitFor(() => deliveries.length === 1);
+    expect(seen.eligibleAgentIds).toEqual(["agent:a"]);
+    expect(seen.participants).toEqual(directory);
+    expect(deliveries.map((item) => item.targetAgentId)).toEqual(["agent:a"]);
+    coordinator.clear();
+  });
+
+  it("Router 和 Delivery 复用摘要与最近 12 条原始消息", async () => {
+    const history = Array.from({ length: 15 }, (_, index) => message(index + 1, `消息 ${index + 1}`));
+    const routeInputs: number[][] = [];
+    const provider = new FakeProactiveRouter((input) => {
+      routeInputs.push(input.messages.map((item) => item.groupSeq));
+      expect(input.summary).toMatchObject({ fromSeq: 1, throughSeq: 3 });
+      return "agent:a";
+    });
+    let delivery: ProactiveDeliverPayload | undefined;
+    const context = {
+      summary: { text: "前三条摘要", fromSeq: 1, throughSeq: 3, promptVersion: "summary-v1" },
+      messages: history.slice(-12),
+      omitted: true,
+      summaryIncomplete: false,
+    };
+    const coordinator = new ProactiveCoordinator({
+      provider,
+      credentials: () => ({ proactiveStatus: "ready", configVersion: 1, apiKey: "key" }),
+      groupName: () => "开发组",
+      candidates: () => [{
+        agentId: "agent:a", clientId: "client-a", name: "Agent-A", description: "后端",
+      }],
+      messages: (_groupId, afterSeq = 0, limit = 20) =>
+        history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
+      latestSeq: () => 15,
+      context: async () => context,
+      participants: () => [],
+      deliver: (_clientId, payload) => (delivery = payload, true),
+      publish: vi.fn(),
+      onInvalidKey: vi.fn(),
+      debounceMs: 1,
+      maxWaitMs: 1,
+      groupIntervalMs: 0,
+    });
+    coordinator.trigger("g", 15);
+    await waitFor(() => delivery !== undefined);
+    expect(routeInputs[0]).toEqual(Array.from({ length: 12 }, (_, index) => index + 4));
+    expect(delivery).toMatchObject({
+      summary: { fromSeq: 1, throughSeq: 3 },
+      summaryIncomplete: false,
+      omitted: true,
+    });
+    expect(delivery!.messages).toHaveLength(12);
+    coordinator.clear();
+  });
+
+  it("Freshness 缺少被省略新增消息的摘要时 fail closed", async () => {
+    const history = [message(1, "原问题")];
+    let delivery: ProactiveDeliverPayload | undefined;
+    const freshness = vi.fn(() => true);
+    const provider = new FakeProactiveRouter(() => "agent:a", freshness);
+    const publish = vi.fn();
+    const coordinator = new ProactiveCoordinator({
+      provider,
+      credentials: () => ({ proactiveStatus: "ready", configVersion: 1, apiKey: "key" }),
+      groupName: () => "开发组",
+      candidates: () => [{
+        agentId: "agent:a", clientId: "client-a", name: "Agent-A", description: "后端",
+      }],
+      messages: (_groupId, afterSeq = 0, limit = 20) =>
+        history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
+      latestSeq: () => history.at(-1)?.groupSeq ?? 0,
+      context: async () => ({
+        messages: history.slice(-12),
+        omitted: true,
+        summaryIncomplete: true,
+      }),
+      participants: () => [],
+      deliver: (_clientId, payload) => (delivery = payload, true),
+      publish,
+      onInvalidKey: vi.fn(),
+      debounceMs: 1,
+      maxWaitMs: 1,
+      groupIntervalMs: 0,
+    });
+    coordinator.trigger("g", 1);
+    await waitFor(() => delivery !== undefined);
+    for (let seq = 2; seq <= 14; seq += 1) history.push(message(seq, `新增 ${seq}`));
+    await coordinator.result({
+      proactiveId: delivery!.proactiveId,
+      action: "answer",
+      text: "候选回答",
+    });
+    expect(freshness).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    coordinator.clear();
+  });
+
   it("合并 batch、投递、发布并启动 cooldown", async () => {
     const history = [message(1, "请检查数据库"), message(2, "重点看迁移")];
     const deliveries: ProactiveDeliverPayload[] = [];
@@ -43,6 +199,8 @@ describe("Proactive Coordinator", () => {
       messages: (_groupId, afterSeq = 0, limit = 20) =>
         history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
       latestSeq: () => history.at(-1)?.groupSeq ?? 0,
+      context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
+      participants: () => [],
       deliver: (_clientId, payload) => (deliveries.push(payload), true),
       publish: (_pending, text) => {
         published.push(text);
@@ -68,6 +226,60 @@ describe("Proactive Coordinator", () => {
     coordinator.clear();
   });
 
+  it("日志记录目标 ID 集合与逐目标结果，不携带目录或 Description", async () => {
+    const history = [message(1, "请回归测试并更新文档")];
+    const deliveries: ProactiveDeliverPayload[] = [];
+    const logs: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const directory = [{
+      user: { name: "DocsUser", isOwner: false, online: true },
+      agent: {
+        name: "Docs-Pi",
+        description: "负责 README 与用户使用文档",
+        online: true,
+        activity: "idle" as const,
+        availability: "available" as const,
+      },
+    }];
+    const coordinator = new ProactiveCoordinator({
+      provider: new FakeProactiveRouter(() => ["agent:a", "agent:b"]),
+      credentials: () => ({ proactiveStatus: "ready", configVersion: 1, apiKey: "key" }),
+      groupName: () => "开发组",
+      candidates: () => [
+        { agentId: "agent:a", clientId: "client-a", name: "A", description: "测试" },
+        { agentId: "agent:b", clientId: "client-b", name: "B", description: "文档" },
+      ],
+      messages: (_groupId, afterSeq = 0, limit = 20) =>
+        history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
+      latestSeq: () => history.at(-1)?.groupSeq ?? 0,
+      context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
+      participants: () => directory,
+      deliver: (_clientId, payload) => (deliveries.push(payload), true),
+      publish: vi.fn(),
+      onInvalidKey: vi.fn(),
+      log: (event, fields) => logs.push({ event, fields }),
+      debounceMs: 1,
+      maxWaitMs: 1,
+      groupIntervalMs: 0,
+      cooldownMs: 0,
+      deliveryTtlMs: 100,
+    });
+    coordinator.trigger("g", 1);
+    await waitFor(() => deliveries.length === 2);
+    for (const delivery of deliveries) {
+      await coordinator.result({
+        proactiveId: delivery.proactiveId,
+        action: "answer",
+        text: `结果-${delivery.targetAgentId}`,
+      });
+    }
+    expect(logs.find((entry) => entry.event === "proactive.router.selected")
+      ?.fields?.targetAgentIds).toEqual(["agent:a", "agent:b"]);
+    expect(logs.filter((entry) => entry.event === "proactive.result.published")
+      .map((entry) => entry.fields?.targetAgentId)).toEqual(["agent:a", "agent:b"]);
+    expect(JSON.stringify(logs)).not.toContain("负责 README");
+    coordinator.clear();
+  });
+
   it("exact duplicate 不调用 Freshness，新增消息时 Freshness fail closed", async () => {
     const history = [message(1, "问题")];
     let delivery: ProactiveDeliverPayload | undefined;
@@ -84,6 +296,8 @@ describe("Proactive Coordinator", () => {
       messages: (_groupId, afterSeq = 0, limit = 20) =>
         history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
       latestSeq: () => history.at(-1)?.groupSeq ?? 0,
+      context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
+      participants: () => [],
       deliver: (_clientId, payload) => (delivery = payload, true),
       publish,
       onInvalidKey: vi.fn(),
@@ -119,6 +333,43 @@ describe("Proactive Coordinator", () => {
     coordinator.clear();
   });
 
+  it("ACK 后投递不再因 TTL 过期而被清理", async () => {
+    const history = [message(1, "请回归测试")];
+    const deliveries: ProactiveDeliverPayload[] = [];
+    const publish = vi.fn();
+    const coordinator = new ProactiveCoordinator({
+      provider: new FakeProactiveRouter(() => "agent:a"),
+      credentials: () => ({ proactiveStatus: "ready", configVersion: 1, apiKey: "key" }),
+      groupName: () => "开发组",
+      candidates: () => [
+        { agentId: "agent:a", clientId: "client-a", name: "A", description: "测试" },
+      ],
+      messages: (_groupId, afterSeq = 0, limit = 20) =>
+        history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
+      latestSeq: () => history.at(-1)?.groupSeq ?? 0,
+      context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
+      participants: () => [],
+      deliver: (_clientId, payload) => { deliveries.push(payload); return true; },
+      publish,
+      onInvalidKey: vi.fn(),
+      debounceMs: 1,
+      maxWaitMs: 1,
+      groupIntervalMs: 0,
+      deliveryTtlMs: 20,
+    });
+    coordinator.trigger("g", 1);
+    await waitFor(() => deliveries.length === 1);
+    coordinator.acknowledge(deliveries[0]!.proactiveId);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await expect(coordinator.result({
+      proactiveId: deliveries[0]!.proactiveId,
+      action: "answer",
+      text: "回归测试通过",
+    })).resolves.toBe(true);
+    expect(publish).toHaveBeenCalledOnce();
+    coordinator.clear();
+  });
+
   it("并行 Agent 结果按到达顺序处理，后一个 Freshness 能看到先发布的回答", async () => {
     const history = [message(1, "问题一")];
     const deliveries: ProactiveDeliverPayload[] = [];
@@ -142,6 +393,8 @@ describe("Proactive Coordinator", () => {
       messages: (_groupId, afterSeq = 0, limit = 20) =>
         history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
       latestSeq: () => history.at(-1)?.groupSeq ?? 0,
+      context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
+      participants: () => [],
       deliver: (_clientId, payload) => (deliveries.push(payload), true),
       publish: (pending, text) => {
         history.push({

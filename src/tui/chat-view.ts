@@ -408,9 +408,12 @@ export class ChatView implements Component, Focusable {
 
     if (message.requestId !== undefined && message.senderType === "agent") {
       const request = this.#messages.find(
-        (item) => item.messageId === message.requestId || item.routeRequestId === message.requestId,
+        (item) => item.messageId === message.requestId || item.routeRequestId === message.requestId ||
+          item.deliveries?.some(({ requestId }) => requestId === message.requestId) === true,
       );
-      if (request?.routeRequestId === message.requestId) request.routeStatus = "completed";
+      const delivery = request?.deliveries?.find(({ requestId }) => requestId === message.requestId);
+      if (delivery !== undefined) delivery.status = "completed";
+      else if (request?.routeRequestId === message.requestId) request.routeStatus = "completed";
       else if (request !== undefined) request.status = "completed";
     }
     if (this.#pendingMessage?.id === message.messageId && message.status !== "failed") {
@@ -426,11 +429,16 @@ export class ChatView implements Component, Focusable {
 
   receiveFailure(failure: SendFailedPayload): void {
     const message = this.#messages.find(
-      (item) => item.messageId === failure.requestId || item.routeRequestId === failure.requestId,
+      (item) => item.messageId === failure.requestId || item.routeRequestId === failure.requestId ||
+        item.deliveries?.some(({ requestId }) => requestId === failure.requestId) === true,
     );
     if (message !== undefined) {
       const wasLatest = this.#isLatestEntry(message.messageId);
-      if (message.routeRequestId === failure.requestId) {
+      const delivery = message.deliveries?.find(({ requestId }) => requestId === failure.requestId);
+      if (delivery !== undefined) {
+        delivery.status = "failed";
+        delivery.failureReason = failure.reason;
+      } else if (message.routeRequestId === failure.requestId) {
         message.routeStatus = "failed";
         message.routeFailureReason = failure.reason;
       } else {
@@ -827,11 +835,16 @@ export class ChatView implements Component, Focusable {
       : message.text.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", blockWidth));
     const state = showState ? messageState(message) : undefined;
     const route = showState ? routeState(message) : undefined;
+    const deliveries = showState ? deliveryStates(message) : [];
     const lines = [
       ...(showHeader ? [this.#theme.fg(message.senderType === "agent" ? "accent" : "muted", label)] : []),
       ...body,
     ];
     if (state !== undefined) lines.push(this.#theme.fg(message.status === "failed" ? "error" : "warning", state));
+    lines.push(...deliveries.map((delivery) => this.#theme.fg(
+      delivery.includes("失败") ? "error" : "warning",
+      delivery,
+    )));
     if (route !== undefined) lines.push(this.#theme.fg(message.routeStatus === "failed" ? "error" : "warning", route));
     return alignMessageBlock(lines, width, blockWidth, own ? "right" : "left");
   }
@@ -1642,6 +1655,7 @@ function failureNotice(message: HistoryMessage): string {
 }
 
 function messageState(message: HistoryMessage): string | undefined {
+  if ((message.deliveries?.length ?? 0) > 1) return undefined;
   if (message.status === "waiting_approval") return "等待目标批准";
   if (message.status === "queued") return "排队处理中…";
   if (message.status === "processing") return "处理中…";
@@ -1649,6 +1663,18 @@ function messageState(message: HistoryMessage): string | undefined {
   if (message.status === "interrupted") return "已中断";
   if (message.status === "failed") return `失败：${failureText(message.failureReason)}`;
   return undefined;
+}
+
+function deliveryStates(message: HistoryMessage): string[] {
+  if ((message.deliveries?.length ?? 0) <= 1) return [];
+  return message.deliveries!.map((delivery) => {
+    const prefix = `${delivery.targetAgentName}：`;
+    if (delivery.status === "waiting_approval") return `${prefix}等待批准`;
+    if (delivery.status === "queued") return `${prefix}已排队`;
+    if (delivery.status === "processing") return `${prefix}处理中`;
+    if (delivery.status === "completed") return `${prefix}已回答`;
+    return `${prefix}失败（${failureText(delivery.failureReason)}）`;
+  });
 }
 
 function routeState(message: HistoryMessage): string | undefined {

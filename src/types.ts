@@ -55,3 +55,25 @@ export interface OnlineMember {
   displayName: string;
   type: MemberType;
 }
+
+export type AgentCollaborationAvailability =
+  | "available"
+  | "approval_required"
+  | "busy"
+  | "offline"
+  | "unavailable";
+
+export interface GroupParticipantContext {
+  user: {
+    name: string;
+    isOwner: boolean;
+    online: boolean;
+  };
+  agent: {
+    name: string;
+    description: string;
+    online: boolean;
+    activity: AgentActivityStatus | "offline";
+    availability: AgentCollaborationAvailability;
+  };
+}

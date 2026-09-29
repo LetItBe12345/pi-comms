@@ -15,6 +15,8 @@ import {
 } from "../src/broker/server.js";
 import type { TcpConnectEndpoint } from "../src/transport/tcp-endpoint.js";
 import { createCommsExtension } from "../src/extension/index.js";
+import { ProactiveConfigStore } from "../src/broker/proactive-config.js";
+import { FakeProactiveRouter } from "../src/broker/proactive-provider.js";
 
 type EventHandler = (event: any, ctx: ExtensionContext) => Promise<any> | any;
 type CommandHandler = (
@@ -261,5 +263,72 @@ describe("MVP 双 Session 自动验收", () => {
       "SELECT COUNT(*) AS count FROM messages WHERE text LIKE '%PRIVATE-ONLY-10%'",
     ).get()).toEqual({ count: 0 });
     database.close();
+  });
+
+  it("端到端生成群聊摘要，并向 Proactive Agent 注入摘要与最近 12 条", async () => {
+    await broker?.close();
+    const config = new ProactiveConfigStore(join(directory, "config.json"));
+    config.load();
+    config.saveVerified("sk-fake-summary");
+    const summaryInputs: number[][] = [];
+    const provider = new FakeProactiveRouter(
+      (input) => input.candidates.find((candidate) => candidate.name === "Bob-Pi")?.agentId ?? null,
+      undefined,
+      (input) => {
+        summaryInputs.push(input.messages.map((message) => message.groupSeq));
+        return `已压缩到 #${input.messages.at(-1)!.groupSeq}`;
+      },
+    );
+    broker = createBrokerServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      dbPath,
+      proactiveProvider: provider,
+      proactiveTimings: {
+        debounceMs: 30,
+        maxWaitMs: 100,
+        groupIntervalMs: 0,
+        cooldownMs: 0,
+        deliveryTtlMs: 500,
+      },
+    });
+    await broker.start();
+    endpoint = broker.endpoint;
+    const alice = setup("summary-alice");
+    const bob = setup("summary-bob");
+    await Promise.all([
+      alice.pi.emit("session_start", alice.ctx),
+      bob.pi.emit("session_start", bob.ctx),
+    ]);
+    await command(alice, "comms-create", "摘要组 Alice Alice-Pi");
+    await waitFor(
+      () => alice.notices.some((notice) => notice.message.includes("Group ID:")),
+      "Alice 未创建摘要测试群组",
+    );
+    const groupId = alice.notices
+      .find((notice) => notice.message.includes("Group ID:"))
+      ?.message.match(/Group ID: ([\w-]+)/)?.[1];
+    await command(bob, "comms-join", `${groupId} Bob Bob-Pi`);
+    await waitFor(
+      () => bob.notices.some((notice) => notice.message.includes("已加入群组")),
+      "Bob 未加入摘要测试群组",
+    );
+
+    for (let index = 1; index <= 13; index += 1) {
+      await command(alice, "comms-test", `上下文消息 ${index}`);
+    }
+    await waitFor(() => bob.pi.sentUserMessages.length === 1, "摘要 Proactive 未注入 Bob");
+    const invitation = bob.pi.sentUserMessages[0]!;
+    expect(summaryInputs).toEqual([[1]]);
+    expect(invitation).toContain("群聊摘要（#1-#1，summary-v1）");
+    expect(invitation).toContain("已压缩到 #1");
+    expect(invitation).not.toContain("#1 [user] Alice: 上下文消息 1");
+    expect(invitation).toContain("#2 [user] Alice: 上下文消息 2");
+    expect(invitation).toContain("#13 [user] Alice: 上下文消息 13");
+    expect(invitation.match(/^#\d+ \[(?:user|agent)\]/gmu)).toHaveLength(12);
+
+    await Promise.all([
+      alice.pi.emit("session_shutdown", alice.ctx),
+      bob.pi.emit("session_shutdown", bob.ctx),
+    ]);
   });
 });

@@ -24,3 +24,7 @@
 - [阶段 17：附近群组默认开放加入](./17-open-nearby-join.md)
 - [阶段 18：Proactive Agent Participation](./18-proactive-agent-participation.md)
 - [阶段 19：Proactive 默认开启](./19-proactive-default-on.md)
+- [阶段 20：群聊上下文摘要与 12 条窗口](./20-group-context-summary.md)
+- [阶段 21：完整群组角色上下文](./21-participant-context.md)
+- [阶段 22：多 Agent 显式并行投递](./22-multi-agent-mentions.md)
+- [阶段 23：DeepSeek 多 Agent 主动路由](./23-multi-agent-proactive-routing.md)

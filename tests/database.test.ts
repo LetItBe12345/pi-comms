@@ -26,7 +26,7 @@ describe("Broker SQLite", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  it("初始化 v6 Schema、WAL 和 FULL，并恢复群组", () => {
+  it("初始化 v10 Schema、WAL 和 FULL，并恢复群组", () => {
     const store = new BrokerDatabase(dbPath);
     expect(store.configuration()).toEqual({
       journalMode: "wal",
@@ -36,7 +36,7 @@ describe("Broker SQLite", () => {
     store.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(8);
+    expect(raw.pragma("user_version", { simple: true })).toBe(10);
     expect(raw.pragma("journal_mode", { simple: true })).toBe("wal");
     const tables = raw
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -45,6 +45,7 @@ describe("Broker SQLite", () => {
       "agent_requests",
       "broker_metadata",
       "group_memberships",
+      "group_summaries",
       "group_tombstones",
       "groups",
       "messages",
@@ -145,7 +146,7 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(8);
+    expect(raw.pragma("user_version", { simple: true })).toBe(10);
     const columns = raw
       .prepare("PRAGMA table_info(agent_requests)")
       .all() as Array<{ name: string }>;
@@ -197,7 +198,7 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(8);
+    expect(raw.pragma("user_version", { simple: true })).toBe(10);
     expect((raw.prepare(
       "SELECT initiator_session_key AS value FROM agent_requests WHERE request_id = ?",
     ).get("release-request") as { value: string }).value).toBe(
@@ -210,6 +211,38 @@ describe("Broker SQLite", () => {
     await writeFile(dbPath, "这不是 SQLite 数据库", "utf8");
     expect(() => new BrokerDatabase(dbPath, DEVICE_ID))
       .toThrow(/database|SQLite|encrypted|malformed/i);
+  });
+
+  it("从 v8 新增群聊摘要表并持久化覆盖范围", () => {
+    const initial = new BrokerDatabase(dbPath, DEVICE_ID);
+    initial.insertGroup({ groupId: "g", groupName: "开发组" });
+    initial.close();
+    const legacy = new Database(dbPath);
+    legacy.exec("DROP TABLE group_summaries; PRAGMA user_version = 8;");
+    legacy.close();
+
+    const migrated = new BrokerDatabase(dbPath, DEVICE_ID);
+    migrated.saveGroupSummary({
+      groupId: "g",
+      summary: "已确认使用事务",
+      fromSeq: 1,
+      throughSeq: 4,
+      promptVersion: "summary-v1",
+      updatedAt: 10,
+    });
+    expect(migrated.groupSummary("g")).toEqual({
+      groupId: "g",
+      summary: "已确认使用事务",
+      fromSeq: 1,
+      throughSeq: 4,
+      promptVersion: "summary-v1",
+      updatedAt: 10,
+    });
+    migrated.close();
+
+    const raw = new Database(dbPath, { readonly: true });
+    expect(raw.pragma("user_version", { simple: true })).toBe(10);
+    raw.close();
   });
 
   it("只加载按时间排序的最近 100 条公开消息", () => {
@@ -260,6 +293,7 @@ describe("Broker SQLite", () => {
       targetAgentName: "Bob-Pi",
       ownerUserName: "Bob",
       onlineMembers: [],
+      participants: [],
       text: "回答",
       chainId: "r",
       round: 1,
@@ -290,6 +324,7 @@ describe("Broker SQLite", () => {
       targetAgentName: "Bob-Pi",
       ownerUserName: "Bob",
       onlineMembers: [],
+      participants: [],
       text: "回答",
       chainId: id,
       round: 1,
@@ -356,6 +391,7 @@ describe("Broker SQLite", () => {
       targetAgentName: "Bob-Pi",
       ownerUserName: "Bob",
       onlineMembers: [],
+      participants: [],
       text: "等待",
       chainId: "waiting",
       round: 1,
@@ -391,6 +427,7 @@ describe("Broker SQLite", () => {
       targetAgentName: "Carol-Pi",
       ownerUserName: "Carol",
       onlineMembers: [],
+      participants: [],
       text: "第十轮",
       chainId: "chain",
       round: 10,

@@ -25,8 +25,10 @@ import type {
   Group,
   GroupSettings,
   GroupSummary,
+  GroupParticipantContext,
   Member,
 } from "../types.js";
+import { participantContext } from "../participant-context.js";
 import {
   DEFAULT_BROKER_ENDPOINT,
   validateConnectEndpoint,
@@ -147,6 +149,7 @@ export function createCommsExtension(
     let proactiveCursorByGroup = new Map<string, number>();
     let activeProactive: ProactiveDeliverPayload | undefined;
     let proactiveAssistantText: string | undefined;
+    let proactiveToolsUsedFor: string | undefined;
     let pendingProactiveToggle:
       | { groupId: string; previous: boolean }
       | undefined;
@@ -574,6 +577,9 @@ export function createCommsExtension(
           activeView?.removeMembers(message.payload.memberIds);
           return;
         case "chat.message":
+          for (const delivery of message.payload.deliveries ?? []) {
+            if (delivery.status !== "waiting_approval") pendingApprovals.delete(delivery.requestId);
+          }
           if (
             message.payload.routeRequestId !== undefined &&
             message.payload.routeStatus !== "waiting_approval"
@@ -982,7 +988,13 @@ export function createCommsExtension(
       activeView?.setOwnAgentBusy(true);
       lastAssistantText = undefined;
       try {
-        pi.sendUserMessage(formatAgentRequest(request));
+        const latestParticipants = participantContext(members.values());
+        pi.sendUserMessage(formatAgentRequest({
+          ...request,
+          participants: latestParticipants.length > 0
+            ? latestParticipants
+            : request.participants,
+        }));
       } catch {
         completeActive({
           requestId: request.requestId,
@@ -1354,6 +1366,12 @@ export function createCommsExtension(
       publishAgentStatus();
     });
 
+    pi.on("tool_execution_end", () => {
+      if (activeProactive !== undefined) {
+        proactiveToolsUsedFor = activeProactive.proactiveId;
+      }
+    });
+
     pi.on("agent_settled", (_event, ctx) => {
       updateContext(ctx);
       if (activeProactive !== undefined) {
@@ -1367,10 +1385,16 @@ export function createCommsExtension(
           publishAgentStatus();
           return;
         }
+        const silent = proactiveAssistantText.trim() === "[PI_COMMS_NO_REPLY]";
+        const usedTools = proactiveToolsUsedFor === proactiveId;
         completeProactive(
-          proactiveAssistantText.trim() === "[PI_COMMS_NO_REPLY]"
+          silent && !usedTools
             ? { proactiveId, action: "silent" }
-            : { proactiveId, action: "answer", text: proactiveAssistantText },
+            : {
+                proactiveId,
+                action: "answer",
+                text: silent ? PROACTIVE_TOOLS_WITHOUT_REPLY : proactiveAssistantText,
+              },
         );
         return;
       }
@@ -1926,15 +1950,11 @@ export function createCommsExtension(
   };
 }
 
+const PROACTIVE_TOOLS_WITHOUT_REPLY =
+  "执行了工具，但没有给出结果说明，可能已修改本地状态。";
+
 export function formatAgentRequest(request: AgentRequestPayload): string {
-  const online = request.onlineMembers.length
-    ? request.onlineMembers
-        .map(
-          (member) =>
-            `${member.displayName}(${member.type === "user" ? "用户" : "Agent"})`,
-        )
-        .join("、")
-    : "无其他在线成员";
+  const coRecipients = request.coRecipients ?? [];
   return [
     "[Pi Comms Remote Request]",
     `你是：${request.targetAgentName}（Agent）`,
@@ -1944,29 +1964,56 @@ export function formatAgentRequest(request: AgentRequestPayload): string {
       ? [`${request.senderName} 所属用户：${request.senderOwnerUserName}`]
       : []),
     `群组：${request.groupName}`,
-    `在线：${online}`,
+    ...formatParticipantDirectory(request.participants),
+    ...(coRecipients.length === 0
+      ? []
+      : [`共同接收者：${coRecipients.map(({ name }) => name).join("、")}`]),
     ...(request.round > 1 ? [`这是第 ${request.round} 轮自动对话。`] : []),
     "",
     request.text,
     "",
     "你可以使用工具、修改本地项目并运行测试。",
     `你的回答会作为公开消息发送到群组「${request.groupName}」，用于回应 ${request.senderName}。请直接回答。`,
-    `如果这个问题更适合群里其他在线 Agent 处理，可在回答开头 @Agent名称 并附上要转交的问题，任务会转给该 Agent；每次只转一次。`,
+    ...(coRecipients.length === 0 ? [] : [
+      "共同接收者可能仍在排队或等待批准；不要假定他们已经开始或完成，也不要把原任务原样再次转给他们。",
+    ]),
+    `如果这个问题更适合群里其他在线 Agent 处理，可在回答开头连续 @多个Agent名称 并附上要转交的问题，任务会分别转给他们；同一批只转一次。`,
   ].join("\n");
 }
 
 export function formatProactiveInvitation(delivery: ProactiveDeliverPayload): string {
+  const coRecipients = delivery.coRecipients ?? [];
   const messages = delivery.messages.map((message) =>
     `#${message.groupSeq} [${message.senderType}] ${message.senderName}: ${message.text}`
   );
+  const summary = delivery.summary === undefined
+    ? []
+    : [
+        `群聊摘要（#${delivery.summary.fromSeq}-#${delivery.summary.throughSeq}，${delivery.summary.promptVersion}）：`,
+        delivery.summary.text,
+        "",
+      ];
   return [
     "[Pi Comms Proactive Invitation]",
     `群组：${delivery.groupName}`,
     `你是：${delivery.targetAgentName}（Agent）`,
-    ...(delivery.omitted ? ["较早的群聊消息已省略。"] : []),
+    ...formatParticipantDirectory(delivery.participants),
+    "",
+    ...summary,
+    ...(delivery.summaryIncomplete
+      ? ["注意：较早的群聊摘要不完整。"]
+      : delivery.omitted && delivery.summary === undefined
+      ? ["较早的群聊消息已省略。"]
+      : []),
     "",
     ...messages,
     "",
+    ...(coRecipients.length === 0
+      ? []
+      : [`共同接收者：${coRecipients.map(({ name }) => name).join("、")}`]),
+    ...(coRecipients.length === 0 ? [] : [
+      "共同接收者可能仍在排队或等待批准；不要假定他们已经开始或完成，也不要把原任务原样再次转给他们。",
+    ]),
     "Broker 认为你可能可以推进讨论。请结合当前项目上下文自行判断是否发言。",
     "你可以使用工具、修改本地项目并运行测试，但不要主动 git push、创建 PR、发布 Release、发邮件或进行其他外部写操作。",
     "如果不应发言，最终完整输出 [PI_COMMS_NO_REPLY]。如果使用过工具或修改过本地状态，必须正常说明结果，不能沉默。",
@@ -1986,7 +2033,21 @@ function formatStableCommsPrompt(
     "[Pi Comms Remote Request] 表示有人明确 @ 你：按普通定向任务处理。",
     "[Pi Comms Proactive Invitation] 表示 Broker 主动邀请：只有能提供具体价值时才回答，也可以严格返回 [PI_COMMS_NO_REPLY]。",
     "两类任务都可以使用工具、修改本地项目和运行测试。Proactive 不主动执行外部写操作。",
+    "群组角色目录只用于选择协作者；实际转交时 Broker 会重新校验成员关系、在线状态、Agent 状态和接收权限。",
   ].join("\n");
+}
+
+export function formatParticipantDirectory(
+  participants: GroupParticipantContext[],
+): string[] {
+  return [
+    "群组角色目录：",
+    ...participants.flatMap(({ user, agent }) => [
+      `- 用户 ${user.name}${user.isOwner ? " [群主]" : ""}：${user.online ? "在线" : "离线"}`,
+      `  - Agent ${agent.name}：${agent.online ? "在线" : "离线"}；activity=${agent.activity}；availability=${agent.availability}`,
+      `    Description：${agent.description || "未提供"}`,
+    ]),
+  ];
 }
 
 function proactiveStatusMessage(value: unknown): string {

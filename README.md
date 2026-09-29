@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-当前发行版是 v0.1.0。阶段 0～16A、17 和 18 已完成；真实设备局域网验收正在按
+当前发行版是 v0.1.0。阶段 0～16A、17～23 已完成；真实设备局域网验收正在按
 [Roadmap](#roadmap) 推进。
 
 现在可以：
@@ -17,7 +17,8 @@
 - 同一台设备或同一个普通 IPv4 网络
 - Pi Agent 和纯文本群聊
 - 人与人、人与 Agent、Agent 与 Agent 通信
-- 用户授权后，Broker 可选择一个合适的 Agent 主动参与群聊
+- 一条消息同时 `@` 多个 Agent，并由不同 Session 独立并行处理
+- 用户授权后，Broker 可选择零个、一个或最多 3 个互补 Agent 主动参与群聊
 - mDNS 附近发现；发现失败时可粘贴完整群组加入信息
 - 短暂离线、Session 重开或网络变化后的长期成员恢复
 
@@ -118,8 +119,15 @@ pi
 @Alice-Pi 检查当前项目的 package.json
 ```
 
+也可以把同一任务同时交给多个 Agent：
+
+```text
+@API-Pi @Web-Pi 分别检查接口和调用端，完成后各自直接回复
+```
+
 - `@用户名称`：只做公开提醒。
 - `@Agent名称`：公开显示消息，同时把任务注入目标 Pi Session。
+- 连续多个 `@Agent名称`：每个目标独立排队、审批、执行和回复；单个失败不影响其他目标。
 - `Ctrl+P`：打开 Agent 权限、Proactive 开关和请求控制面板。
 - `Shift+Enter`：换行。
 - `Esc`：退出群聊，返回原 Pi 界面。
@@ -130,16 +138,43 @@ pi
 
 Proactive 由 Broker 使用独立的 DeepSeek API Key。它不读取、修改或复用
 Pi Session 的模型和 Key。Broker 固定使用 DeepSeek 官方 API 和
-`deepseek-v4-flash`。
+`deepseek-flash`。
+
+Router、Proactive Agent 和 Freshness 只读取 Pi Comms 的公开群聊：较早内容使用
+带 `groupSeq` 范围的滚动摘要，原始窗口最多保留最近 12 条。摘要不会读取 Pi Session
+私聊、工具调用或本地项目文件；原始公开消息仍完整保存在 SQLite。
 
 在 `/comms` 首页打开“Broker 设置”，输入 DeepSeek API Key。Key 验证成功后会保存在
 Broker 所在机器的 `~/.pi/comms/config.json`，以后创建群组或重启 Broker 会继续使用。
 每个 Agent 的 Proactive 开关按 Pi Session 和群组独立保存，默认开启。该
 Session 的用户可以在 `Ctrl+P` 面板中显式关闭；Broker Router 没有就绪时不会发起模型调用。
 
+Router 每次最多邀请 3 个 Agent。默认只邀请 0 或 1 个；只有多个 Agent 能提供不同且具体的价值时才会并行邀请。每个 Agent 都独立处理同一份群聊上下文，单个 Agent 离线或失败不会取消其他邀请。
+
+Router 只从可邀请的 Agent 中选择，但会看到完整角色目录，用来判断谁负责什么；目录里的
+Description 只是协作背景，不会被选中。Router 不拆分不同子任务，同批 Agent 收到相同的
+群聊上下文和共同接收者名单。
+
+成本：每次触发最多一次 Router 调用；每个入选 Agent 各自产生一次回答；结果到达时如果群聊
+已有新消息，会再产生一次 Freshness 判断。邀请越多，模型调用越多，所以默认只邀请能带来
+不同价值的 Agent。
+
+结果按到达 Broker 的顺序逐个处理，先公开的回答会进入后续结果的上下文。包含独立修改、
+测试结果、失败或阻塞信息的回答不会仅因为已有其他 Agent 回答就被丢弃。Agent 只要执行过
+工具或修改过本地状态，就必须公开说明，不能以 `[PI_COMMS_NO_REPLY]` 沉默。
+
 ## 多用户协作
 
 每个用户继续使用自己的电脑、代码库和 Pi Session。Pi Comms 负责把群聊中的公开任务发送给被 `@` 的 Agent，并把结果带回群组。
+
+收到显式任务或 Proactive 邀请时，Agent 会看到群内所有有效长期成员的角色目录：
+真人用户与所属 Agent 的配对关系、群主、在线/离线、Agent 的 idle/busy、统一接收能力和
+公开 Description。目录不包含其他成员的 Proactive 开关或关闭原因；真正转交时 Broker
+仍会重新检查目标是否可用。
+
+同批 Agent 会看到其他共同接收者的名称，但不会看到虚构的父子任务或整体进度。共同
+接收者可能尚未批准或仍在排队，所以每个 Agent 都应独立完成并公开自己的结果，不得
+假定对方已开始或已完成，也不应把原任务原样再次转给共同接收者。
 
 ```text
 小林：@API-Pi 请检查接口返回结构。
