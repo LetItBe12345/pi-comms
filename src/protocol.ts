@@ -9,6 +9,7 @@ import type {
   AgentPermission,
   GroupSettings,
   GroupVisibility,
+  GroupParticipantContext,
 } from "./types.js";
 
 export interface Envelope<T = unknown> {
@@ -25,7 +26,7 @@ export const PI_COMMS_BUILD_CHANNEL: PiCommsBuildChannel =
   process.env.PI_COMMS_BUILD_CHANNEL === "development"
     ? "development"
     : "release";
-export const BROKER_PROTOCOL_VERSION = 6;
+export const BROKER_PROTOCOL_VERSION = 7;
 export const MAX_JSONL_FRAME_BYTES = 8 * 1024 * 1024;
 
 export interface BrokerProbePayload {
@@ -259,6 +260,7 @@ export interface AgentRequestPayload {
   targetAgentName: string;
   ownerUserName: string;
   onlineMembers: OnlineMember[];
+  participants: GroupParticipantContext[];
   text: string;
   chainId: string;
   round: number;
@@ -349,6 +351,7 @@ export interface ProactiveDeliverPayload {
   triggerFromSeq: number;
   triggerToSeq: number;
   observedToSeq: number;
+  participants: GroupParticipantContext[];
   summary?: ProactiveContextSummaryPayload;
   summaryIncomplete: boolean;
   messages: ProactiveObservationMessage[];

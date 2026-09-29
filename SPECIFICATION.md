@@ -79,7 +79,7 @@ B 的 Pi Agent 处理消息
 - IPv6 和主机名连接暂不支持，输入后必须给出可读提示，不能进入模糊超时。
 - 连接模式分为 `local`、`lan-host` 和 `lan-client`；配置按 Pi Session 保存。
 - 传输协议：JSON Lines。
-- 连接必须先完成 `broker.probe` / `broker.ready` 握手，并严格匹配 `service: pi-comms` 和 `protocolVersion: 6`。
+- 连接必须先完成 `broker.probe` / `broker.ready` 握手，并严格匹配 `service: pi-comms` 和 `protocolVersion: 7`。
 - 数据库：SQLite + `better-sqlite3`，开启 WAL 模式。
 - 数据库默认路径：`~/.pi/comms/comms.db`。
 - 只有 Local Broker 可以读写数据库，Extension 不直接访问数据库。
@@ -270,6 +270,7 @@ interface AgentRequest {
     displayName: string;
     type: "user" | "agent";
   }>;
+  participants: GroupParticipantContext[];
   text: string;
   chainId: string;
   round: number;
@@ -278,7 +279,7 @@ interface AgentRequest {
 
 ## 9. 协议
 
-- 阶段 18 的协议版本为 `5`。版本 4 与版本 5 不允许混用。
+- 当前协议版本为 `7`。不同协议版本不允许混用，握手返回明确的 `protocol_mismatch`。
 - 每台设备在 `~/.pi/comms/device-id` 保存稳定 UUID。
 - Broker 内部使用 `JSON.stringify([deviceId, sessionId])` 作为统一 `SessionKey`。
 - `clientId` 只表示当前 Broker 实例中的逻辑客户端；群成员 ID 仍基于 `clientId`。
@@ -442,8 +443,8 @@ interface Envelope<T = unknown> {
 - 每次只注入当前消息，不注入完整群聊历史。
 - `@用户名称` 只公开提醒；`@Agent名称` 同时注入目标 Session。
 - 只识别消息开头的一个 `@名称`，内部使用成员 ID 路由。
-- 注入内容包含接收方身份、所属用户、发送者、群名、在线成员和消息正文。
-- 在线成员不包含接收方自己；正文移除开头的 `@Agent名称` 后保持原样。
+- 注入内容包含接收方身份、所属用户、发送者、群名、完整群组角色目录和消息正文。
+- 角色目录包含接收方自己以及所有有效长期成员；正文移除开头的 `@Agent名称` 后保持原样。
 - 第 2 轮起注明自动对话轮数。
 - 注入格式固定为：
 
@@ -452,7 +453,10 @@ interface Envelope<T = unknown> {
 你是：{targetAgentName}（Agent）
 所属用户：{ownerUserName}
 来自：{senderName}  群组：{groupName}
-在线：Alice(用户)、Bob-Pi(Agent)
+群组角色目录：
+- 用户 Alice [群主]：在线
+  - Agent Alice-Pi：在线 / idle / 可接收
+    Description：负责后端
 
 {消息正文}
 
@@ -836,3 +840,32 @@ DeepSeek 实现以官方文档为准：
 
 - Broker 协议版本为 6。`proactive.deliver` 可携带摘要正文、覆盖范围、Prompt 版本和 `summaryIncomplete`。
 - SQLite schema 版本为 9，新增 `group_summaries` 表。旧数据库升级只新增摘要表，不改写原始消息。
+
+## 21. 完整群组角色上下文
+
+### 21.1 角色目录
+
+- Broker 为群内 Coding Agent 提供结构化 `GroupParticipantContext[]`。每项对应一个长期 membership，并明确配对真人用户和所属 Agent。
+- 用户字段包含名称、是否群主和在线状态。Agent 字段包含名称、Description、在线状态、`idle | busy | offline` 活动状态，以及统一协作可用状态。
+- 协作可用状态只允许 `available | approval_required | busy | offline | unavailable`。它用于帮助 Agent 选择协作者，不承诺实际投递一定成功。
+- 目录包含在线与离线的有效长期成员，也包含当前接收 Agent 自己。`status=removed` 的 membership 不得进入目录。
+- Agent Description 使用 membership 中已经公开且规范化的值。目录不读取 Agent 的私人 Session、项目、工具或文件内容。
+
+### 21.2 隐私与可见范围
+
+- 目录不包含 `proactiveEnabled`、Proactive 关闭原因、API Key、Session 私人状态或未公开信息。
+- `approval_required` 和 `unavailable` 只表达显式 `@Agent` 的公开接收能力；不得用它们推断或暴露 Proactive 开关。
+- 角色目录只随已经授权的显式 `agent.deliver`、`request.pending` 和 `proactive.deliver` 发给群内对应 Session。附近发现、未入群客户端和邀请信息不得获得目录或 Description。
+
+### 21.3 注入与刷新
+
+- `[Pi Comms Remote Request]` 与 `[Pi Comms Proactive Invitation]` 使用同一种角色目录文本格式，显示用户—Agent 所属关系、群主、在线状态、活动状态、接收能力和 Description。
+- Broker 创建投递时附带当前目录。显式请求进入 Extension FIFO 后，Extension 在请求真正成为 active request 时，使用最新 Snapshot 和 Presence 重建目录；协议中的目录只作为缺少本地状态时的回退。
+- Proactive 只在 Agent 空闲时立即注入，使用 Broker 在发送前生成的最新目录。
+- 成员移除、上下线、Agent busy/idle 和显式接收权限变化必须进入之后新开始任务的目录。
+- 稳定 Session 提示词必须说明：角色目录只用于判断协作和转交对象；实际转交时 Broker 仍会重新校验 membership、在线状态、Agent 状态和权限。
+
+### 21.4 协议与验收
+
+- Broker 协议版本为 7。`AgentRequestPayload` 与 `ProactiveDeliverPayload` 必须携带 `participants`。
+- 自动测试覆盖在线、离线、群主、用户—Agent 配对、Description、成员移除、统一可用状态、Proactive 隐私、排队后刷新和跨设备 Snapshot。

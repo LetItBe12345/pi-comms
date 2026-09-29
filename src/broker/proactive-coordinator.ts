@@ -5,6 +5,7 @@ import type {
   ProactiveResultPayload,
   ProactiveStatus,
 } from "../protocol.js";
+import type { GroupParticipantContext } from "../types.js";
 import {
   ProactiveProviderError,
   FRESHNESS_PROMPT_VERSION,
@@ -36,6 +37,7 @@ export interface ProactiveCoordinatorOptions {
   latestSeq(groupId: string): number;
   context(groupId: string, throughSeq: number, apiKey: string): Promise<ProactiveGroupContext>;
   contextSnapshot?(groupId: string, throughSeq: number): ProactiveGroupContext;
+  participants(groupId: string): GroupParticipantContext[];
   deliver(clientId: string, payload: ProactiveDeliverPayload): boolean;
   publish(pending: PendingProactive, text: string): Promise<void> | void;
   onInvalidKey(): void;
@@ -86,6 +88,7 @@ export class ProactiveCoordinator {
     apiKey: string,
   ) => Promise<ProactiveGroupContext>;
   readonly #contextSnapshot?: (groupId: string, throughSeq: number) => ProactiveGroupContext;
+  readonly #participants: (groupId: string) => GroupParticipantContext[];
   readonly #deliver: (clientId: string, payload: ProactiveDeliverPayload) => boolean;
   readonly #publish: (pending: PendingProactive, text: string) => Promise<void> | void;
   readonly #onInvalidKey: () => void;
@@ -119,6 +122,7 @@ export class ProactiveCoordinator {
     this.#latestSeq = options.latestSeq;
     this.#context = options.context;
     this.#contextSnapshot = options.contextSnapshot;
+    this.#participants = options.participants;
     this.#deliver = options.deliver;
     this.#publish = options.publish;
     this.#onInvalidKey = options.onInvalidKey;
@@ -412,6 +416,7 @@ export class ProactiveCoordinator {
         triggerFromSeq: pending.triggerFromSeq,
         triggerToSeq: pending.triggerToSeq,
         observedToSeq,
+        participants: this.#participants(batch.groupId),
         ...(deliveryContext.summary === undefined ? {} : { summary: deliveryContext.summary }),
         summaryIncomplete: deliveryContext.summaryIncomplete,
         messages: deliveryContext.messages.map(toObservation),

@@ -475,6 +475,8 @@ describe("Local Broker 群组与成员", () => {
     await joinGroup(b, groupId);
     const c = await connect();
     await joinGroup(c, groupId, "Carol", "Carol-Pi");
+    c.send("proactive.update", { groupId, enabled: false });
+    await c.waitFor("proactive.update.ack");
 
     a.send("chat.send", { text: "@bob-pi  原样正文" }, "agent-request");
     const [publicMessage, delivery] = await Promise.all([
@@ -505,6 +507,28 @@ describe("Local Broker 群组与成员", () => {
       displayName: "Bob",
       type: "user",
     });
+    expect(delivery.payload.participants).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        user: expect.objectContaining({ name: "Alice", isOwner: true }),
+        agent: expect.objectContaining({
+          name: "Alice-Pi",
+          description: "Alice-Pi 测试 Agent",
+          availability: "available",
+        }),
+      }),
+      expect.objectContaining({
+        user: expect.objectContaining({ name: "Bob" }),
+        agent: expect.objectContaining({
+          name: "Bob-Pi",
+          description: "Bob-Pi 测试 Agent",
+        }),
+      }),
+      expect.objectContaining({
+        user: expect.objectContaining({ name: "Carol" }),
+        agent: expect.objectContaining({ name: "Carol-Pi" }),
+      }),
+    ]));
+    expect(JSON.stringify(delivery.payload.participants)).not.toContain("proactiveEnabled");
     expect(c.messages.some((message) => message.type === "agent.deliver")).toBe(false);
   });
 

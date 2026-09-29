@@ -182,9 +182,9 @@ describe("客户端消息校验", () => {
       sessionId: "session-a",
       permission: "auto",
     }))).toMatchObject({ ok: false, code: "protocol_mismatch" });
-    expect(BROKER_PROTOCOL_VERSION).toBe(6);
+    expect(BROKER_PROTOCOL_VERSION).toBe(7);
     expect(parseClientEnvelope(createEnvelope("client.hello", {
-      protocolVersion: 4,
+      protocolVersion: 6,
       deviceId: "device-a",
       sessionId: "session-a",
       permission: "auto",

@@ -361,22 +361,14 @@ describe("Pi Extension 群组接入", () => {
     await waitFor(() => b.pi.sentUserMessages.length === 1, "目标未收到注入");
     expect(a.pi.sentUserMessages).toEqual([]);
     expect(c.pi.sentUserMessages).toEqual([]);
-    expect(b.pi.sentUserMessages[0]).toBe(
-      [
-        "[Pi Comms Remote Request]",
-        "你是：Bob-Pi（Agent）",
-        "所属用户：Bob",
-        "来自：Alice（用户）",
-        "群组：开发组",
-        "在线：Alice(用户)、Alice-Pi(Agent)、Bob(用户)、Carol(用户)、Carol-Pi(Agent)",
-        "",
-        "只回复 OK",
-        "",
-        "你可以使用工具、修改本地项目并运行测试。",
-        "你的回答会作为公开消息发送到群组「开发组」，用于回应 Alice。请直接回答。",
-        "如果这个问题更适合群里其他在线 Agent 处理，可在回答开头 @Agent名称 并附上要转交的问题，任务会转给该 Agent；每次只转一次。",
-      ].join("\n"),
-    );
+    expect(b.pi.sentUserMessages[0]).toContain("群组角色目录：");
+    expect(b.pi.sentUserMessages[0]).toContain("用户 Alice [群主]：在线");
+    expect(b.pi.sentUserMessages[0]).toContain("Agent Alice-Pi：在线；activity=idle；availability=available");
+    expect(b.pi.sentUserMessages[0]).toContain("Agent Bob-Pi：在线");
+    expect(b.pi.sentUserMessages[0]).toContain("Agent Carol-Pi：在线；activity=idle；availability=available");
+    expect(b.pi.sentUserMessages[0]).toContain("Description：测试 Agent");
+    expect(b.pi.sentUserMessages[0]).not.toContain("proactiveEnabled");
+    expect(b.pi.sentUserMessages[0]).toContain("只回复 OK");
 
     await b.pi.emit("message_end", b.ctx, {
       message: { role: "assistant", content: [{ type: "text", text: "OK" }] },
@@ -423,6 +415,9 @@ describe("Pi Extension 群组接入", () => {
     await command(a, "comms-test", "请检查迁移事务");
     await waitFor(() => b.pi.sentUserMessages.length === 1, "Proactive 未注入");
     expect(b.pi.sentUserMessages[0]).toContain("[Pi Comms Proactive Invitation]");
+    expect(b.pi.sentUserMessages[0]).toContain("群组角色目录：");
+    expect(b.pi.sentUserMessages[0]).toContain("Agent Alice-Pi");
+    expect(b.pi.sentUserMessages[0]).toContain("Agent Bob-Pi");
     expect(b.pi.sentUserMessages[0]).toContain("#1 [user] Alice: 请检查迁移事务");
     expect(b.pi.sentUserMessages[0]).toContain("[PI_COMMS_NO_REPLY]");
 
@@ -499,11 +494,21 @@ describe("Pi Extension 群组接入", () => {
     for (const text of ["请求一", "请求二", "请求三"]) {
       await command(a, "comms-test", `@Bob-Pi ${text}`);
     }
+    const c = setup("session-c");
+    await start(c);
+    await joinGroup(c, groupId, "Carol", "Carol-Pi");
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(b.pi.sentUserMessages).toEqual([]);
     b.setIdle(true);
     await b.pi.emit("agent_settled", b.ctx);
     await waitFor(() => b.pi.sentUserMessages.length === 1, "第一项未开始");
+    expect(b.pi.sentUserMessages[0]).toContain("Agent Carol-Pi");
+    await command(c, "comms-leave");
+    await waitFor(
+      () => c.notices.some((notice) => notice.message === "已离开群组"),
+      "Carol 未离群",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
 
     for (const [index, answer] of ["一", "二", "三"].entries()) {
       await b.pi.emit("message_end", b.ctx, {
@@ -522,9 +527,11 @@ describe("Pi Extension 群组接入", () => {
       "请求二",
       "请求三",
     ]);
+    expect(b.pi.sentUserMessages[1]).not.toContain("Agent Carol-Pi");
     await Promise.all([
       a.pi.emit("session_shutdown", a.ctx),
       b.pi.emit("session_shutdown", b.ctx),
+      c.pi.emit("session_shutdown", c.ctx),
     ]);
   });
 
@@ -606,6 +613,16 @@ describe("Agent 注入格式", () => {
       targetAgentName: "Bob-Pi",
       ownerUserName: "Bob",
       onlineMembers: [],
+      participants: [{
+        user: { name: "Bob", isOwner: false, online: true },
+        agent: {
+          name: "Bob-Pi",
+          description: "负责后端",
+          online: true,
+          activity: "idle",
+          availability: "available",
+        },
+      }],
       text: "继续",
       chainId: "c",
       round: 2,
@@ -613,7 +630,9 @@ describe("Agent 注入格式", () => {
     expect(text).toContain("这是第 2 轮自动对话。");
     expect(text).toContain("来自：Alice-Pi（Agent）");
     expect(text).toContain("Alice-Pi 所属用户：Alice");
-    expect(text).toContain("在线：无其他在线成员");
+    expect(text).toContain("群组角色目录：");
+    expect(text).toContain("Agent Bob-Pi：在线；activity=idle；availability=available");
+    expect(text).toContain("Description：负责后端");
     expect(text).not.toContain("目标：");
   });
 });

@@ -25,8 +25,10 @@ import type {
   Group,
   GroupSettings,
   GroupSummary,
+  GroupParticipantContext,
   Member,
 } from "../types.js";
+import { participantContext } from "../participant-context.js";
 import {
   DEFAULT_BROKER_ENDPOINT,
   validateConnectEndpoint,
@@ -982,7 +984,13 @@ export function createCommsExtension(
       activeView?.setOwnAgentBusy(true);
       lastAssistantText = undefined;
       try {
-        pi.sendUserMessage(formatAgentRequest(request));
+        const latestParticipants = participantContext(members.values());
+        pi.sendUserMessage(formatAgentRequest({
+          ...request,
+          participants: latestParticipants.length > 0
+            ? latestParticipants
+            : request.participants,
+        }));
       } catch {
         completeActive({
           requestId: request.requestId,
@@ -1927,14 +1935,6 @@ export function createCommsExtension(
 }
 
 export function formatAgentRequest(request: AgentRequestPayload): string {
-  const online = request.onlineMembers.length
-    ? request.onlineMembers
-        .map(
-          (member) =>
-            `${member.displayName}(${member.type === "user" ? "用户" : "Agent"})`,
-        )
-        .join("、")
-    : "无其他在线成员";
   return [
     "[Pi Comms Remote Request]",
     `你是：${request.targetAgentName}（Agent）`,
@@ -1944,7 +1944,7 @@ export function formatAgentRequest(request: AgentRequestPayload): string {
       ? [`${request.senderName} 所属用户：${request.senderOwnerUserName}`]
       : []),
     `群组：${request.groupName}`,
-    `在线：${online}`,
+    ...formatParticipantDirectory(request.participants),
     ...(request.round > 1 ? [`这是第 ${request.round} 轮自动对话。`] : []),
     "",
     request.text,
@@ -1970,6 +1970,8 @@ export function formatProactiveInvitation(delivery: ProactiveDeliverPayload): st
     "[Pi Comms Proactive Invitation]",
     `群组：${delivery.groupName}`,
     `你是：${delivery.targetAgentName}（Agent）`,
+    ...formatParticipantDirectory(delivery.participants),
+    "",
     ...summary,
     ...(delivery.summaryIncomplete
       ? ["注意：较早的群聊摘要不完整。"]
@@ -1998,7 +2000,21 @@ function formatStableCommsPrompt(
     "[Pi Comms Remote Request] 表示有人明确 @ 你：按普通定向任务处理。",
     "[Pi Comms Proactive Invitation] 表示 Broker 主动邀请：只有能提供具体价值时才回答，也可以严格返回 [PI_COMMS_NO_REPLY]。",
     "两类任务都可以使用工具、修改本地项目和运行测试。Proactive 不主动执行外部写操作。",
+    "群组角色目录只用于选择协作者；实际转交时 Broker 会重新校验成员关系、在线状态、Agent 状态和接收权限。",
   ].join("\n");
+}
+
+export function formatParticipantDirectory(
+  participants: GroupParticipantContext[],
+): string[] {
+  return [
+    "群组角色目录：",
+    ...participants.flatMap(({ user, agent }) => [
+      `- 用户 ${user.name}${user.isOwner ? " [群主]" : ""}：${user.online ? "在线" : "离线"}`,
+      `  - Agent ${agent.name}：${agent.online ? "在线" : "离线"}；activity=${agent.activity}；availability=${agent.availability}`,
+      `    Description：${agent.description || "未提供"}`,
+    ]),
+  ];
 }
 
 function proactiveStatusMessage(value: unknown): string {

@@ -13,6 +13,7 @@ function request(requestId: string): AgentRequestPayload {
     targetAgentName: "Target-Pi",
     ownerUserName: "Target",
     onlineMembers: [],
+    participants: [],
     text: requestId,
     chainId: requestId,
     round: 1,

@@ -25,3 +25,4 @@
 - [阶段 18：Proactive Agent Participation](./18-proactive-agent-participation.md)
 - [阶段 19：Proactive 默认开启](./19-proactive-default-on.md)
 - [阶段 20：群聊上下文摘要与 12 条窗口](./20-group-context-summary.md)
+- [阶段 21：完整群组角色上下文](./21-participant-context.md)

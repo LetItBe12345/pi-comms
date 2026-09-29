@@ -373,6 +373,7 @@ describe("最小群聊 TUI", () => {
       targetAgentName: "Alice-Pi",
       ownerUserName: "Alice",
       onlineMembers: [],
+      participants: [],
       text: "请检查测试",
       chainId: "request-1",
       round: 1,

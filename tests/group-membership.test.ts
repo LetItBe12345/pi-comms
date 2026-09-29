@@ -6,6 +6,7 @@ import { createBrokerServer, type BrokerServer } from "../src/broker/server.js";
 import { fetchGroupCatalog } from "../src/discovery/group-catalog.js";
 import { BrokerClient } from "../src/extension/broker-client.js";
 import type { BrokerEnvelope } from "../src/protocol.js";
+import { participantContext } from "../src/participant-context.js";
 
 class Session {
   readonly messages: BrokerEnvelope[] = [];
@@ -154,6 +155,17 @@ describe("每群邀请与长期成员", () => {
         expect.objectContaining({ displayName: "Bob" }),
         expect.objectContaining({ displayName: "Bob-Pi" }),
       ]));
+    if (snapshot.type !== "snapshot") throw new Error("未恢复 Snapshot");
+    expect(participantContext(snapshot.payload.members)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        user: expect.objectContaining({ name: "Alice", isOwner: true }),
+        agent: expect.objectContaining({ name: "Alice-Pi", description: "负责测试" }),
+      }),
+      expect.objectContaining({
+        user: expect.objectContaining({ name: "Bob" }),
+        agent: expect.objectContaining({ name: "Bob-Pi", description: "负责测试" }),
+      }),
+    ]));
   });
 
   it("创建时启用邀请码后，远程首次加入不能省略邀请码", async () => {

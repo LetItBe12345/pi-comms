@@ -74,6 +74,7 @@ import {
 } from "./proactive-coordinator.js";
 import { ProactiveCallScheduler } from "./proactive-scheduler.js";
 import { GroupContextSummary } from "./group-context-summary.js";
+import { participantContext } from "../participant-context.js";
 
 export const DEFAULT_DATABASE_PATH = join(
   homedir(),
@@ -1093,6 +1094,7 @@ export function createBrokerServer(
       context: (groupId, throughSeq, apiKey) =>
         groupContext.prepare(groupId, apiKey, throughSeq),
       contextSnapshot: (groupId, throughSeq) => groupContext.snapshot(groupId, throughSeq),
+      participants: participantDirectory,
       deliver: (clientId, payload) => {
         const target = groups.membershipForClient(clientId)?.agent;
         const targetSocket = clients.get(clientId);
@@ -1196,6 +1198,7 @@ export function createBrokerServer(
           onlineMembers: groups.onlineMembers(pending.groupId)
             .filter((member) => member.memberId !== target.memberId)
             .map((member) => ({ displayName: member.displayName, type: member.type })),
+          participants: participantDirectory(pending.groupId),
           text: mention.text,
           chainId: pending.proactiveId,
           round: 2,
@@ -1703,6 +1706,7 @@ export function createBrokerServer(
           displayName: member.displayName,
           type: member.type,
         })),
+      participants: participantDirectory(group.groupId),
       text: mention.text,
       chainId: requestId,
       round: 1,
@@ -1981,6 +1985,7 @@ export function createBrokerServer(
                 onlineMembers: groups.onlineMembers(pending.groupId)
                   .filter((member) => member.memberId !== target.memberId)
                   .map((member) => ({ displayName: member.displayName, type: member.type })),
+                participants: participantDirectory(pending.groupId),
                 text: mention.text!,
                 chainId: pending.request.chainId,
                 round: nextRound,
@@ -2201,6 +2206,7 @@ export function createBrokerServer(
       onlineMembers: groups.onlineMembers(paused.groupId)
         .filter((member) => member.memberId !== target.memberId)
         .map((member) => ({ displayName: member.displayName, type: member.type })),
+      participants: participantDirectory(paused.groupId),
       text: paused.text,
       chainId,
       round: paused.nextRound,
@@ -2403,6 +2409,10 @@ export function createBrokerServer(
       );
     }
     return result;
+  }
+
+  function participantDirectory(groupId: string) {
+    return participantContext(snapshotMembers(groupId));
   }
 
   function requireOwner(

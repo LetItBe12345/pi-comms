@@ -145,6 +145,11 @@ Session 的用户可以在 `Ctrl+P` 面板中显式关闭；Broker Router 没有
 
 每个用户继续使用自己的电脑、代码库和 Pi Session。Pi Comms 负责把群聊中的公开任务发送给被 `@` 的 Agent，并把结果带回群组。
 
+收到显式任务或 Proactive 邀请时，Agent 会看到群内所有有效长期成员的角色目录：
+真人用户与所属 Agent 的配对关系、群主、在线/离线、Agent 的 idle/busy、统一接收能力和
+公开 Description。目录不包含其他成员的 Proactive 开关或关闭原因；真正转交时 Broker
+仍会重新检查目标是否可用。
+
 ```text
 小林：@API-Pi 请检查接口返回结构。
 API-Pi：字段名不一致，建议统一为 traceId。

@@ -54,6 +54,7 @@ describe("Proactive Coordinator", () => {
         history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
       latestSeq: () => 15,
       context: async () => context,
+      participants: () => [],
       deliver: (_clientId, payload) => (delivery = payload, true),
       publish: vi.fn(),
       onInvalidKey: vi.fn(),
@@ -94,6 +95,7 @@ describe("Proactive Coordinator", () => {
         omitted: true,
         summaryIncomplete: true,
       }),
+      participants: () => [],
       deliver: (_clientId, payload) => (delivery = payload, true),
       publish,
       onInvalidKey: vi.fn(),
@@ -130,6 +132,7 @@ describe("Proactive Coordinator", () => {
         history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
       latestSeq: () => history.at(-1)?.groupSeq ?? 0,
       context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
+      participants: () => [],
       deliver: (_clientId, payload) => (deliveries.push(payload), true),
       publish: (_pending, text) => {
         published.push(text);
@@ -172,6 +175,7 @@ describe("Proactive Coordinator", () => {
         history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
       latestSeq: () => history.at(-1)?.groupSeq ?? 0,
       context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
+      participants: () => [],
       deliver: (_clientId, payload) => (delivery = payload, true),
       publish,
       onInvalidKey: vi.fn(),
@@ -231,6 +235,7 @@ describe("Proactive Coordinator", () => {
         history.filter((item) => item.groupSeq > afterSeq).slice(-limit),
       latestSeq: () => history.at(-1)?.groupSeq ?? 0,
       context: async () => ({ messages: history.slice(-12), omitted: false, summaryIncomplete: false }),
+      participants: () => [],
       deliver: (_clientId, payload) => (deliveries.push(payload), true),
       publish: (pending, text) => {
         history.push({
