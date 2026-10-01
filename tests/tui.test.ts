@@ -1,7 +1,7 @@
 import { initTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import {
   KeybindingsManager,
-  TUI,
+  TuiMainScreen,
   TUI_KEYBINDINGS,
   setKeybindings,
   visibleWidth,
@@ -109,7 +109,7 @@ function message(overrides: Partial<HistoryMessage>): HistoryMessage {
 
 function createView(overrides: Partial<ChatViewActions> = {}) {
   const terminal = new TestTerminal();
-  const tui = new TUI(terminal);
+  const tui = new TuiMainScreen(terminal);
   const done = vi.fn();
   const actions: ChatViewActions = {
     createGroup: vi.fn(() => "create-1"),
@@ -636,7 +636,7 @@ describe("最小群聊 TUI", () => {
 describe("群组首屏", () => {
   it("同屏显示三个分区，并在附近更新时保持选择", () => {
     const terminal = new TestTerminal();
-    const tui = new TUI(terminal);
+    const tui = new TuiMainScreen(terminal);
     const done = vi.fn();
     const refresh = vi.fn();
     const picker = new GroupPicker({
@@ -703,7 +703,7 @@ describe("群组首屏", () => {
 
   it("创建附近群组时默认选择直接加入", () => {
     const terminal = new TestTerminal();
-    const tui = new TUI(terminal);
+    const tui = new TuiMainScreen(terminal);
     const done = vi.fn();
     const choice = new RequiredChoice({
       tui,

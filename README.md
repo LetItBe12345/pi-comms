@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-当前发行版是 v0.2.1。阶段 0～16A、17～24 已完成；真实设备局域网验收正在按
+当前版本为 v0.3.0（待发布）。已完成阶段 0～16A、17～25；真实设备局域网验收正在按
 [Roadmap](#roadmap) 推进。
 
 现在可以：
@@ -21,6 +21,18 @@
 - 用户授权后，Broker 可选择零个、一个或最多 3 个互补 Agent 主动参与群聊
 - mDNS 附近发现；发现失败时可粘贴完整群组加入信息
 - 短暂离线、Session 重开或网络变化后的长期成员恢复
+- Agent 通过 Broker MCP 按需读取当前群最新上下文和公开历史（要求 Pi 0.99.2+）
+
+## Agent 按需读取群聊上下文
+
+阶段 25 要求 Pi 0.99.2 或更新版本。加入群组后，Extension 自动注册当前 Broker 的只读 MCP，两个工具直接向模型提供，无需修改 `mcp.json`：
+
+- `mcp__pi_comms__get_group_context()`：群信息、成员与 Agent 角色目录、最新序号、已有滚动摘要，以及最近最多 12 条公开消息。
+- `mcp__pi_comms__read_group_messages({ afterSeq?, throughSeq?, limit? })`：默认最新 20 条，最多 50 条；afterSeq 不包含，throughSeq 包含。
+
+两个 Resource 是 `pi-comms://group/current` 和 `pi-comms://group/context`，可用 Pi 原生 `read_mcp_resource` 读取，server 为 `pi-comms`。显式 Agent 请求携带触发消息序号，Agent 可用 throughSeq 回看触发点之前的历史。
+
+读取只访问当前 Session 已加入的群。不触发 DeepSeek 摘要，也不更新主动参与的进度。原有 `@Agent` 和 Proactive 上下文注入继续保留。离群、断线或 Broker 重启后旧凭证失效；重连入群会自动重新注册。LAN 读取访问当前远端 Broker 的 HTTP 端口；该端口由 Broker 动态分配，与 TCP 端口一起需要可达。
 
 ## 从零开始
 
@@ -94,7 +106,7 @@ Pi 官方安装文档：<https://pi.dev/docs/latest/quickstart>。
 推荐安装固定 Release：
 
 ```bash
-pi install git:github.com/LetItBe12345/pi-comms@v0.2.1
+pi install git:github.com/LetItBe12345/pi-comms@v0.3.0
 ```
 
 确认 Pi 已记录这个 Extension：

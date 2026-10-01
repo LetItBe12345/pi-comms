@@ -42,6 +42,7 @@ import {
   type GroupPickerResult,
 } from "../tui/group-picker.js";
 import { BrokerClient } from "./broker-client.js";
+import { McpRegistration } from "./mcp-registration.js";
 import { startLanHostBroker, startLocalBroker } from "./broker-process.js";
 import {
   CONNECTION_CONFIG_ENTRY,
@@ -175,12 +176,14 @@ export function createCommsExtension(
       options.registerTestCommands === true;
     const pendingApprovals = new Map<string, AgentRequestPayload>();
     const pausedChains = new Map<string, PausedChainPayload>();
+    const mcpRegistration = new McpRegistration(pi, () => { brokerClient.send("mcp.access", {}); });
 
     const brokerClient = new BrokerClient({
       endpoint,
       reconnectIntervalMs: options.reconnectIntervalMs,
       onMessage: handleBrokerMessage,
       onDisconnected: (wasConnected) => {
+        mcpRegistration.clear();
         if (activeProactive !== undefined) {
           context?.abort();
           activeProactive = undefined;
@@ -566,6 +569,9 @@ export function createCommsExtension(
           availableGroups = message.payload.groups;
           activeView?.setGroups(availableGroups);
           return;
+        case "mcp.access":
+          if (currentGroup !== undefined) mcpRegistration.update(message.payload, brokerClient.endpoint);
+          return;
         case "presence.changed":
           if (message.payload.groupId === currentGroup?.groupId) {
             members.set(message.payload.memberId, message.payload);
@@ -788,6 +794,11 @@ export function createCommsExtension(
       clientId = snapshot.clientId;
       availableGroups = snapshot.groups;
       currentGroup = snapshot.group;
+      if (snapshot.group !== undefined && snapshot.mcpAccess !== undefined) {
+        mcpRegistration.update(snapshot.mcpAccess, brokerClient.endpoint);
+      } else {
+        mcpRegistration.clear();
+      }
       currentGroupSettings = snapshot.groupSettings;
       currentIsOwner = snapshot.isOwner === true;
       proactiveStatus = snapshot.proactiveStatus ?? proactiveStatus;
@@ -1297,6 +1308,7 @@ export function createCommsExtension(
     });
 
     pi.on("session_shutdown", async (_event, ctx) => {
+      mcpRegistration.clear();
       shuttingDown = true;
       updateContext(ctx);
       if (resultRetryTimer !== undefined) {
@@ -1964,6 +1976,7 @@ export function formatAgentRequest(request: AgentRequestPayload): string {
       ? [`${request.senderName} 所属用户：${request.senderOwnerUserName}`]
       : []),
     `群组：${request.groupName}`,
+    ...(request.sourceGroupSeq === undefined ? [] : [`触发消息：#${request.sourceGroupSeq}（可用 read_group_messages 的 throughSeq 回看历史）`]),
     ...formatParticipantDirectory(request.participants),
     ...(coRecipients.length === 0
       ? []

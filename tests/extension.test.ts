@@ -73,7 +73,11 @@ class FakePi {
   readonly sentUserMessages: string[] = [];
   readonly appendedEntries: unknown[] = [];
 
+  readonly mcpServers = new Map<string, unknown>();
+
   readonly api = {
+    registerMcpServer: (name: string, config: unknown) => { this.mcpServers.set(name, config); },
+    unregisterMcpServer: (name: string) => { this.mcpServers.delete(name); },
     on: (event: string, handler: EventHandler) => {
       this.handlers.set(event, handler);
     },

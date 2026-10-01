@@ -75,6 +75,7 @@ import {
 import { ProactiveCallScheduler } from "./proactive-scheduler.js";
 import { GroupContextSummary } from "./group-context-summary.js";
 import { participantContext } from "../participant-context.js";
+import { createBrokerMcpServer, publicMcpMessage } from "./mcp-server.js";
 
 export const DEFAULT_DATABASE_PATH = join(
   homedir(),
@@ -125,6 +126,7 @@ export interface BrokerServerOptions {
 }
 
 export interface BrokerServer {
+  readonly mcpPort: number;
   readonly endpoint: TcpListenEndpoint;
   readonly dbPath: string;
   readonly instanceId: string;
@@ -236,6 +238,35 @@ export function createBrokerServer(
   let observedNetworkKey: string | undefined;
   let networkRefreshTimer: ReturnType<typeof setInterval> | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const mcp = createBrokerMcpServer({
+    host: listen.host,
+    currentGroup: (clientId) => {
+      if (!clients.has(clientId)) return undefined;
+      const group = groups.groupForClient(clientId);
+      const key = sessionKeyForClient(clientId);
+      return group !== undefined && key !== undefined &&
+        db().membership(group.groupId, key)?.status === "active" ? group.groupId : undefined;
+    },
+    networkAllowed: (address) => isLoopback(address) || (mode === "lan-host" &&
+      networkAccessAllowed && (!networkAccessRequired ||
+        isAddressOnOrdinaryNetwork(address, networkAccessAddress))),
+    current: (groupId) => ({
+      group: { groupId, groupName: db().storedGroup(groupId)!.groupName },
+      latestGroupSeq: db().latestGroupSeq(groupId),
+    }),
+    context: (groupId) => {
+      const latestGroupSeq = db().latestGroupSeq(groupId);
+      const snapshot = groupContext.snapshot(groupId, latestGroupSeq);
+      return {
+        group: { groupId, groupName: db().storedGroup(groupId)!.groupName },
+        latestGroupSeq,
+        participants: participantDirectory(groupId),
+        ...snapshot,
+        messages: snapshot.messages.map(publicMcpMessage),
+      };
+    },
+    messages: (groupId, query) => db().publicMessages(groupId, query),
+  });
 
   function handleConnection(socket: Socket): void {
     const decoder = new JsonlDecoder(maxFrameBytes);
@@ -533,6 +564,7 @@ export function createBrokerServer(
       return;
     }
     clients.delete(clientId);
+    mcp.revoke(clientId);
     const session = sessions.get(sessionKey);
     if (session?.socket === socket) {
       session.socket = undefined;
@@ -600,6 +632,15 @@ export function createBrokerServer(
     socket: Socket,
     envelope: Exclude<ClientEnvelope, ClientHelloEnvelope>,
   ): void {
+    if (envelope.type === "mcp.access") {
+      const group = groups.groupForClient(clientId);
+      if (group === undefined) {
+        sendError(socket, { code: "not_in_group", message: "MCP 读取前必须加入群组", requestId: envelope.id });
+      } else {
+        send(socket, createEnvelope("mcp.access", mcp.issue(clientId, group.groupId)) as BrokerEnvelope);
+      }
+      return;
+    }
     if (envelope.type === "proactive.update") {
       const membership = groups.membershipForClient(clientId);
       if (
@@ -918,6 +959,7 @@ export function createBrokerServer(
         member.userName,
       );
       if (targetClientId !== undefined) {
+        mcp.revoke(targetClientId);
         const removed = groups.removeIfJoined(targetClientId);
         if (removed !== undefined) {
           broadcastPresenceRemoved(removed.groupId, [
@@ -951,6 +993,7 @@ export function createBrokerServer(
       const removed = groups.removeGroupAndMemberships(envelope.payload.groupId);
       db().deleteGroup(envelope.payload.groupId);
       for (const membership of removed) {
+        mcp.revoke(membership.user.clientId);
         const targetSocket = clients.get(membership.user.clientId);
         if (targetSocket !== undefined) sendSnapshot(membership.user.clientId, targetSocket);
       }
@@ -1535,6 +1578,7 @@ export function createBrokerServer(
     required = false,
     deleteSessionKey?: SessionKey,
   ): void {
+    mcp.revoke(clientId);
     const membership = groups.membershipForClient(clientId);
     if (membership === undefined) {
       if (required) {
@@ -2380,11 +2424,13 @@ export function createBrokerServer(
 
   function sendSnapshot(clientId: string, socket: Socket): void {
     const group = groups.groupForClient(clientId);
+    if (group === undefined) mcp.revoke(clientId);
     const sessionKey = sessionKeyForClient(clientId);
     const storedGroup = group === undefined ? undefined : db().storedGroup(group.groupId);
     send(
       socket,
       createEnvelope("snapshot", {
+        ...(group === undefined ? {} : { mcpAccess: mcp.issue(clientId, group.groupId) }),
         brokerInstanceId: instanceId,
         clientId,
         proactiveStatus: currentProactiveStatus(),
@@ -2678,7 +2724,9 @@ export function createBrokerServer(
         server.once("listening", onListening);
         server.listen({ ...listen, exclusive: true });
       });
+      await mcp.start();
       await writeBrokerRuntimeMetadata(dbPath, {
+        mcpPort: mcp.port,
         brokerId: stableBrokerId,
         brokerInstanceId: instanceId,
         pid: process.pid,
@@ -2708,6 +2756,7 @@ export function createBrokerServer(
       closing = false;
       scheduleIdleShutdown();
     } catch (error) {
+      await mcp.close();
       if (server.listening) {
         await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
       }
@@ -2785,6 +2834,7 @@ export function createBrokerServer(
       session.socket?.destroy();
     }
     clients.clear();
+    await mcp.close();
     sessions.clear();
     pendingRequests.clear();
     proactive?.clear();
@@ -2838,6 +2888,7 @@ export function createBrokerServer(
   }
 
   return {
+    get mcpPort() { return mcp.port; },
     get endpoint() { return endpoint; },
     dbPath,
     instanceId,

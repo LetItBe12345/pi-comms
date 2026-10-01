@@ -39,11 +39,11 @@
 | 22 | [多 Agent 显式并行投递](./done/22-multi-agent-mentions.md) | 一条消息并行投递给多个 Agent | done | 阶段 21 |
 | 23 | [DeepSeek 多 Agent 主动路由](./done/23-multi-agent-proactive-routing.md) | Router 一次选择多个 Agent 并独立邀请 | done | 阶段 20、21、22 |
 | 24 | [修复 Pi 内 Broker 自动启动运行时](./done/24-pi-broker-autostart-runtime.md) | Pi 独立二进制内使用真实 Node.js 启动 Broker | done | 阶段 14 |
-| 25 | [Broker MCP 群聊上下文读取](./in-progress/25-broker-mcp-group-context.md) | 当前 Pi Session 通过 Broker MCP 按需读取当前群上下文和公开历史 | in-progress（未开始） | 阶段 20、21、24 |
+| 25 | [Broker MCP 群聊上下文读取](./done/25-broker-mcp-group-context.md) | 当前 Pi Session 通过 Broker MCP 按需读取当前群上下文和公开历史 | done | 阶段 20、21、24 |
 
 ## 当前里程碑
 
-阶段 0～16A、17～24 已完成。阶段 16B 等待三台真实设备；阶段 25 未开始。
+阶段 0～16A、17～25 已完成。阶段 16B 等待三台真实设备。
 
 ## 维护规则
 

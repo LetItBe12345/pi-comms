@@ -894,14 +894,17 @@ export class BrokerDatabase {
     awaitingApproval: boolean,
     context: AgentChainContext,
   ): void {
+    request.sourceGroupSeq ??= (this.#db.prepare(
+      "SELECT group_seq AS seq FROM messages WHERE message_id = ?",
+    ).get(messageId) as { seq: number }).seq;
     this.#db.prepare(
       `INSERT INTO agent_requests (
          request_id, group_id, message_id, sender_id, sender_name,
          target_agent_id, target_agent_name, owner_user_name,
          sender_type, sender_owner_user_name, online_members, text,
          chain_id, round, status, initiator_session_key, initiator_name,
-         participants, round_limit, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         participants, round_limit, created_at, updated_at, source_group_seq
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       request.requestId, request.groupId, messageId, request.senderId,
       request.senderName, request.targetAgentId, request.targetAgentName,
@@ -911,7 +914,7 @@ export class BrokerDatabase {
       awaitingApproval ? "awaiting_approval" : "pending",
       context.initiatorSessionKey, context.initiatorName,
       JSON.stringify(context.participants), context.roundLimit,
-      timestamp, timestamp,
+      timestamp, timestamp, request.sourceGroupSeq ?? null,
     );
   }
 
@@ -1106,10 +1109,25 @@ export class BrokerDatabase {
 
   #migrate(): void {
     const version = this.#db.pragma("user_version", { simple: true }) as number;
-    if (version > 10) {
+    if (version > 11) {
       throw new Error(`数据库版本不受支持：${version}`);
     }
+    if (version === 11) {
+      return;
+    }
     if (version === 10) {
+      this.#db.transaction(() => {
+        const columns = this.#db.pragma("table_info(agent_requests)") as Array<{ name: string }>;
+        if (!columns.some((column) => column.name === "source_group_seq")) {
+          this.#db.exec(`
+            ALTER TABLE agent_requests ADD COLUMN source_group_seq INTEGER;
+            UPDATE agent_requests SET source_group_seq = (
+              SELECT group_seq FROM messages WHERE messages.message_id = agent_requests.message_id
+            );
+          `);
+        }
+        this.#db.pragma("user_version = 11");
+      })();
       return;
     }
     if (version === 9) {
@@ -1163,6 +1181,7 @@ export class BrokerDatabase {
         COMMIT;
       `);
       this.#db.pragma("foreign_keys = ON");
+      this.#migrate();
       return;
     }
     if (version === 8) {
@@ -1563,6 +1582,7 @@ export class BrokerDatabase {
       PRAGMA user_version = 10;
       COMMIT;
     `);
+    this.#migrate();
   }
 }
 
