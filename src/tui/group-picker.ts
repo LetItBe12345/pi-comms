@@ -24,6 +24,7 @@ export type GroupPickerResult =
   | { type: "create" }
   | { type: "paste" }
   | { type: "local" }
+  | { type: "broker-settings" }
   | { type: "cancel" };
 
 interface PickerRow {
@@ -217,6 +218,12 @@ export class GroupPicker implements Component, Focusable {
         label: "使用加入信息",
         description: "粘贴后直接定位群组",
         result: { type: "paste" },
+      },
+      {
+        key: "broker-settings",
+        label: "Broker 设置",
+        description: "配置这台电脑的 DeepSeek V4.1 Flash 路由模型",
+        result: { type: "broker-settings" },
       },
       {
         key: "local",

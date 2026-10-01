@@ -710,6 +710,7 @@ export function createBrokerServer(
         proactive?.clear();
         if (envelope.payload.rebuild === true) {
           const rebuilt = proactiveConfig.rebuild();
+          broadcastConfigStatus();
           sendConfigStatus(
             socket,
             envelope.id,
@@ -718,14 +719,20 @@ export function createBrokerServer(
           );
         } else {
           proactiveConfig.delete();
+          broadcastConfigStatus();
           sendConfigStatus(socket, envelope.id, "DeepSeek API Key 已删除");
         }
       } else {
+        const apiKey = envelope.payload.apiKey ?? proactiveConfig.snapshot().apiKey;
+        if (apiKey === undefined) {
+          sendConfigStatus(socket, envelope.id, "尚未保存 DeepSeek API Key，请先配置");
+          return;
+        }
         void validateConfigKey(
           socket,
           envelope.id,
-          envelope.payload.apiKey,
-          envelope.type === "broker.config.update",
+          apiKey,
+          envelope.type === "broker.config.update" || envelope.payload.apiKey === undefined,
         );
       }
       return;
@@ -1068,9 +1075,17 @@ export function createBrokerServer(
       await proactiveScheduler.schedule("validation", (signal) =>
         withProactiveRetry(() => proactiveProvider.validate(apiKey, signal))
       );
-      if (save) proactiveConfig.saveVerified(apiKey);
+      if (save) {
+        proactiveConfig.saveVerified(apiKey);
+        broadcastConfigStatus();
+      }
       sendConfigStatus(socket, requestId, save ? "DeepSeek API Key 已验证并保存" : "验证成功");
     } catch (error) {
+      if (error instanceof ProactiveProviderError && error.kind === "invalid_key" &&
+        proactiveConfig.snapshot().apiKey === apiKey) {
+        proactiveConfig.markInvalid();
+        broadcastConfigStatus();
+      }
       if (
         save &&
         error instanceof ProactiveProviderError &&
@@ -1078,6 +1093,7 @@ export function createBrokerServer(
         proactiveConfig.snapshot().apiKey === undefined
       ) {
         proactiveConfig.saveUnverified(apiKey);
+        broadcastConfigStatus();
         sendConfigStatus(socket, requestId, "网络不可用，Key 已保存为未验证");
         return;
       }

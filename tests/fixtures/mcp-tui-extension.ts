@@ -63,7 +63,7 @@ export default function (pi: ExtensionAPI) {
     endpoint: { host: process.env.PI_COMMS_E2E_HOST ?? "127.0.0.1", port: Number(process.env.PI_COMMS_E2E_PORT) },
     dbPath: process.env.PI_COMMS_E2E_DB,
     ...(process.env.PI_COMMS_E2E_MODE === "lan" ? { connectionConfig: { mode: "lan-host" as const } } : {}),
-    registerTestCommands: true,
+    registerTestCommands: process.env.PI_COMMS_E2E_HOME !== "1",
     startBroker: () => {},
   })(pi);
   pi.registerProvider("mcp-e2e", {

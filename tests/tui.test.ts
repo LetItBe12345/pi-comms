@@ -634,6 +634,18 @@ describe("最小群聊 TUI", () => {
 });
 
 describe("群组首屏", () => {
+  it("未建群也可以通过首页打开 Broker 路由设置", () => {
+    const done = vi.fn();
+    const picker = new GroupPicker({
+      tui: new TuiMainScreen(new TestTerminal()), theme, done,
+      memberships: [], onRefresh: vi.fn(),
+    });
+    expect(picker.render(120).join("\n")).toContain("DeepSeek V4.1 Flash");
+    picker.handleInput("\u001b[B");
+    picker.handleInput("\u001b[B");
+    picker.handleInput("\r");
+    expect(done).toHaveBeenCalledWith({ type: "broker-settings" });
+  });
   it("同屏显示三个分区，并在附近更新时保持选择", () => {
     const terminal = new TestTerminal();
     const tui = new TuiMainScreen(terminal);
