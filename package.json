@@ -44,7 +44,7 @@
     "@earendil-works/pi-mcp": "^0.99.2",
     "@earendil-works/pi-tui": "^0.99.2",
     "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^22.20.1",
+    "@types/node": "^26.1.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },
