@@ -18,6 +18,8 @@
 
 在 Node.js 22.23.3 下执行 `npm run check`。结果：类型检查通过，单元与集成测试 167 通过，原有 E2E 20 通过；1 个原有环境条件测试跳过。
 
+发布准备补充检查：在隔离临时目录执行 `npm ci --omit=dev`，确认 Pi 开发包未安装；生产 Broker 启动成功，生产依赖审计为 0 个漏洞。
+
 新增 MCP 测试覆盖原生 Pi MCP Client 与官方 SDK Client 互通、Local/LAN、两个用户、最新 context、已有摘要读取、Provider 零调用、数据库 membership 不变、消息分页、50 条上限、公开字段过滤、两个 Resource、跨群参数拒绝、未入群、错误和过期 token、刷新、离群重入、移出成员、Session 结束、Broker 重启失效、请求锚点持久化。注册测试覆盖 direct exposure、远端地址、提前刷新和注销。
 
 ## 两用户、两 TUI 的实际验收
