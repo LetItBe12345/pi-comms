@@ -725,7 +725,7 @@ pi-comms/
 
 ### 19.2 Broker 模型与本机配置
 
-- Broker Router、Freshness 和 Summary 默认且只使用 DeepSeek 官方 `deepseek-flash`。Base URL 固定为 `https://api.deepseek.com`，不允许自定义模型或中转 endpoint。
+- Broker Router、Freshness 和 Summary 默认且只使用 DeepSeek 官方 `deepseek-flash`（当前为 DeepSeek V4.1 Flash）。Base URL 固定为 `https://api.deepseek.com`，不允许自定义模型或中转 endpoint。
 - Pi Session 自己的模型与 Broker 模型严格分开。Pi Comms 不读取、修改或复用 Session 的模型配置和 Key。
 - DeepSeek API Key 由 Broker 本机用户提供并承担费用，只保存在 `~/.pi/comms/config.json`。文件使用临时文件原子替换，macOS/Linux 权限为 `0600`。
 - 本机设置页可以配置、验证、更换、删除 Key。保存后只显示 `****abcd` 形式的遮罩值，不提供完整值回显。远程客户端不显示设置入口。
@@ -736,6 +736,11 @@ pi-comms/
 - `401/403` 把 Key 持久化标记为无效。未验证 Key 每次 Broker 启动时自动验证一次，设置页也提供手动重新验证。
 - 配置文件损坏或不可读时进入 `config_error`。重建配置前把旧文件重命名为带时间戳的 `0600` 备份，不自动删除。
 - 日志、错误、Snapshot 和协议回复不得包含完整 Key。
+
+- `/comms` 群组首页提供本机「Broker 设置」，未建群也可配置。群内通过 `Ctrl+P` 进入，退出设置后恢复群聊。
+- 设置页显示模型名、中文状态和脱敏 Key，提供配置说明及准备、输入、验证保存三步引导；成功后提示检查主动参与开关。
+- 重新验证允许不传 Key，由 Broker 验证已保存的 Key；成功时将未验证配置保存为已验证。保留传 Key 的旧请求格式。
+- 本机配置改变后向所有连接广播新状态；远程 Session 仍不能修改 Key。
 
 ### 19.3 触发、候选与调度
 

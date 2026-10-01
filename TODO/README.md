@@ -41,9 +41,11 @@
 | 24 | [修复 Pi 内 Broker 自动启动运行时](./done/24-pi-broker-autostart-runtime.md) | Pi 独立二进制内使用真实 Node.js 启动 Broker | done | 阶段 14 |
 | 25 | [Broker MCP 群聊上下文读取](./done/25-broker-mcp-group-context.md) | 当前 Pi Session 通过 Broker MCP 按需读取当前群上下文和公开历史 | done | 阶段 20、21、24 |
 
+| 26 | [Broker 路由模型配置引导](./done/26-broker-router-setup-guide.md) | 首页和群内引导配置 DeepSeek V4.1 Flash，修复重新验证与状态同步 | done | 阶段 18、25 |
+
 ## 当前里程碑
 
-阶段 0～16A、17～25 已完成。阶段 16B 等待三台真实设备。
+阶段 0～16A、17～26 已完成。阶段 16B 等待三台真实设备。
 
 ## 维护规则
 

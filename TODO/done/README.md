@@ -30,3 +30,5 @@
 - [阶段 23：DeepSeek 多 Agent 主动路由](./23-multi-agent-proactive-routing.md)
 - [阶段 24：修复 Pi 内 Broker 自动启动运行时](./24-pi-broker-autostart-runtime.md)
 - [阶段 25：Broker MCP 群聊上下文读取](./25-broker-mcp-group-context.md)
+
+- [阶段 26：Broker 路由模型配置引导](./26-broker-router-setup-guide.md)

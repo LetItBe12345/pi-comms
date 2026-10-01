@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-当前代码版本为 v0.3.0。已完成阶段 0～16A、17～25；真实设备局域网验收正在按
+当前代码版本为 v0.3.1。已完成阶段 0～16A、17～26；真实设备局域网验收正在按
 [Roadmap](#roadmap) 推进。
 
 现在可以：
@@ -106,7 +106,7 @@ Pi 官方安装文档：<https://pi.dev/docs/latest/quickstart>。
 推荐安装固定 Release：
 
 ```bash
-pi install git:github.com/LetItBe12345/pi-comms@v0.3.0
+pi install git:github.com/LetItBe12345/pi-comms@v0.3.1
 ```
 
 确认 Pi 已记录这个 Extension：
@@ -182,11 +182,11 @@ pi
 
 Proactive 由 Broker 使用独立的 DeepSeek API Key。它不读取、修改或复用
 Pi Session 的模型和 Key。Broker 固定使用 DeepSeek 官方 API 和
-`deepseek-flash`。
+`deepseek-flash`（当前为 DeepSeek V4.1 Flash）。
 
 ### 获取 API Key
 
-1. 登录 DeepSeek Platform。
+1. 打开 [DeepSeek Platform](https://platform.deepseek.com/api_keys)。
 2. 创建一个 DeepSeek API Key，并确保账户有可用额度。
 3. 不要把 Key 提交到项目文件、聊天消息或 Git 仓库。
 
@@ -198,7 +198,12 @@ DeepSeek API 文档：<https://api-docs.deepseek.com/api/deepseek-api/>。
 2. 执行 `/comms`。
 3. 在首页选择“Broker 设置”。
 4. 选择“配置或更换 API Key”。
-5. 输入 DeepSeek API Key，等待状态变成“已就绪”。
+5. 按三步引导准备 Key、输入 Key、确认验证并保存。
+6. 等待“已就绪”提示；进入群聊，在 `Ctrl+P` 中检查“主动参与”开关。
+
+未创建群组也可以配置。群内也可通过 `Ctrl+P` → “Broker 设置”进入，配置结束后会回到群聊。
+“查看配置说明”提供官方 API 地址、模型名、获取 Key 的地址和保存位置。
+完整步骤与常见状态见 [Broker 路由模型配置](./docs/broker-router-setup.md)。
 
 Key 验证成功后会保存在 Broker 所在机器的 `~/.pi/comms/config.json`。文件权限在
 macOS 和 Linux 上会被设置为仅当前用户可读写。远程加入该 Broker 的 Session 不能修改

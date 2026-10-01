@@ -20,7 +20,7 @@ export interface Envelope<T = unknown> {
 }
 
 export const BROKER_SERVICE = "pi-comms";
-export const PI_COMMS_VERSION = "0.3.0";
+export const PI_COMMS_VERSION = "0.3.1";
 export type PiCommsBuildChannel = "release" | "development";
 export const PI_COMMS_BUILD_CHANNEL: PiCommsBuildChannel =
   process.env.PI_COMMS_BUILD_CHANNEL === "development"
@@ -565,7 +565,7 @@ export type ProactiveResultEnvelope = Envelope<ProactiveResultPayload> & {
 export type ProactiveDeclineEnvelope = Envelope<ProactiveDeclinePayload> & {
   type: "proactive.decline";
 };
-export type BrokerConfigValidateEnvelope = Envelope<BrokerConfigKeyPayload> & {
+export type BrokerConfigValidateEnvelope = Envelope<Partial<BrokerConfigKeyPayload>> & {
   type: "broker.config.validate";
 };
 export type BrokerConfigUpdateEnvelope = Envelope<BrokerConfigKeyPayload> & {
@@ -903,6 +903,9 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
         ? { ok: true, envelope: value as unknown as ProactiveDeclineEnvelope }
         : invalid("invalid_payload", "proactive.decline payload 无效", requestId);
     case "broker.config.validate":
+      return value.payload.apiKey === undefined
+        ? { ok: true, envelope: value as unknown as BrokerConfigValidateEnvelope }
+        : requireStrings(value, requestId, ["apiKey"]);
     case "broker.config.update":
       return requireStrings(value, requestId, ["apiKey"]);
     case "broker.config.delete":
