@@ -20,7 +20,7 @@ export interface Envelope<T = unknown> {
 }
 
 export const BROKER_SERVICE = "pi-comms";
-export const PI_COMMS_VERSION = "0.2.0";
+export const PI_COMMS_VERSION = "0.3.0";
 export type PiCommsBuildChannel = "release" | "development";
 export const PI_COMMS_BUILD_CHANNEL: PiCommsBuildChannel =
   process.env.PI_COMMS_BUILD_CHANNEL === "development"
@@ -45,7 +45,14 @@ export interface BrokerReadyPayload {
   requestId: string;
 }
 
+export interface McpAccessPayload {
+  port: number;
+  token: string;
+  expiresAt: number;
+}
+
 export interface SnapshotPayload {
+  mcpAccess?: McpAccessPayload;
   brokerInstanceId: string;
   clientId: string;
   groups: GroupSummary[];
@@ -263,6 +270,7 @@ export interface HistoryMessage extends ChatMessagePayload {
 }
 
 export interface AgentRequestPayload {
+  sourceGroupSeq?: number;
   requestId: string;
   groupId: string;
   groupName: string;
@@ -568,6 +576,7 @@ export type BrokerConfigDeleteEnvelope = Envelope<BrokerConfigDeletePayload> & {
 };
 
 export type ClientEnvelope =
+  | (Envelope<Record<string, never>> & { type: "mcp.access" })
   | BrokerProbeEnvelope
   | BrokerShutdownEnvelope
   | GroupCatalogEnvelope
@@ -602,6 +611,7 @@ export type ClientEnvelope =
   | BrokerConfigDeleteEnvelope;
 
 export type BrokerEnvelope =
+  | (Envelope<McpAccessPayload> & { type: "mcp.access" })
   | (Envelope<BrokerReadyPayload> & { type: "broker.ready" })
   | (Envelope<{ requestId: string }> & { type: "broker.stopping" })
   | (Envelope<ClientWelcomePayload> & { type: "client.welcome" })
@@ -746,6 +756,7 @@ export function parseClientEnvelope(value: unknown): ParseClientEnvelopeResult {
     case "broker.shutdown":
     case "broker.network.refresh":
     case "client.goodbye":
+    case "mcp.access":
     case "ping":
       return { ok: true, envelope: value as unknown as ClientEnvelope };
     case "group.catalog":

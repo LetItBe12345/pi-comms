@@ -1,6 +1,6 @@
 # 阶段 25：Broker MCP 群聊上下文读取 决策记录
 
-本文档记录针对 [阶段 25 TODO](../in-progress/25-broker-mcp-group-context.md) 已经确认的设计决定。未完成的讨论不写入本文档。
+本文档记录针对 [阶段 25 TODO](../done/25-broker-mcp-group-context.md) 已经确认的设计决定。未完成的讨论不写入本文档。
 
 ## Pi 与 MCP 形态
 

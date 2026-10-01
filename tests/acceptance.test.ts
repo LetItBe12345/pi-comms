@@ -34,7 +34,11 @@ class AcceptancePi {
   readonly commands = new Map<string, CommandHandler>();
   readonly sentUserMessages: string[] = [];
 
+  readonly mcpServers = new Map<string, unknown>();
+
   readonly api = {
+    registerMcpServer: (name: string, config: unknown) => { this.mcpServers.set(name, config); },
+    unregisterMcpServer: (name: string) => { this.mcpServers.delete(name); },
     on: (event: string, handler: EventHandler) => {
       this.handlers.set(event, handler);
     },

@@ -10,6 +10,7 @@ export interface BrokerRuntimeMetadata {
   pid: number;
   host: string;
   port: number;
+  mcpPort?: number;
   mode: BrokerMode;
   appVersion?: string;
   buildChannel?: PiCommsBuildChannel;

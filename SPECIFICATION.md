@@ -898,3 +898,17 @@ DeepSeek 实现以官方文档为准：
 - Broker 协议版本为 8。`AgentRequestPayload.coRecipients` 携带共同接收者；`ChatMessagePayload.deliveries` 携带逐目标状态。
 - SQLite schema 版本为 10。`agent_requests.message_id` 不再唯一，并为该列建立普通索引，使一条公开消息可以关联多个请求。
 - 自动测试覆盖多目标成功、重复 mention、用户与 Agent 混合目标、部分失败、部分审批、独立 ACK、Agent 多目标下一跳、共同接收者、10 轮暂停和 TUI 逐目标状态。
+## Broker MCP 群聊上下文（阶段 25）
+
+Pi 0.99.2 及以上通过原生 Streamable HTTP MCP 读取当前群。MCP Server 与 Broker 在同一进程，使用同一身份、membership、SQLite 和上下文查询。TCP 继续负责实时通信和写入。Extension 自动注册 `pi-comms`，两个 Tool 的 exposure 都是 `direct`，不要求修改 `mcp.json`。
+
+Broker 在已认证 TCP Session 入群后签发独立于 resumeToken 的五分钟 MCP access token，通过 snapshot 返回 HTTP port、token 和 expiresAt；`mcp.access` 可刷新凭证。Extension 提前刷新，并用当前 TCP Broker 的 host 构造 `/mcp` URL。Token 仅绑定签发 Session 的当前群。HTTP 每次请求检查 token 到期时间、在线 Session 和当前有效 membership；离群、移除成员、Session 结束、断线或 Broker 重启立即失效。未入群和无效凭证返回明确错误。Local/LAN 共用权限与查询；不读取本机替代数据库，不缓存旧 context。
+
+- `get_group_context()`：无参数，返回当前群 `group`、`latestGroupSeq`、阶段 21 的 `participants`、已有 `summary`（含 fromSeq/throughSeq/promptVersion）、`omitted`、`summaryIncomplete` 和最新最多 12 条公开 `messages`。只调用 snapshot，绝不调用 prepare 或摘要 Provider。
+- `read_group_messages({ afterSeq?, throughSeq?, limit? })`：序号为非负安全整数，afterSeq 是排他下界，throughSeq 是包含上界。默认最新 20 条，limit 为正整数，超过 50 时截为 50。复用 publicMessages，结果按序号递增。
+- `pi-comms://group/current`：当前群信息和 latestGroupSeq。
+- `pi-comms://group/context`：与 get_group_context 相同的实时可读 JSON。
+
+Tool 不接受 groupId 或其他未声明参数。公开消息只含 groupSeq、messageId、timestamp、senderName、senderType、text、mentionIds，以及存在时的 chainId、round。不得返回请求状态、凭证、API Key、私有 Session 或 Proactive 状态。Resource 使用相同的鉴权和字段过滤。MCP 不提供写 Tool；读取不更新 lastSeenGroupSeq、Proactive cursor/cooldown、ACK、投递或群聊状态。
+
+显式 AgentRequestPayload 增加 sourceGroupSeq，指向触发请求的公开消息；该值随请求持久化，Broker 重启后保留。原有 Remote Request、Proactive Invitation 和上下文注入保留。Agent 可以使用 throughSeq: sourceGroupSeq 回看触发点之前的历史。
