@@ -88,6 +88,9 @@ jobs:
       - name: Install development dependencies
         run: npm ci
 
+      - name: Install browser for mobile Web E2E
+        run: npx playwright install --with-deps chromium
+
       - name: Run checks
         run: npm run check
 
@@ -99,6 +102,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          test -f src/web/public/index.html
+          test -f src/web/public/app.js
+          test -f src/web/public/style.css
           test -x node_modules/.bin/tsx
           test ! -e node_modules/@earendil-works/pi-coding-agent
           test ! -e node_modules/@earendil-works/pi-tui
@@ -118,6 +124,24 @@ jobs:
             exit 1
           fi
           grep -F "Pi Comms Broker 正在监听" "$broker_log"
+
+          node --import tsx --input-type=module <<'JS'
+          import { createBrokerServer } from './src/broker/server.ts';
+          const broker = createBrokerServer({
+            listen: { host: '127.0.0.1', port: 0 },
+            dbPath: `${process.env.RUNNER_TEMP}/pi-comms-web-smoke/comms.db`,
+            mode: 'lan-host', webPort: 0, networkAccessRequired: false,
+            mdnsPublisherFactory: () => ({ async stop() {} }),
+          });
+          await broker.start();
+          try {
+            if (!broker.webPort) throw new Error(broker.webError ?? 'Web server unavailable');
+            for (const path of ['', 'app.js', 'style.css']) {
+              const response = await fetch(`http://127.0.0.1:${broker.webPort}/${path}`);
+              if (response.status !== 200) throw new Error(`Web asset failed: ${path}`);
+            }
+          } finally { await broker.close(); }
+          JS
 
       - name: Create tag and GitHub Release
         shell: bash

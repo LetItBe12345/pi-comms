@@ -9,7 +9,6 @@ import {
   PI_COMMS_BUILD_CHANNEL,
   PI_COMMS_VERSION,
   createEnvelope,
-  encodeEnvelope,
   JsonlDecoder,
   parseClientEnvelope,
   type AgentRequestPayload,
@@ -47,7 +46,7 @@ import {
   type AgentChainContext,
   type StoredPausedChain,
 } from "./database.js";
-import { GroupState, GroupStateError } from "./group-state.js";
+import { GroupState, GroupStateError, membershipMembers, validateDisplayName } from "./group-state.js";
 import { generateInviteCode, normalizeInviteCode } from "./invite-code.js";
 import { assertNoLiveLegacyBroker } from "./legacy-migration.js";
 import { acquireBrokerProcessLock, type BrokerProcessLock } from "./process-lock.js";
@@ -75,6 +74,9 @@ import {
 import { ProactiveCallScheduler } from "./proactive-scheduler.js";
 import { GroupContextSummary } from "./group-context-summary.js";
 import { participantContext } from "../participant-context.js";
+import { tcpPeer, type ClientPeer } from "./client-peer.js";
+import { createWebServer } from "../web/server.js";
+import { parseWebEnvelope } from "../web/protocol.js";
 import { createBrokerMcpServer, publicMcpMessage } from "./mcp-server.js";
 
 export const DEFAULT_DATABASE_PATH = join(
@@ -95,6 +97,7 @@ export const DEFAULT_IDLE_SHUTDOWN_MS = 5 * 60_000;
 
 export interface BrokerServerOptions {
   listen?: TcpListenEndpoint;
+  webPort?: number;
   dbPath?: string;
   disconnectGraceMs?: number;
   localDisconnectGraceMs?: number;
@@ -127,6 +130,8 @@ export interface BrokerServerOptions {
 
 export interface BrokerServer {
   readonly mcpPort: number;
+  readonly webPort: number | undefined;
+  readonly webError: string | undefined;
   readonly endpoint: TcpListenEndpoint;
   readonly dbPath: string;
   readonly instanceId: string;
@@ -139,7 +144,8 @@ export interface BrokerServer {
 interface ClientSession {
   clientId: string;
   resumeToken: string;
-  socket?: Socket;
+  kind: "pi" | "web";
+  socket?: ClientPeer;
   disconnectTimer?: ReturnType<typeof setTimeout>;
   heartbeatTimer?: ReturnType<typeof setTimeout>;
 }
@@ -215,7 +221,7 @@ export function createBrokerServer(
   const networkAccessRequired = options.networkAccessRequired ?? true;
   const updateAutostart =
     options.configureAutostart ?? configureBrokerAutostart;
-  const clients = new Map<string, Socket>();
+  const clients = new Map<string, ClientPeer>();
   const sessions = new Map<SessionKey, ClientSession>();
   let groups = new GroupState();
   let database: BrokerDatabase | undefined;
@@ -268,7 +274,76 @@ export function createBrokerServer(
     messages: (groupId, query) => db().publicMessages(groupId, query),
   });
 
-  function handleConnection(socket: Socket): void {
+  function webAllowed(address: string | undefined): boolean {
+    return mode === "lan-host" && networkAccessAllowed &&
+      (isLoopback(address) || !networkAccessRequired || isAddressOnOrdinaryNetwork(address, networkAccessAddress));
+  }
+
+  const web = createWebServer({
+    host: mode === "local" ? "127.0.0.1" : listen.host,
+    port: options.webPort,
+    allowed: webAllowed,
+    group: (groupId) => {
+      const group = db().storedGroup(groupId);
+      return group?.visibility === "nearby" ? { groupId, groupName: group.groupName } : undefined;
+    },
+    connect: handleWebConnection,
+  });
+
+  function handleWebConnection(socket: ClientPeer) {
+    let hello: ClientHelloEnvelope | undefined;
+    let identity: { sessionKey: SessionKey; clientId: string } | undefined;
+    const timer = setTimeout(() => {
+      if (!hello) { sendError(socket, { code: "hello_timeout", message: "手机连接超时" }); socket.end(); }
+    }, helloTimeoutMs);
+    return {
+      message(value: unknown) {
+        const parsed = parseWebEnvelope(value);
+        if (!parsed.ok) { sendError(socket, { code: parsed.code, message: parsed.message, requestId: parsed.requestId }); return; }
+        const envelope = parsed.envelope;
+        if (envelope.type === "client.hello") {
+          if (hello) { sendError(socket, { code: "invalid_payload", message: "连接已初始化" }); return; }
+          hello = envelope;
+          clearTimeout(timer);
+          // Registration and takeover wait until the membership credential is verified.
+          socket.send(createEnvelope("client.welcome", { brokerInstanceId: instanceId }));
+          return;
+        }
+        if (!hello) { sendError(socket, { code: "invalid_payload", message: "请先初始化手机连接" }); return; }
+        if (!webAllowed(socket.remoteAddress)) { sendError(socket, { code: "network_unavailable", message: "当前网络不允许手机加入" }); socket.end(); return; }
+        if (envelope.type === "group.join") {
+          const group = db().storedGroup(envelope.payload.groupId);
+          if (group?.visibility !== "nearby") { sendError(socket, { code: group ? "invite_invalid" : "group_not_found", message: "群组不可用或尚未开放附近加入" }); return; }
+          const key = createSessionKey(hello.payload.deviceId, hello.payload.sessionId);
+          const stored = db().membership(group.groupId, key);
+          if (envelope.payload.membershipCredential !== undefined || stored !== undefined) {
+            if (!stored || stored.agentName !== undefined || stored.credentialHash !== hashSecret(envelope.payload.membershipCredential ?? "")) {
+              sendError(socket, { code: "membership_invalid", message: "成员身份已失效，请重新加入" }); return;
+            }
+            if (stored.status === "removed") { sendError(socket, { code: "member_removed", message: "你已被群主移出群组" }); socket.end(); return; }
+          }
+          identity ??= registerClient(socket, hello);
+          if (identity) handleGroupJoin(identity.sessionKey, identity.clientId, socket, envelope.id, envelope.payload);
+          return;
+        }
+        if (envelope.type === "ping") {
+          const session = identity === undefined ? undefined : sessions.get(identity.sessionKey);
+          if (identity && session?.socket === socket) armHeartbeat(identity.sessionKey, session, socket);
+          send(socket, createEnvelope("pong", { requestId: envelope.id }));
+          return;
+        }
+        if (!identity || clients.get(identity.clientId) !== socket) { sendError(socket, { code: "not_in_group", message: "请先加入群组" }); return; }
+        handleClientMessage(identity.sessionKey, identity.clientId, socket, envelope);
+      },
+      close() {
+        clearTimeout(timer);
+        if (identity) handleUnexpectedDisconnect(identity.sessionKey, identity.clientId, socket);
+      },
+    };
+  }
+
+  function handleConnection(rawSocket: Socket): void {
+    const socket = tcpPeer(rawSocket);
     const decoder = new JsonlDecoder(maxFrameBytes);
     let sessionKey: SessionKey | undefined;
     let clientId: string | undefined;
@@ -278,7 +353,7 @@ export function createBrokerServer(
       socket.end();
     }, helloTimeoutMs);
 
-    socket.on("data", (chunk) => {
+    rawSocket.on("data", (chunk) => {
       for (const result of decoder.push(chunk)) {
         if (!result.ok) {
           sendError(socket, { code: result.code, message: result.error });
@@ -341,6 +416,8 @@ export function createBrokerServer(
             brokerId: stableBrokerId,
             brokerInstanceId: instanceId,
             brokerMode: mode,
+            webPort: web.port,
+            webError: web.error,
             appVersion: PI_COMMS_VERSION,
             buildChannel: PI_COMMS_BUILD_CHANNEL,
             requestId: parsed.envelope.id,
@@ -437,8 +514,8 @@ export function createBrokerServer(
       }
     });
 
-    socket.on("error", () => socket.destroy());
-    socket.once("close", () => {
+    rawSocket.on("error", () => socket.destroy());
+    rawSocket.once("close", () => {
       if (helloTimer !== undefined) clearTimeout(helloTimer);
       if (clientId !== undefined && sessionKey !== undefined) {
         handleUnexpectedDisconnect(sessionKey, clientId, socket);
@@ -447,7 +524,7 @@ export function createBrokerServer(
   }
 
   function rejectInvite(
-    socket: Socket,
+    socket: ClientPeer,
     requestId: string,
     supplied: boolean,
   ): void {
@@ -480,7 +557,7 @@ export function createBrokerServer(
   }
 
   function registerClient(
-    socket: Socket,
+    socket: ClientPeer,
     hello: ClientHelloEnvelope,
   ): { sessionKey: SessionKey; clientId: string } | undefined {
     const sessionKey = createSessionKey(hello.payload.deviceId, hello.payload.sessionId);
@@ -494,11 +571,15 @@ export function createBrokerServer(
       session = {
         clientId: randomUUID(),
         resumeToken: randomBytes(32).toString("base64url"),
+        kind: socket.kind,
       };
       sessions.set(sessionKey, session);
     } else if (
-      hello.payload.clientId !== session.clientId ||
-      hello.payload.resumeToken !== session.resumeToken
+      session.kind !== socket.kind ||
+      (socket.kind === "pi" && (
+        hello.payload.clientId !== session.clientId ||
+        hello.payload.resumeToken !== session.resumeToken
+      ))
     ) {
       sendError(socket, {
         code: hello.payload.clientId === undefined ? "session_in_use" : "resume_rejected",
@@ -514,7 +595,10 @@ export function createBrokerServer(
       session.disconnectTimer = undefined;
     }
     if (session.socket !== undefined && session.socket !== socket) {
-      session.socket.destroy();
+      if (socket.kind === "web") {
+        sendError(session.socket, { code: "session_in_use", message: "连接已在其他标签页接管" });
+        session.socket.end();
+      } else session.socket.destroy();
     }
 
     const clientId = session.clientId;
@@ -531,7 +615,7 @@ export function createBrokerServer(
       resumeToken: session.resumeToken,
     }) as BrokerEnvelope);
     sendSnapshot(clientId, socket);
-    sendConfigStatus(socket);
+    if (socket.kind === "pi") sendConfigStatus(socket);
     if (reconnectedMembers.length > 0) {
       broadcastPresence(reconnectedMembers, clientId);
       broadcastGroupsChanged();
@@ -544,7 +628,7 @@ export function createBrokerServer(
   function armHeartbeat(
     sessionKey: SessionKey,
     session: ClientSession,
-    socket: Socket,
+    socket: ClientPeer,
   ): void {
     if (session.heartbeatTimer !== undefined) clearTimeout(session.heartbeatTimer);
     session.heartbeatTimer = setTimeout(() => {
@@ -558,7 +642,7 @@ export function createBrokerServer(
   function handleUnexpectedDisconnect(
     sessionKey: SessionKey,
     clientId: string,
-    socket: Socket,
+    socket: ClientPeer,
   ): void {
     if (clients.get(clientId) !== socket) {
       return;
@@ -593,8 +677,7 @@ export function createBrokerServer(
           const removed = groups.removeIfJoined(clientId);
           if (removed !== undefined) {
             broadcastPresenceRemoved(removed.groupId, [
-              removed.user.memberId,
-              removed.agent.memberId,
+              ...membershipMembers(removed).map((member) => member.memberId),
             ]);
           }
           failRequestsForTarget(clientId, "target_offline");
@@ -609,7 +692,7 @@ export function createBrokerServer(
   function removeClientSession(
     sessionKey: SessionKey,
     clientId: string,
-    socket: Socket,
+    socket: ClientPeer,
   ): void {
     const session = sessions.get(sessionKey);
     if (session?.disconnectTimer !== undefined) {
@@ -629,7 +712,7 @@ export function createBrokerServer(
   function handleClientMessage(
     sessionKey: SessionKey,
     clientId: string,
-    socket: Socket,
+    socket: ClientPeer,
     envelope: Exclude<ClientEnvelope, ClientHelloEnvelope>,
   ): void {
     if (envelope.type === "mcp.access") {
@@ -970,8 +1053,7 @@ export function createBrokerServer(
         const removed = groups.removeIfJoined(targetClientId);
         if (removed !== undefined) {
           broadcastPresenceRemoved(removed.groupId, [
-            removed.user.memberId,
-            removed.agent.memberId,
+            ...membershipMembers(removed).map((member) => member.memberId),
           ]);
           const targetSocket = clients.get(targetClientId);
           if (targetSocket !== undefined) {
@@ -980,6 +1062,7 @@ export function createBrokerServer(
               message: "你已被群主移出该群组",
             });
             sendSnapshot(targetClientId, targetSocket);
+            if (targetSocket.kind === "web") targetSocket.end();
           }
         }
       }
@@ -1002,7 +1085,11 @@ export function createBrokerServer(
       for (const membership of removed) {
         mcp.revoke(membership.user.clientId);
         const targetSocket = clients.get(membership.user.clientId);
-        if (targetSocket !== undefined) sendSnapshot(membership.user.clientId, targetSocket);
+        if (targetSocket !== undefined) {
+          if (targetSocket.kind === "web") sendError(targetSocket, { code: "group_deleted", message: "群组已解散" });
+          sendSnapshot(membership.user.clientId, targetSocket);
+          if (targetSocket.kind === "web") targetSocket.end();
+        }
       }
       broadcastGroupsChanged();
       void refreshNetworkAccess();
@@ -1055,7 +1142,7 @@ export function createBrokerServer(
   }
 
   async function handleProactiveResult(
-    socket: Socket,
+    socket: ClientPeer,
     result: ProactiveResultPayload,
   ): Promise<void> {
     const accepted = await proactive?.result(result) ?? false;
@@ -1066,7 +1153,7 @@ export function createBrokerServer(
   }
 
   async function validateConfigKey(
-    socket: Socket,
+    socket: ClientPeer,
     requestId: string,
     apiKey: string,
     save: boolean,
@@ -1110,7 +1197,7 @@ export function createBrokerServer(
   }
 
   function sendConfigStatus(
-    socket: Socket,
+    socket: ClientPeer,
     requestId?: string,
     message?: string,
     backupPath?: string,
@@ -1206,7 +1293,7 @@ export function createBrokerServer(
 
   function publishProactiveAnswer(pending: PendingProactive, text: string): void {
     const source = groups.membershipForClient(pending.target.clientId);
-    if (source === undefined || source.groupId !== pending.groupId) return;
+    if (source === undefined || source.agent === undefined || source.groupId !== pending.groupId) return;
     const mention = parseMentions(text.trimStart());
     const resolved = mention?.names.map((name) => ({
       name, member: groups.findMemberByName(pending.groupId, name),
@@ -1343,7 +1430,7 @@ export function createBrokerServer(
   function handleGroupCreate(
     sessionKey: SessionKey,
     clientId: string,
-    socket: Socket,
+    socket: ClientPeer,
     requestId: string,
     payload: GroupCreatePayload,
   ): void {
@@ -1411,11 +1498,26 @@ export function createBrokerServer(
   function handleGroupJoin(
     sessionKey: SessionKey,
     clientId: string,
-    socket: Socket,
+    socket: ClientPeer,
     requestId: string,
     payload: GroupJoinPayload,
   ): void {
     try {
+      const current = groups.membershipForClient(clientId);
+      if (current !== undefined) {
+        if (socket.kind === "web" && current.groupId === payload.groupId) { sendSnapshot(clientId, socket); return; }
+        throw new GroupStateError("already_in_group", "当前 Session 已加入群组");
+      }
+      if (payload.userName !== undefined) {
+        // Validate before inserting a durable membership.
+        validateDisplayName(payload.userName);
+        if (payload.agentName !== undefined) {
+          validateDisplayName(payload.agentName);
+          if (payload.userName.toLocaleLowerCase("en-US") === payload.agentName.toLocaleLowerCase("en-US")) {
+            throw new GroupStateError("member_name_conflict", "用户名称与 Agent 名称不能相同");
+          }
+        }
+      }
       if (payload.agentDescription !== undefined) {
         payload.agentDescription = normalizeAgentDescription(payload.agentDescription);
       }
@@ -1436,8 +1538,8 @@ export function createBrokerServer(
         throw new GroupStateError("group_not_found", "群组不存在");
       }
       let userName: string;
-      let agentName: string;
-      let agentDescription: string;
+      let agentName: string | undefined;
+      let agentDescription: string | undefined;
       let proactiveEnabled = true;
       let membershipCredential: string | undefined;
       let isOwner = false;
@@ -1473,7 +1575,7 @@ export function createBrokerServer(
           });
           return;
         }
-        if (!stored.agentDescription) {
+        if (socket.kind === "pi" && (!stored.agentName || !stored.agentDescription)) {
           sendError(socket, {
             code: "membership_invalid",
             message: "旧成员身份需要重新加入并填写 Agent Description",
@@ -1491,7 +1593,7 @@ export function createBrokerServer(
         const normalizedInvite = payload.inviteCode === undefined
           ? undefined
           : normalizeInviteCode(payload.inviteCode);
-        const localEnrollment = normalizedInvite === undefined &&
+        const localEnrollment = socket.kind === "pi" && normalizedInvite === undefined &&
           isLoopback(socket.remoteAddress);
         const remoteEnrollment = !localEnrollment;
         if (remoteEnrollment && storedGroup.visibility !== "nearby") {
@@ -1513,7 +1615,7 @@ export function createBrokerServer(
         inviteFailures.delete(socket.remoteAddress ?? "unknown");
         membershipCredential = createCredential();
         const legacy = db().membership(payload.groupId, sessionKey);
-        if (legacy !== undefined && legacy.status === "active" && !legacy.agentDescription) {
+        if (socket.kind === "pi" && legacy !== undefined && legacy.agentName !== undefined && legacy.status === "active" && !legacy.agentDescription) {
           userName = legacy.userName;
           agentName = legacy.agentName;
           agentDescription = payload.agentDescription!;
@@ -1527,7 +1629,7 @@ export function createBrokerServer(
           userName = payload.userName!;
           agentName = payload.agentName!;
           agentDescription = payload.agentDescription!;
-          if (!db().isMemberNameAvailable(payload.groupId, userName, agentName)) {
+          if (!db().isMemberNameAvailable(payload.groupId, [userName, ...(agentName === undefined ? [] : [agentName])])) {
             throw new GroupStateError("member_name_conflict", "群组内名称已被使用");
           }
           db().insertMembership({
@@ -1536,7 +1638,7 @@ export function createBrokerServer(
             userName,
             agentName,
             agentDescription,
-            proactiveEnabled: true,
+            proactiveEnabled: socket.kind === "pi",
             credentialHash: hashSecret(membershipCredential),
           });
         }
@@ -1559,7 +1661,7 @@ export function createBrokerServer(
         }) as BrokerEnvelope);
       }
       sendSnapshot(clientId, socket);
-      broadcastPresence([membership.user, membership.agent], clientId);
+      broadcastPresence(membershipMembers(membership), clientId);
       broadcastGroupsChanged();
     } catch (error) {
       sendGroupError(socket, requestId, error);
@@ -1569,7 +1671,7 @@ export function createBrokerServer(
   function handleGroupLeave(
     sessionKey: SessionKey,
     clientId: string,
-    socket: Socket,
+    socket: ClientPeer,
     requestId: string,
   ): void {
     try {
@@ -1610,8 +1712,7 @@ export function createBrokerServer(
       db().deleteMembership(removed.groupId, deleteSessionKey);
     }
     broadcastPresenceRemoved(removed.groupId, [
-      removed.user.memberId,
-      removed.agent.memberId,
+      ...membershipMembers(removed).map((member) => member.memberId),
     ]);
     failRequestsForTarget(clientId, "target_offline");
     broadcastGroupsChanged();
@@ -1619,7 +1720,7 @@ export function createBrokerServer(
 
   function handleChatSend(
     clientId: string,
-    socket: Socket,
+    socket: ClientPeer,
     requestId: string,
     text: string,
   ): void {
@@ -1836,7 +1937,7 @@ export function createBrokerServer(
 
   function resendUnacknowledgedDeliveries(
     targetClientId: string,
-    socket: Socket,
+    socket: ClientPeer,
   ): void {
     for (const pending of pendingRequests.values()) {
       if (
@@ -1852,7 +1953,7 @@ export function createBrokerServer(
     }
   }
 
-  function resendPendingApprovals(targetClientId: string, socket: Socket): void {
+  function resendPendingApprovals(targetClientId: string, socket: ClientPeer): void {
     for (const pending of pendingRequests.values()) {
       if (
         pending.targetClientId === targetClientId &&
@@ -1865,7 +1966,7 @@ export function createBrokerServer(
 
   function handleRequestDecision(
     clientId: string,
-    socket: Socket,
+    socket: ClientPeer,
     requestId: string,
     approve: boolean,
   ): void {
@@ -1955,7 +2056,7 @@ export function createBrokerServer(
 
   function handleAgentResult(
     clientId: string,
-    socket: Socket,
+    socket: ClientPeer,
     result: AgentResultPayload,
   ): void {
     if (
@@ -2182,7 +2283,7 @@ export function createBrokerServer(
   }
 
   function sendResultAck(
-    socket: Socket,
+    socket: ClientPeer,
     requestId: string,
     accepted: boolean,
   ): void {
@@ -2239,7 +2340,7 @@ export function createBrokerServer(
 
   function handleChainDecision(
     clientId: string,
-    socket: Socket,
+    socket: ClientPeer,
     chainId: string,
     resume: boolean,
   ): void {
@@ -2438,7 +2539,7 @@ export function createBrokerServer(
     } as BrokerEnvelope;
   }
 
-  function sendSnapshot(clientId: string, socket: Socket): void {
+  function sendSnapshot(clientId: string, socket: ClientPeer): void {
     const group = groups.groupForClient(clientId);
     if (group === undefined) mcp.revoke(clientId);
     const sessionKey = sessionKeyForClient(clientId);
@@ -2446,15 +2547,15 @@ export function createBrokerServer(
     send(
       socket,
       createEnvelope("snapshot", {
-        ...(group === undefined ? {} : { mcpAccess: mcp.issue(clientId, group.groupId) }),
+        ...(group === undefined || socket.kind === "web" ? {} : { mcpAccess: mcp.issue(clientId, group.groupId) }),
         brokerInstanceId: instanceId,
         clientId,
         proactiveStatus: currentProactiveStatus(),
-        ...(groups.membershipForClient(clientId)?.agent.proactiveEnabled === undefined
+        ...(groups.membershipForClient(clientId)?.agent?.proactiveEnabled === undefined
           ? {}
           : {
               ownProactiveEnabled:
-                groups.membershipForClient(clientId)!.agent.proactiveEnabled,
+                groups.membershipForClient(clientId)!.agent!.proactiveEnabled,
             }),
         groups: isLoopback(socket.remoteAddress)
           ? groups.summaries()
@@ -2473,7 +2574,7 @@ export function createBrokerServer(
               },
               isOwner: storedGroup.ownerSessionKey === sessionKey,
               ownerRecoveryAvailable:
-                isLoopback(socket.remoteAddress) &&
+                socket.kind === "pi" && isLoopback(socket.remoteAddress) &&
                 storedGroup.ownerSessionKey !== sessionKey,
             }),
         members: group === undefined ? [] : snapshotMembers(group.groupId),
@@ -2537,7 +2638,7 @@ export function createBrokerServer(
           isOwner: db().storedGroup(groupId)?.ownerSessionKey === stored.sessionKey,
           ...(stored.status === "removed" ? { removed: true, online: false } : {}),
         },
-        {
+        ...(stored.agentName === undefined ? [] : [{
           ...(currentAgent === undefined ? {
             memberId: `agent:${stored.sessionKey}`,
             clientId: stored.sessionKey,
@@ -2554,7 +2655,7 @@ export function createBrokerServer(
           stableSessionKey: stored.sessionKey,
           lastActiveAt: stored.lastActiveAt,
           ...(stored.status === "removed" ? { removed: true, online: false } : {}),
-        },
+        }]),
       );
     }
     return result;
@@ -2566,7 +2667,7 @@ export function createBrokerServer(
 
   function requireOwner(
     sessionKey: SessionKey,
-    socket: Socket,
+    socket: ClientPeer,
     requestId: string,
     payload: { groupId: string; ownerCredential: string },
   ): boolean {
@@ -2596,7 +2697,7 @@ export function createBrokerServer(
   function disconnectRemoteGroupMembers(groupId: string): void {
     for (const targetClientId of groups.onlineClientIds(groupId)) {
       const targetSocket = clients.get(targetClientId);
-      if (targetSocket === undefined || isLoopback(targetSocket.remoteAddress)) continue;
+      if (targetSocket === undefined || (targetSocket.kind === "pi" && isLoopback(targetSocket.remoteAddress))) continue;
       const removed = groups.removeIfJoined(targetClientId);
       if (removed === undefined) continue;
       sendError(targetSocket, {
@@ -2604,6 +2705,7 @@ export function createBrokerServer(
         message: "群主已停止向附近设备开放这个群组",
       });
       sendSnapshot(targetClientId, targetSocket);
+      if (targetSocket.kind === "web") targetSocket.end();
     }
     broadcastGroupsChanged();
     scheduleIdleShutdown();
@@ -2667,7 +2769,7 @@ export function createBrokerServer(
   }
 
   function sendGroupError(
-    socket: Socket,
+    socket: ClientPeer,
     requestId: string,
     error: unknown,
   ): void {
@@ -2686,7 +2788,7 @@ export function createBrokerServer(
     });
   }
 
-  function sendError(socket: Socket, payload: ErrorPayload): void {
+  function sendError(socket: ClientPeer, payload: ErrorPayload): void {
     send(socket, createEnvelope("error", payload) as BrokerEnvelope);
   }
 
@@ -2741,8 +2843,12 @@ export function createBrokerServer(
         server.listen({ ...listen, exclusive: true });
       });
       await mcp.start();
+      await refreshNetworkAccess();
+      await web.start();
       await writeBrokerRuntimeMetadata(dbPath, {
         mcpPort: mcp.port,
+        webPort: web.port,
+        webError: web.error,
         brokerId: stableBrokerId,
         brokerInstanceId: instanceId,
         pid: process.pid,
@@ -2753,7 +2859,6 @@ export function createBrokerServer(
         buildChannel: PI_COMMS_BUILD_CHANNEL,
         startedAt: Date.now(),
       });
-      await refreshNetworkAccess();
       if (mode === "lan-host") {
         networkRefreshTimer = setInterval(() => {
           const networkKey = primaryOrdinaryNetwork()?.networkKey;
@@ -2772,6 +2877,7 @@ export function createBrokerServer(
       closing = false;
       scheduleIdleShutdown();
     } catch (error) {
+      await web.close();
       await mcp.close();
       if (server.listening) {
         await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
@@ -2806,6 +2912,12 @@ export function createBrokerServer(
         await networkAccessStore.isConfirmed(network)
       );
     networkAccessAddress = networkAccessAllowed ? network?.address : undefined;
+    for (const socket of clients.values()) {
+      if (socket.kind === "web" && !webAllowed(socket.remoteAddress)) {
+        sendError(socket, { code: "network_unavailable", message: "当前网络已停止允许手机加入" });
+        socket.end();
+      }
+    }
     const hasNearbyGroups = database?.storedGroups()
       .some((group) => group.visibility === "nearby") === true;
     if (networkAccessAllowed && publishMdns && hasNearbyGroups) {
@@ -2850,6 +2962,7 @@ export function createBrokerServer(
       session.socket?.destroy();
     }
     clients.clear();
+    await web.close();
     await mcp.close();
     sessions.clear();
     pendingRequests.clear();
@@ -2905,6 +3018,8 @@ export function createBrokerServer(
 
   return {
     get mcpPort() { return mcp.port; },
+    get webPort() { return web.port; },
+    get webError() { return web.error; },
     get endpoint() { return endpoint; },
     dbPath,
     instanceId,
@@ -2939,10 +3054,8 @@ function parseMention(text: string): { name: string; text?: string } | undefined
     : { name: parsed.names[0]!, ...(parsed.text === undefined ? {} : { text: parsed.text }) };
 }
 
-function send(socket: Socket, envelope: Envelope): void {
-  if (!socket.destroyed) {
-    socket.write(encodeEnvelope(envelope));
-  }
+function send(socket: ClientPeer, envelope: Envelope): void {
+  socket.send(envelope);
 }
 
 function isLoopbackAddress(address: string | undefined): boolean {

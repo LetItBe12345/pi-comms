@@ -26,7 +26,44 @@ describe("Broker SQLite", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  it("初始化 v11 Schema、WAL 和 FULL，并恢复群组", () => {
+  it("v11 rebuild 保留已有 Pi 成员，并持久化纯人类成员", () => {
+    const store = new BrokerDatabase(dbPath);
+    store.insertGroup({ groupId: "g", groupName: "迁移测试" });
+    store.insertMembership({ groupId: "g", sessionKey: SESSION_KEY, userName: "Alice", agentName: "Alice-Pi", agentDescription: "原有助手", proactiveEnabled: true, credentialHash: "pi-secret" });
+    const before = store.membership("g", SESSION_KEY);
+    store.close();
+    const raw = new Database(dbPath);
+    raw.exec(`
+      ALTER TABLE group_memberships RENAME TO memberships_old;
+      CREATE TABLE group_memberships (
+        group_id TEXT NOT NULL REFERENCES groups(group_id), session_key TEXT NOT NULL,
+        user_name TEXT NOT NULL, normalized_user_name TEXT NOT NULL,
+        agent_name TEXT NOT NULL, normalized_agent_name TEXT NOT NULL,
+        agent_description TEXT NOT NULL DEFAULT '', proactive_enabled INTEGER NOT NULL DEFAULT 1,
+        credential_hash TEXT NOT NULL UNIQUE, status TEXT NOT NULL CHECK (status IN ('active', 'removed')),
+        created_at INTEGER NOT NULL, last_active_at INTEGER NOT NULL, PRIMARY KEY (group_id, session_key)
+      );
+      INSERT INTO group_memberships SELECT * FROM memberships_old;
+      DROP TABLE memberships_old;
+      PRAGMA user_version = 11;
+    `);
+    raw.close();
+    const reopened = new BrokerDatabase(dbPath);
+    expect(reopened.membership("g", SESSION_KEY)).toEqual(before);
+    const webKey = createSessionKey("phone", "web");
+    reopened.insertMembership({ groupId: "g", sessionKey: webKey, userName: "Bob", proactiveEnabled: false, credentialHash: "web-secret" });
+    expect(reopened.membershipByCredential("g", "web-secret")).toMatchObject({ userName: "Bob", agentName: undefined, agentDescription: undefined, proactiveEnabled: false });
+    expect(reopened.isMemberNameAvailable("g", ["alice-pi"])).toBe(false);
+    expect(reopened.isMemberNameAvailable("g", ["bob"])).toBe(false);
+    reopened.touchMembership("g", webKey);
+    reopened.setMembershipStatus("g", webKey, "removed");
+    expect(reopened.membership("g", webKey)?.status).toBe("removed");
+    reopened.close();
+    const restored = new BrokerDatabase(dbPath);
+    expect(restored.membership("g", webKey)?.status).toBe("removed");
+    restored.close();
+  });
+  it("初始化 v12 Schema、WAL 和 FULL，并恢复群组", () => {
     const store = new BrokerDatabase(dbPath);
     expect(store.configuration()).toEqual({
       journalMode: "wal",
@@ -36,7 +73,7 @@ describe("Broker SQLite", () => {
     store.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(11);
+    expect(raw.pragma("user_version", { simple: true })).toBe(12);
     expect(raw.pragma("journal_mode", { simple: true })).toBe("wal");
     const tables = raw
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -146,7 +183,7 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(11);
+    expect(raw.pragma("user_version", { simple: true })).toBe(12);
     const columns = raw
       .prepare("PRAGMA table_info(agent_requests)")
       .all() as Array<{ name: string }>;
@@ -198,7 +235,7 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(11);
+    expect(raw.pragma("user_version", { simple: true })).toBe(12);
     expect((raw.prepare(
       "SELECT initiator_session_key AS value FROM agent_requests WHERE request_id = ?",
     ).get("release-request") as { value: string }).value).toBe(
@@ -241,7 +278,7 @@ describe("Broker SQLite", () => {
     migrated.close();
 
     const raw = new Database(dbPath, { readonly: true });
-    expect(raw.pragma("user_version", { simple: true })).toBe(11);
+    expect(raw.pragma("user_version", { simple: true })).toBe(12);
     raw.close();
   });
 

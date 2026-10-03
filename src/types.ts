@@ -25,8 +25,8 @@ export interface GroupMembership {
   groupId: string;
   sessionKey: string;
   userName: string;
-  agentName: string;
-  agentDescription: string;
+  agentName?: string;
+  agentDescription?: string;
   proactiveEnabled: boolean;
   isOwner: boolean;
   removed: boolean;
@@ -69,7 +69,7 @@ export interface GroupParticipantContext {
     isOwner: boolean;
     online: boolean;
   };
-  agent: {
+  agent?: {
     name: string;
     description: string;
     online: boolean;

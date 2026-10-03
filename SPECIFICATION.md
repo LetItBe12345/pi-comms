@@ -47,7 +47,7 @@ B 的 Pi Agent 处理消息
 - mDNS 自动发现附近群组，发现失败时使用完整邀请信息加入。
 - 群主、可选的按群邀请码、长期成员和群组级附近可见范围。
 - 一个 Pi Session 对应一个用户，一个用户同时只加入一个群组。
-- 用户和 Agent 作为两个独立群成员出现。
+- Pi 用户和 Agent 作为两个独立群成员出现；手机 Web 用户只有人类成员。
 - 人对人、人对 Agent、Agent 对 Agent 通信。
 - 所有群聊消息公开显示。
 - 显式 `@Agent` 消息注入目标 Agent；阶段 18 起，用户明确开启 Proactive 后，Broker 也可以按第 19 节主动邀请最多一个 Agent。
@@ -160,7 +160,7 @@ Nearby Pi Extension ─────── LAN TCP ───────┘
 
 - 群组信息、群主凭证摘要、可见范围、可选的群组邀请码摘要和后台设置。
 - 长期成员、成员凭证摘要、群组内名称、最后活跃时间和移出状态。
-- 每个 membership 的 Agent Description 和最后同步的 Proactive 状态。
+- Pi membership 的 Agent Description 和最后同步的 Proactive 状态；Web membership 没有 Agent，Proactive 固定关闭。
 - 公开群聊消息。
 - 每群单调递增的 `groupSeq`。
 - 消息状态。
@@ -279,7 +279,7 @@ interface AgentRequest {
 
 ## 9. 协议
 
-- 当前协议版本为 `7`。不同协议版本不允许混用，握手返回明确的 `protocol_mismatch`。
+- 当前协议版本为 `9`。不同协议版本不允许混用，握手返回明确的 `protocol_mismatch`。
 - 每台设备在 `~/.pi/comms/device-id` 保存稳定 UUID。
 - Broker 内部使用 `JSON.stringify([deviceId, sessionId])` 作为统一 `SessionKey`。
 - `clientId` 只表示当前 Broker 实例中的逻辑客户端；群成员 ID 仍基于 `clientId`。
@@ -713,7 +713,7 @@ pi-comms/
 
 ### 19.1 Agent Description 与授权
 
-- 创建或加入群组时必须填写 Agent Description。程序自动 trim，将换行和连续空白合并为一个空格，并自动截断到 240 个字符；处理后为空才要求重新填写。
+- Pi 创建或加入群组时必须填写 Agent Description。程序自动 trim，将换行和连续空白合并为一个空格，并自动截断到 240 个字符；处理后为空才要求重新填写。
 - Description 属于当前 Pi Session 在当前群的 membership。加入后不可编辑；只有主动离群并重新加入时才能重新填写。
 - Description 对已入群成员公开，离线后继续可见。附近发现、完整邀请信息和未入群客户端不得获得成员 Description。
 - 旧 membership 缺少 Description 时不自动从 cwd、仓库名或 `AGENTS.md` 生成。用户下次打开 `/comms` 补填前保持未入群。
@@ -850,7 +850,7 @@ DeepSeek 实现以官方文档为准：
 
 ### 21.1 角色目录
 
-- Broker 为群内 Coding Agent 提供结构化 `GroupParticipantContext[]`。每项对应一个长期 membership，并明确配对真人用户和所属 Agent。
+- Broker 为群内 Coding Agent 提供结构化 `GroupParticipantContext[]`。每项对应一个长期 membership；Pi 用户配对所属 Agent，Web 用户的 `agent` 字段缺省。
 - 用户字段包含名称、是否群主和在线状态。Agent 字段包含名称、Description、在线状态、`idle | busy | offline` 活动状态，以及统一协作可用状态。
 - 协作可用状态只允许 `available | approval_required | busy | offline | unavailable`。它用于帮助 Agent 选择协作者，不承诺实际投递一定成功。
 - 目录包含在线与离线的有效长期成员，也包含当前接收 Agent 自己。`status=removed` 的 membership 不得进入目录。
@@ -917,3 +917,21 @@ Broker 在已认证 TCP Session 入群后签发独立于 resumeToken 的五分�
 Tool 不接受 groupId 或其他未声明参数。公开消息只含 groupSeq、messageId、timestamp、senderName、senderType、text、mentionIds，以及存在时的 chainId、round。不得返回请求状态、凭证、API Key、私有 Session 或 Proactive 状态。Resource 使用相同的鉴权和字段过滤。MCP 不提供写 Tool；读取不更新 lastSeenGroupSeq、Proactive cursor/cooldown、ACK、投递或群聊状态。
 
 显式 AgentRequestPayload 增加 sourceGroupSeq，指向触发请求的公开消息；该值随请求持久化，Broker 重启后保留。原有 Remote Request、Proactive Invitation 和上下文注入保留。Agent 可以使用 throughSeq: sourceGroupSeq 回看触发点之前的历史。
+
+
+## 手机 Web 群聊（阶段 27）
+
+- Broker 和 SQLite 只运行在 macOS / Linux 主机。手机 MVP 面向 Android Chrome，同一普通 IPv4 LAN；手机不运行 Pi、Agent 或 Broker，不创建和管理群组。
+- `Ctrl+G → 附近加入 → 手机扫码加入` 显示二维码与网址。local 群先复用网络确认和 local → lan-host 的开放流程，以直接加入方式开放。创建群组不强制显示二维码，原 Pi 完整加入信息继续保留。
+- Web HTTP / WebSocket 内置于同一 Broker，固定端口 `43128`（测试允许 `0`）。端口占用只禁用 Web，runtime metadata 和 `broker.ready` 提供 `webPort` / `webError`，TUI 显示明确错误。TCP 继续使用 `43127`。
+- Web 只允许 lan-host 模式、已确认普通网络和 nearby 群。浏览器实测可使用同一主机的 loopback，但仍检查模式、网络开放状态、群可见性和邀请码；loopback 不得绕过 Web 首次入群的邀请码。
+- 邀请网址为 `http://<普通 IPv4>:43128/#/join/<groupId>`；需邀请码时追加 fragment 参数 `?invite=<code>`。二维码复用现有邀请码，不新增 invite token 或邀请数据库。轮换后旧二维码不能创建新成员，已有成员凭证仍有效。
+- 一个二维码供多人重复扫描。每个浏览器 profile 保存随机 `deviceId`，按群保存 `sessionId`、`membershipCredential` 和用户名。同一 origin、profile、群只有一个长期 Web 身份；首次输入用户名，后续刷新、再扫码和 Broker 重启使用凭证恢复。
+- Web membership 只有 user，不伪造 Agent。用户名不能与现有 user 或 agent 冲突。SQLite v11 → v12 rebuild 将 Agent 三列改为 nullable，保留已有 Pi 行、凭证、状态和时间。Web Proactive 固定关闭，角色目录显示“Web 用户（无 Agent）”。Broker 协议升为 9。
+- 浏览器使用受限协议：`web.hello`、`group.join`、`chat.send`、`group.leave`、`chain.continue`、`chain.end`、`ping`。不开放建群、群主管理、Agent result、Proactive、Broker 设置和 MCP access。TCP / WebSocket 使用 ClientPeer adapter 直接共享 Broker 状态逻辑，不通过 loopback TCP 转发。
+- 新标签页验证长期凭证后接管同一 Web Session，旧页显示“连接已在其他标签页接管”并禁用发送、停止重连；Pi 的 session_in_use 行为保持不变。
+- 页面显示群名、成员在线状态、最近 100 条公开消息，支持普通文本和现有 `@用户` / `@Agent` 语义。消息在 SQLite 落盘后广播。页面断网时保留历史、禁用发送、恢复网络后自动重连。
+- 关闭页面、刷新、锁屏或短暂断线只算离线，不删除长期 membership。显式“退出群组”需二次确认，Broker 删除该 membership，浏览器清除该群凭证并返回 Join；再次扫码需重新输入用户名。
+- 自己发起的 Agent chain 暂停时显示“继续 / 结束”，复用 initiatorSessionKey 和同群校验，不能操作其他 Session 的 chain。
+- 群改为 local、群解散、成员被移出或普通网络失效时，对应 Web 连接收到明确错误并关闭。手机在线也保持 Broker 存活，最后一个在线成员离线后复用 5 分钟 idle shutdown 和 keepAvailableWhenEmpty。
+- 不支持公网中继、HTTPS、PWA、文件、图片、语音、推送、手机多群首页或 Windows Broker。

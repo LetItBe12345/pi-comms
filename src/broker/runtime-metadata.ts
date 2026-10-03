@@ -11,6 +11,8 @@ export interface BrokerRuntimeMetadata {
   host: string;
   port: number;
   mcpPort?: number;
+  webPort?: number;
+  webError?: string;
   mode: BrokerMode;
   appVersion?: string;
   buildChannel?: PiCommsBuildChannel;

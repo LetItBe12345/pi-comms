@@ -71,8 +71,10 @@ export interface ChatViewActions {
   renameGroup?(groupName: string): string | undefined;
   rotateGroupInvite?(): string | undefined;
   showGroupInvitation?(): void;
+  mobileInvitation?(): Promise<{ url: string; qr: string }>;
   confirmAutostart?(): Promise<boolean>;
-  confirmNearbyAccess?(): Promise<boolean>;
+  nearbyAccessNeedsConfirmation?(): Promise<boolean>;
+  confirmNearbyAccess?(confirmed?: boolean): Promise<boolean>;
   updateGroupAvailability?(
     keepAvailableWhenEmpty: boolean,
     openAtLogin: boolean,
@@ -160,8 +162,13 @@ export class ChatView implements Component, Focusable {
     | "delete-name"
     | "member-action"
     | "rename"
+    | "nearby-confirm"
+    | "mobile-invitation"
     | "help"
     | undefined;
+  #mobileInvitation: { url: string; qr: string } | undefined;
+  #pendingMobileInvitation = false;
+  #nearbyConfirmList: SelectList | undefined;
   #permission: AgentPermission;
   #proactiveEnabled = true;
   #proactiveStatus: SnapshotPayload["proactiveStatus"] = "unconfigured";
@@ -348,6 +355,10 @@ export class ChatView implements Component, Focusable {
     this.#permissionList = this.#createPermissionList();
     this.#groupPanelList = this.#createGroupPanelList();
     if (snapshot.group !== undefined) {
+      if (this.#pendingMobileInvitation && snapshot.groupSettings?.visibility === "nearby") {
+        this.#pendingMobileInvitation = false;
+        void this.#showMobileInvitation();
+      }
       this.#stage = "chat";
       this.#initialGroupName = snapshot.group.groupName;
       this.#pendingSetup = undefined;
@@ -860,8 +871,40 @@ export class ChatView implements Component, Focusable {
     ].map((line) => truncateToWidth(line, width));
   }
 
+  async #showMobileInvitation(): Promise<void> {
+    try {
+      const invitation = await this.#actions.mobileInvitation?.();
+      if (!invitation) throw new Error("手机入口不可用");
+      this.#mobileInvitation = invitation;
+      this.#panel = "mobile-invitation";
+      this.#error = undefined;
+    } catch (error) {
+      this.#error = error instanceof Error ? error.message : String(error);
+    }
+    this.#syncFocus();
+    this.#tui.requestRender();
+  }
+
   #renderPanel(width: number): string[] {
+    if (this.#panel === "mobile-invitation" && this.#mobileInvitation) {
+      const { url, qr } = this.#mobileInvitation;
+      const rows = qr.replace(/\n$/, "").split("\n");
+      return [
+        this.#theme.fg("accent", `手机扫码加入「${this.#snapshot?.group?.groupName ?? ""}」`),
+        "手机与主机连接同一普通 Wi-Fi。",
+        "",
+        ...(rows.every((row) => visibleWidth(row) <= width)
+          ? rows.map((row) => `\x1b[30;47m${row}\x1b[0m`)
+          : ["终端太窄，请加宽窗口或直接打开下方网址。"]),
+        "",
+        ...wrapTextWithAnsi(url, width),
+        "",
+        "Esc 返回",
+      ];
+    }
+
     const title =
+      this.#panel === "nearby-confirm" ? "允许附近设备看到这个群组？" :
       this.#panel === "permission" ? "Agent 控制" :
       this.#panel === "pending" ? "待批准请求" :
       this.#panel === "decision" ? "处理请求" :
@@ -919,6 +962,7 @@ export class ChatView implements Component, Focusable {
   }
 
   #activePanel(): (Component & Partial<Focusable>) | undefined {
+    if (this.#panel === "nearby-confirm") return this.#nearbyConfirmList;
     if (this.#panel === "permission") return this.#permissionList;
     if (this.#panel === "pending") return this.#pendingList;
     if (this.#panel === "decision") return this.#decisionList;
@@ -934,7 +978,9 @@ export class ChatView implements Component, Focusable {
   }
 
   #closePanel(): void {
-    if (this.#panel === "decision") this.#panel = "pending";
+    if (this.#panel === "nearby-confirm") { this.#pendingMobileInvitation = false; this.#panel = "group"; }
+    else if (this.#panel === "mobile-invitation") this.#panel = "group";
+    else if (this.#panel === "decision") this.#panel = "pending";
     else if (this.#panel === "chain-decision") this.#panel = "chains";
     else if (this.#panel === "group-delete" || this.#panel === "local-confirm") {
       this.#panel = "group";
@@ -1145,7 +1191,7 @@ export class ChatView implements Component, Focusable {
         return {
           value: `member:${member.memberId}`,
           label: `${state} · ${member.displayName}${member.isOwner ? " [群主]" : ""}`,
-          description: `Agent：${agent?.displayName ?? "未命名"}${
+          description: `${agent ? `Agent：${agent.displayName}` : "Web 用户（无 Agent）"}${
             agent?.agentDescription ? ` · ${agent.agentDescription}` : ""
           }${lastActive}`,
         };
@@ -1188,6 +1234,11 @@ export class ChatView implements Component, Focusable {
           ? "包含这个群的邀请码"
           : "对方可以直接加入",
       }] : []),
+      {
+        value: "mobile-invitation",
+        label: "手机扫码加入",
+        description: settings.visibility === "nearby" ? "显示手机二维码和网址" : "先允许附近加入，再显示二维码",
+      },
       {
         value: "visibility",
         label: settings.visibility === "nearby"
@@ -1252,6 +1303,13 @@ export class ChatView implements Component, Focusable {
         return;
       }
       if (item.value === "network-status") return;
+      if (item.value === "mobile-invitation") {
+        if (settings?.visibility === "local") {
+          this.#pendingMobileInvitation = true;
+          void this.#confirmAndEnableNearby().then((enabled) => { if (!enabled && this.#panel !== "nearby-confirm") this.#pendingMobileInvitation = false; });
+        } else void this.#showMobileInvitation();
+        return;
+      }
       if (item.value === "show-invitation") {
         this.#actions.showGroupInvitation?.();
         return;
@@ -1359,11 +1417,30 @@ export class ChatView implements Component, Focusable {
     this.#tui.requestRender();
   }
 
-  async #confirmAndEnableNearby(): Promise<void> {
-    if (await this.#actions.confirmNearbyAccess?.() !== true) return;
+  async #confirmAndEnableNearby(confirmed = false): Promise<boolean> {
+    if (!confirmed && await this.#actions.nearbyAccessNeedsConfirmation?.()) {
+      const list = this.#createSelectList([
+        { value: "yes", label: "允许", description: "只使用当前普通网络；VPN 开关不改变此设置" },
+        { value: "no", label: "取消", description: "保持仅这台电脑可用" },
+      ]);
+      list.onSelect = (item) => {
+        this.#panel = "group";
+        if (item.value === "yes") {
+          void this.#confirmAndEnableNearby(true).then((enabled) => { if (!enabled) this.#pendingMobileInvitation = false; });
+        } else this.#pendingMobileInvitation = false;
+        this.#syncFocus(); this.#tui.requestRender();
+      };
+      list.onCancel = () => this.#closePanel();
+      this.#nearbyConfirmList = list;
+      this.#panel = "nearby-confirm";
+      this.#syncFocus(); this.#tui.requestRender();
+      return false;
+    }
+    if (await this.#actions.confirmNearbyAccess?.(confirmed) !== true) return false;
     const id = this.#actions.updateGroupVisibility?.("nearby");
     this.#error = id === undefined ? "操作尚未发送，请检查连接" : "正在开放附近加入…";
     this.#tui.requestRender();
+    return id !== undefined;
   }
 
   #createMemberActionList(): SelectList {
@@ -1377,7 +1454,7 @@ export class ChatView implements Component, Focusable {
           ? this.#snapshot?.groupSettings?.inviteRequired
             ? "对方仍需使用当前邀请码"
             : "对方之后可以直接重新加入"
-          : `同时移出 ${member.displayName} 和其 Agent`,
+          : `移出 ${member.displayName}${[...this.#members.values()].some((candidate) => candidate.type === "agent" && candidate.stableSessionKey === member.stableSessionKey) ? " 和其 Agent" : ""}`,
       },
     ]);
     list.onSelect = (item) => {

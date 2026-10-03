@@ -55,6 +55,8 @@ export class BrokerClient {
   #resumeToken: string | undefined;
   #brokerInstanceId: string | undefined;
   #brokerId: string | undefined;
+  webPort: number | undefined;
+  webError: string | undefined;
   #socket: Socket | undefined;
   #connectTask: Promise<boolean> | undefined;
   #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -299,6 +301,8 @@ export class BrokerClient {
               return;
             }
             this.#brokerId = message.payload.brokerId;
+            this.webPort = message.payload.webPort;
+            this.webError = message.payload.webError;
             if (
               this.#brokerInstanceId !== undefined &&
               this.#brokerInstanceId !== message.payload.brokerInstanceId

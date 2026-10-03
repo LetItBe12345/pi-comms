@@ -152,6 +152,56 @@ beforeAll(() => {
 });
 
 describe("最小群聊 TUI", () => {
+  it("手机邀请复用附近加入入口，QR 可返回，纯人类成员不显示假 Agent", async () => {
+    const mobileInvitation = vi.fn(async () => ({ url: "http://192.168.1.2:43128/#/join/group-a", qr: "██  ██\n██  ██\n" }));
+    const { view } = createView({ mobileInvitation });
+    const state = snapshot();
+    state.isOwner = true;
+    state.groupSettings = { groupId: "group-a", groupName: "开发组", visibility: "nearby", inviteRequired: false, keepAvailableWhenEmpty: false, openAtLogin: false };
+    state.members.push({ memberId: "user:web", clientId: "web", stableSessionKey: "web", type: "user", displayName: "Bob", groupId: "group-a", online: true });
+    view.applySnapshot(state); view.setConnection("connected");
+    view.handleInput("\x07"); view.handleInput("\x1b[B"); view.handleInput("\r");
+    expect(view.render(100).join("\n")).toContain("手机扫码加入");
+    view.handleInput("\x1b[B"); view.handleInput("\x1b[B"); view.handleInput("\r");
+    await flushRender();
+    expect(mobileInvitation).toHaveBeenCalledOnce();
+    expect(view.render(100).join("\n")).toContain("http://192.168.1.2:43128/#/join/group-a");
+    view.handleInput("\x1b"); expect(view.render(100).join("\n")).toContain("复制加入信息");
+    view.handleInput("\x1b"); view.handleInput("\x1b[B"); view.handleInput("\x1b[B"); view.handleInput("\r");
+    expect(view.render(100).join("\n")).toContain("Web 用户（无 Agent）");
+    expect(view.render(100).join("\n")).not.toContain("未命名");
+  });
+  it("首次网络确认留在 ChatView，取消不开放，允许后继续显示 QR", async () => {
+    const mobileInvitation = vi.fn(async () => ({ url: "http://192.168.1.2:43128/#/join/group-a", qr: "██\n" }));
+    const confirmNearbyAccess = vi.fn(async () => true), updateGroupVisibility = vi.fn(() => "visibility-request");
+    const { view } = createView({ mobileInvitation, nearbyAccessNeedsConfirmation: async () => true, confirmNearbyAccess, updateGroupVisibility });
+    const state = snapshot(); state.isOwner = true;
+    state.groupSettings = { groupId: "group-a", groupName: "开发组", visibility: "local", inviteRequired: false, keepAvailableWhenEmpty: false, openAtLogin: false };
+    view.applySnapshot(state); view.setConnection("connected");
+    view.handleInput("\x07"); view.handleInput("\x1b[B"); view.handleInput("\r");
+    view.handleInput("\x1b[B"); view.handleInput("\r"); await flushRender();
+    expect(view.render(100).join("\n")).toContain("允许附近设备看到这个群组？");
+    expect(confirmNearbyAccess).not.toHaveBeenCalled();
+    view.handleInput("\x1b"); expect(updateGroupVisibility).not.toHaveBeenCalled();
+    view.handleInput("\r"); await flushRender(); view.handleInput("\r"); await flushRender();
+    expect(confirmNearbyAccess).toHaveBeenCalledWith(true); expect(updateGroupVisibility).toHaveBeenCalledWith("nearby");
+    state.groupSettings.visibility = "nearby"; view.applySnapshot(state); await flushRender();
+    expect(mobileInvitation).toHaveBeenCalledOnce(); expect(view.render(100).join("\n")).toContain("http://192.168.1.2");
+  });
+  it("local 群先确认附近加入，开放成功的快照到达后才显示二维码", async () => {
+    const mobileInvitation = vi.fn(async () => ({ url: "http://192.168.1.2:43128/#/join/group-a", qr: "██\n" }));
+    const confirmNearbyAccess = vi.fn(async () => true), updateGroupVisibility = vi.fn(() => "visibility-request");
+    const { view } = createView({ mobileInvitation, confirmNearbyAccess, updateGroupVisibility });
+    const state = snapshot(); state.isOwner = true;
+    state.groupSettings = { groupId: "group-a", groupName: "开发组", visibility: "local", inviteRequired: false, keepAvailableWhenEmpty: false, openAtLogin: false };
+    view.applySnapshot(state); view.setConnection("connected");
+    view.handleInput("\x07"); view.handleInput("\x1b[B"); view.handleInput("\r");
+    view.handleInput("\x1b[B"); view.handleInput("\r"); await flushRender();
+    expect(confirmNearbyAccess).toHaveBeenCalledOnce(); expect(updateGroupVisibility).toHaveBeenCalledWith("nearby");
+    expect(mobileInvitation).not.toHaveBeenCalled();
+    state.groupSettings.visibility = "nearby"; view.applySnapshot(state); await flushRender();
+    expect(mobileInvitation).toHaveBeenCalledOnce(); expect(view.render(100).join("\n")).toContain("http://192.168.1.2");
+  });
   it("群主与普通成员显示清楚的 Ctrl+G 和快捷键帮助", () => {
     const { view } = createView();
     const ownerSnapshot = snapshot();

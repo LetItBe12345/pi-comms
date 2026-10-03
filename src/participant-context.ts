@@ -14,8 +14,8 @@ export function participantContext(members: Iterable<Member>): GroupParticipantC
     pairs.set(key, pair);
   }
   return [...pairs.values()]
-    .filter((pair): pair is { user: Member; agent: Member } =>
-      pair.user !== undefined && pair.agent !== undefined
+    .filter((pair): pair is { user: Member; agent?: Member } =>
+      pair.user !== undefined
     )
     .map(({ user, agent }) => ({
       user: {
@@ -23,7 +23,7 @@ export function participantContext(members: Iterable<Member>): GroupParticipantC
         isOwner: user.isOwner === true,
         online: user.online,
       },
-      agent: {
+      ...(agent === undefined ? {} : { agent: {
         name: agent.displayName,
         description: agent.agentDescription ?? "",
         online: agent.online,
@@ -31,7 +31,7 @@ export function participantContext(members: Iterable<Member>): GroupParticipantC
           ? agent.agentStatus ?? "idle" as const
           : "offline" as const,
         availability: availability(agent),
-      },
+      } }),
     }))
     .sort((left, right) =>
       Number(right.user.isOwner) - Number(left.user.isOwner) ||
