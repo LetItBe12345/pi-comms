@@ -26,7 +26,7 @@ export const PI_COMMS_BUILD_CHANNEL: PiCommsBuildChannel =
   process.env.PI_COMMS_BUILD_CHANNEL === "development"
     ? "development"
     : "release";
-export const BROKER_PROTOCOL_VERSION = 8;
+export const BROKER_PROTOCOL_VERSION = 9;
 export const MAX_JSONL_FRAME_BYTES = 8 * 1024 * 1024;
 
 export interface BrokerProbePayload {
@@ -43,6 +43,8 @@ export interface BrokerReadyPayload {
   appVersion: string;
   buildChannel: PiCommsBuildChannel;
   requestId: string;
+  webPort?: number;
+  webError?: string;
 }
 
 export interface McpAccessPayload {

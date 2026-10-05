@@ -3,6 +3,9 @@ import { participantContext } from "../src/participant-context.js";
 import type { Member } from "../src/types.js";
 
 describe("群组角色目录", () => {
+  it("纯人类 Web 用户保留在目录中", () => {
+    expect(participantContext([user("web", "Bob", true)])).toEqual([{ user: { name: "Bob", isOwner: false, online: true } }]);
+  });
   it("配对用户与 Agent，保留角色状态并排除 removed", () => {
     const members: Member[] = [
       user("owner", "Alice", true, true),
@@ -23,7 +26,7 @@ describe("群组角色目录", () => {
     expect(directory.map((entry) => entry.user.name)).toEqual([
       "Alice", "Bob", "Carol", "Dave", "Eve",
     ]);
-    expect(directory.map((entry) => entry.agent.availability)).toEqual([
+    expect(directory.map((entry) => entry.agent!.availability)).toEqual([
       "available", "busy", "approval_required", "unavailable", "offline",
     ]);
     expect(directory[0]).toMatchObject({

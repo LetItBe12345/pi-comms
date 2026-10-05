@@ -66,8 +66,8 @@ export interface StoredMembership {
   groupId: string;
   sessionKey: SessionKey;
   userName: string;
-  agentName: string;
-  agentDescription: string;
+  agentName?: string;
+  agentDescription?: string;
   proactiveEnabled: boolean;
   credentialHash: string;
   status: "active" | "removed";
@@ -344,23 +344,17 @@ export class BrokerDatabase {
 
   isMemberNameAvailable(
     groupId: string,
-    userName: string,
-    agentName: string,
+    names: string[],
     exceptSessionKey?: SessionKey,
   ): boolean {
-    const names = [normalizeName(userName), normalizeName(agentName)];
+    const normalized = names.map(normalizeName);
+    const placeholders = normalized.map(() => "?").join(", ");
     const row = this.#db.prepare(
-      `SELECT 1
-         FROM group_memberships
-        WHERE group_id = ?
-          AND status = 'active'
-          AND session_key <> ?
-          AND (
-            normalized_user_name IN (?, ?)
-            OR normalized_agent_name IN (?, ?)
-          )
-        LIMIT 1`,
-    ).get(groupId, exceptSessionKey ?? "", ...names, ...names);
+      `SELECT 1 FROM group_memberships
+        WHERE group_id = ? AND status = 'active' AND session_key <> ?
+          AND (normalized_user_name IN (${placeholders})
+            OR normalized_agent_name IN (${placeholders})) LIMIT 1`,
+    ).get(groupId, exceptSessionKey ?? "", ...normalized, ...normalized);
     return row === undefined;
   }
 
@@ -475,10 +469,10 @@ export class BrokerDatabase {
       membership.sessionKey,
       membership.userName,
       normalizeName(membership.userName),
-      membership.agentName,
-      normalizeName(membership.agentName),
-      membership.agentDescription,
-      membership.proactiveEnabled ? 1 : 0,
+      membership.agentName ?? null,
+      membership.agentName === undefined ? null : normalizeName(membership.agentName),
+      membership.agentDescription ?? null,
+      membership.agentName !== undefined && membership.proactiveEnabled ? 1 : 0,
       membership.credentialHash,
       membership.status,
       membership.createdAt,
@@ -1109,10 +1103,34 @@ export class BrokerDatabase {
 
   #migrate(): void {
     const version = this.#db.pragma("user_version", { simple: true }) as number;
-    if (version > 11) {
+    if (version > 12) {
       throw new Error(`数据库版本不受支持：${version}`);
     }
+    if (version === 12) return;
     if (version === 11) {
+      this.#db.transaction(() => {
+        this.#db.exec(`
+          CREATE TABLE group_memberships_v12 (
+            group_id TEXT NOT NULL REFERENCES groups(group_id),
+            session_key TEXT NOT NULL,
+            user_name TEXT NOT NULL,
+            normalized_user_name TEXT NOT NULL,
+            agent_name TEXT,
+            normalized_agent_name TEXT,
+            agent_description TEXT,
+            proactive_enabled INTEGER NOT NULL DEFAULT 0,
+            credential_hash TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL CHECK (status IN ('active', 'removed')),
+            created_at INTEGER NOT NULL,
+            last_active_at INTEGER NOT NULL,
+            PRIMARY KEY (group_id, session_key)
+          );
+          INSERT INTO group_memberships_v12 SELECT * FROM group_memberships;
+          DROP TABLE group_memberships;
+          ALTER TABLE group_memberships_v12 RENAME TO group_memberships;
+          PRAGMA user_version = 12;
+        `);
+      })();
       return;
     }
     if (version === 10) {
@@ -1128,6 +1146,7 @@ export class BrokerDatabase {
         }
         this.#db.pragma("user_version = 11");
       })();
+      this.#migrate();
       return;
     }
     if (version === 9) {
@@ -1612,7 +1631,7 @@ interface StoredMembershipRow extends Omit<StoredMembership, "proactiveEnabled">
 }
 
 function mapStoredMembership(row: StoredMembershipRow): StoredMembership {
-  return { ...row, proactiveEnabled: row.proactiveEnabled === 1 };
+  return { ...row, agentName: row.agentName ?? undefined, agentDescription: row.agentDescription ?? undefined, proactiveEnabled: row.proactiveEnabled === 1 };
 }
 
 interface StoredGroupRow {

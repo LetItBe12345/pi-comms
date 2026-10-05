@@ -32,8 +32,8 @@
     "broker:migrate": "tsx src/extension/broker-process.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
-    "test:unit": "vitest run --passWithNoTests --exclude tests/broker-process.test.ts --exclude tests/acceptance.test.ts --exclude tests/extension.test.ts --exclude tests/lan-e2e.test.ts",
-    "test:e2e": "vitest run --maxWorkers=1 tests/broker-process.test.ts tests/acceptance.test.ts tests/extension.test.ts tests/lan-e2e.test.ts",
+    "test:unit": "vitest run --passWithNoTests --exclude tests/broker-process.test.ts --exclude tests/acceptance.test.ts --exclude tests/extension.test.ts --exclude tests/lan-e2e.test.ts --exclude tests/web-server.test.ts --exclude tests/web-browser-e2e.test.ts",
+    "test:e2e": "vitest run --maxWorkers=1 tests/broker-process.test.ts tests/acceptance.test.ts tests/extension.test.ts tests/lan-e2e.test.ts tests/web-server.test.ts tests/web-browser-e2e.test.ts",
     "diagnose:mdns": "tsx scripts/mdns-diagnostic.ts",
     "accept:lan": "tsx scripts/lan-acceptance.ts",
     "check": "npm run typecheck && npm run test:unit && npm run test:e2e"
@@ -45,6 +45,9 @@
     "@earendil-works/pi-tui": "^0.99.2",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.20.1",
+    "@types/qrcode": "^1.5.6",
+    "@types/ws": "^8.18.2",
+    "playwright": "^1.63.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },
@@ -56,7 +59,9 @@
     "@modelcontextprotocol/sdk": "^1.31.0",
     "better-sqlite3": "^12.11.1",
     "bonjour-service": "^1.3.0",
+    "qrcode": "^1.5.4",
     "tsx": "^4.23.1",
+    "ws": "^8.22.0",
     "zod": "^4.6.5"
   }
 }

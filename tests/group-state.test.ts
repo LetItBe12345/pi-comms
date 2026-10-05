@@ -6,6 +6,21 @@ import {
 } from "../src/broker/group-state.js";
 
 describe("GroupState", () => {
+  it("纯人类成员没有 Agent，名称、在线和移除仍正常", () => {
+    const state = new GroupState();
+    const alice = state.createGroup("alice", "群组", "Alice", "Alice-Pi");
+    expect(() => state.joinGroup("bad", alice.groupId, "Alice-Pi", undefined)).toThrow("用户名称已被使用");
+    const bob = state.joinGroup("bob", alice.groupId, "Bob", undefined);
+    expect(bob.agent).toBeUndefined();
+    expect(state.members(alice.groupId).map((m) => m.displayName)).toEqual(["Alice", "Alice-Pi", "Bob"]);
+    expect(state.findMemberByName(alice.groupId, "bob")?.type).toBe("user");
+    expect(state.setOnline("bob", false)).toHaveLength(1);
+    expect(state.onlineMembers(alice.groupId)).toHaveLength(2);
+    state.setOnline("bob", true);
+    expect(state.onlineMembers(alice.groupId)).toHaveLength(3);
+    state.leaveGroup("bob");
+    expect(state.members(alice.groupId)).toHaveLength(2);
+  });
   it("按 Unicode 字符校验名称", () => {
     expect(() => validateDisplayName("中文_Name-24")).not.toThrow();
     expect(() => validateDisplayName("有 空格")).toThrow(GroupStateError);

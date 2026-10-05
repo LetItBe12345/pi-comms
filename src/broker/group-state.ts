@@ -27,7 +27,7 @@ export class GroupStateError extends Error {
 interface Membership {
   groupId: string;
   user: Member;
-  agent: Member;
+  agent?: Member;
 }
 
 interface GroupRecord extends Group {
@@ -52,7 +52,7 @@ export class GroupState {
     groupId = randomUUID(),
     stableSessionKey?: string,
     agentDescription = "",
-  ): Membership {
+  ): Membership & { agent: Member } {
     this.#ensureNotJoined(clientId);
     validateDisplayName(groupName);
     this.#validateMemberNames(userName, agentName);
@@ -78,7 +78,7 @@ export class GroupState {
       true,
       stableSessionKey,
       agentDescription,
-    );
+    ) as Membership & { agent: Member };
   }
 
   removeGroup(groupId: string): void {
@@ -140,7 +140,7 @@ export class GroupState {
     clientId: string,
     groupId: string,
     userName: string,
-    agentName: string,
+    agentName: string | undefined,
     isOwner = false,
     stableSessionKey?: string,
     agentDescription = "",
@@ -154,13 +154,13 @@ export class GroupState {
     const existingNames = new Set(
       [...group.memberships.values()].flatMap((membership) => [
         normalizeName(membership.user.displayName),
-        normalizeName(membership.agent.displayName),
+        ...(membership.agent ? [normalizeName(membership.agent.displayName)] : []),
       ]),
     );
     if (existingNames.has(normalizeName(userName))) {
       throw new GroupStateError("member_name_conflict", "用户名称已被使用");
     }
-    if (existingNames.has(normalizeName(agentName))) {
+    if (agentName !== undefined && existingNames.has(normalizeName(agentName))) {
       throw new GroupStateError("member_name_conflict", "Agent 名称已被使用");
     }
     return this.#join(
@@ -197,8 +197,8 @@ export class GroupState {
       return [];
     }
     membership.user.online = online;
-    membership.agent.online = online;
-    return [membership.user, membership.agent];
+    if (membership.agent) membership.agent.online = online;
+    return membershipMembers(membership);
   }
 
   setAgentStatus(
@@ -256,7 +256,7 @@ export class GroupState {
       return [];
     }
     return [...group.memberships.values()]
-      .flatMap((membership) => [membership.user, membership.agent])
+      .flatMap(membershipMembers)
       .filter((member) => member.online)
       .map((member) => ({ ...member }));
   }
@@ -267,7 +267,7 @@ export class GroupState {
       return [];
     }
     return [...group.memberships.values()]
-      .flatMap((membership) => [membership.user, membership.agent])
+      .flatMap(membershipMembers)
       .map((member) => ({ ...member }));
   }
 
@@ -288,7 +288,7 @@ export class GroupState {
     }
     const expected = normalizeName(displayName);
     for (const membership of group.memberships.values()) {
-      for (const member of [membership.user, membership.agent]) {
+      for (const member of membershipMembers(membership)) {
         if (normalizeName(member.displayName) === expected) {
           return member;
         }
@@ -313,8 +313,9 @@ export class GroupState {
     }
   }
 
-  #validateMemberNames(userName: string, agentName: string): void {
+  #validateMemberNames(userName: string, agentName: string | undefined): void {
     validateDisplayName(userName);
+    if (agentName === undefined) return;
     validateDisplayName(agentName);
     if (normalizeName(userName) === normalizeName(agentName)) {
       throw new GroupStateError(
@@ -328,7 +329,7 @@ export class GroupState {
     group: GroupRecord,
     clientId: string,
     userName: string,
-    agentName: string,
+    agentName: string | undefined,
     isOwner: boolean,
     stableSessionKey?: string,
     agentDescription = "",
@@ -345,7 +346,7 @@ export class GroupState {
         ...(isOwner ? { isOwner: true } : {}),
         ...(stableSessionKey === undefined ? {} : { stableSessionKey }),
       },
-      agent: {
+      ...(agentName === undefined ? {} : { agent: {
         memberId: `agent:${clientId}`,
         clientId,
         type: "agent",
@@ -358,7 +359,7 @@ export class GroupState {
         agentDescription,
         proactiveEnabled: true,
         ...(stableSessionKey === undefined ? {} : { stableSessionKey }),
-      },
+      } }),
     };
     group.memberships.set(clientId, membership);
     this.#memberships.set(clientId, membership);
@@ -382,4 +383,8 @@ export function validateDisplayName(name: string): void {
 
 function normalizeName(name: string): string {
   return name.toLocaleLowerCase("en-US");
+}
+
+export function membershipMembers(membership: Membership): Member[] {
+  return membership.agent ? [membership.user, membership.agent] : [membership.user];
 }

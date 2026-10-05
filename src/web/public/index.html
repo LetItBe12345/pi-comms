@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Pi Comms · 手机群聊</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><div><span class="brand">PI COMMS</span><h1 id="group-name">手机群聊</h1></div><span id="status" role="status">连接中</span></header>
+    <p id="error" role="alert" hidden></p>
+    <section id="join-view">
+      <h2>加入群聊</h2><p>使用自己的用户名加入，与群里的用户和 Agent 聊天。</p>
+      <form id="join-form"><label for="username">用户名</label><input id="username" maxlength="24" autocomplete="nickname" required placeholder="例如 Bob"><button id="join-button" type="submit">加入</button></form>
+      <p class="hint">名称支持中文、英文、数字、_ 和 -。手机用户无需配置 Agent。</p>
+    </section>
+    <section id="chat-view" hidden>
+      <details id="members"><summary>群成员</summary><ul id="member-list"></ul></details>
+      <div id="messages" role="log" aria-live="polite" aria-label="聊天消息"></div>
+      <div id="chains" aria-live="polite"></div>
+      <form id="send-form"><label class="sr-only" for="message">消息</label><textarea id="message" rows="2" placeholder="发送消息，或 @Agent名称 发起请求" required></textarea><button id="send-button" type="submit" disabled>发送</button></form>
+      <footer><span id="identity"></span><button id="leave-button" type="button" class="quiet">退出群组</button></footer>
+    </section>
+    <dialog id="leave-dialog"><h2>退出群组？</h2><p>退出会删除你的长期成员身份。再次扫码需要重新加入。</p><div class="dialog-actions"><button id="cancel-leave" class="quiet">取消</button><button id="confirm-leave">确认退出</button></div></dialog>
+  </main>
+</body>
+</html>

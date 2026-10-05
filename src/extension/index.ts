@@ -1,3 +1,4 @@
+import { mobileInvitationUrl, mobileInvitationQr } from "../web/invitation.js";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -1755,6 +1756,14 @@ export function createCommsExtension(
                       ownerCredential: savedMembership.ownerCredential,
                     });
                   },
+                  mobileInvitation: async () => {
+                    const address = primaryOrdinaryNetwork()?.address;
+                    if (brokerClient.webError) throw new Error(brokerClient.webError);
+                    if (!address || !currentGroup || !brokerClient.webPort) throw new Error("手机入口尚未就绪，请稍后重试");
+                    if (currentGroupSettings?.inviteRequired && !savedMembership?.inviteCode) throw new Error("请先生成新的邀请码，再显示手机邀请");
+                    const url = mobileInvitationUrl(address, currentGroup.groupId, savedMembership?.inviteCode, brokerClient.webPort);
+                    return { url, qr: await mobileInvitationQr(url) };
+                  },
                   showGroupInvitation: () => {
                     const address = getLanIPv4Addresses()[0];
                     if (
@@ -1780,14 +1789,18 @@ export function createCommsExtension(
                     "开启登录后自动开放？",
                     "这会修改当前用户的后台启动配置，不需要管理员密码。",
                   ),
-                  confirmNearbyAccess: async () => {
+                  nearbyAccessNeedsConfirmation: async () => {
+                    const network = primaryOrdinaryNetwork();
+                    return network !== undefined && !await networkAccessStore.isConfirmed(network);
+                  },
+                  confirmNearbyAccess: async (confirmedInChat) => {
                     const network = primaryOrdinaryNetwork();
                     if (network === undefined) {
                       ctx.ui.notify("当前网络无法连接附近设备", "error");
                       return false;
                     }
                     if (!await networkAccessStore.isConfirmed(network)) {
-                      const confirmed = await ctx.ui.confirm(
+                      const confirmed = confirmedInChat === true || await ctx.ui.confirm(
                         "允许附近设备看到这个群组？",
                         "只会使用当前普通网络。VPN 打开或关闭不会改变这个设置。",
                       );
@@ -2059,8 +2072,8 @@ export function formatParticipantDirectory(
     "群组角色目录：",
     ...participants.flatMap(({ user, agent }) => [
       `- 用户 ${user.name}${user.isOwner ? " [群主]" : ""}：${user.online ? "在线" : "离线"}`,
-      `  - Agent ${agent.name}：${agent.online ? "在线" : "离线"}；activity=${agent.activity}；availability=${agent.availability}`,
-      `    Description：${agent.description || "未提供"}`,
+      ...(agent ? [`  - Agent ${agent.name}：${agent.online ? "在线" : "离线"}；activity=${agent.activity}；availability=${agent.availability}`,
+      `    Description：${agent.description || "未提供"}`] : ["  - Web 用户（无 Agent）"]),
     ]),
   ];
 }
