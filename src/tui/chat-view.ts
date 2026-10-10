@@ -170,6 +170,8 @@ export class ChatView implements Component, Focusable {
   #pendingMobileInvitation = false;
   #nearbyConfirmList: SelectList | undefined;
   #permission: AgentPermission;
+  #permissionDraft: { permission: AgentPermission; proactiveEnabled: boolean } | undefined;
+  #permissionSelectedIndex = 0;
   #proactiveEnabled = true;
   #proactiveStatus: SnapshotPayload["proactiveStatus"] = "unconfigured";
   #pendingRequests: AgentRequestPayload[];
@@ -553,12 +555,17 @@ export class ChatView implements Component, Focusable {
     }
     if (this.#panel !== undefined) {
       if (matchesKey(data, Key.escape)) this.#closePanel();
-      else this.#activePanel()?.handleInput?.(data);
+      else if (this.#panel === "permission" &&
+        (matchesKey(data, Key.left) || matchesKey(data, Key.right))) {
+        this.#switchPermissionOption(matchesKey(data, Key.right) ? 1 : -1);
+      } else this.#activePanel()?.handleInput?.(data);
       this.#tui.requestRender();
       return;
     }
     if (this.#stage === "chat" && matchesKey(data, "ctrl+p")) {
       this.#panel = "permission";
+      this.#permissionDraft = { permission: this.#permission, proactiveEnabled: this.#proactiveEnabled };
+      this.#permissionSelectedIndex = 0;
       this.#permissionList = this.#createPermissionList();
       this.#syncFocus();
       this.#tui.requestRender();
@@ -957,7 +964,9 @@ export class ChatView implements Component, Focusable {
     if (this.#error !== undefined) {
       lines.push("", this.#theme.fg("warning", this.#error));
     }
-    lines.push("", this.#theme.fg("dim", "Enter 确认 · Esc 返回"));
+    lines.push("", this.#theme.fg("dim", this.#panel === "permission"
+      ? "↑↓ 选择 · ←→ 切换 · Enter 确认 · Esc 取消"
+      : "Enter 确认 · Esc 返回"));
     return lines.map((line) => truncateToWidth(line, width));
   }
 
@@ -978,6 +987,7 @@ export class ChatView implements Component, Focusable {
   }
 
   #closePanel(): void {
+    if (this.#panel === "permission") this.#permissionDraft = undefined;
     if (this.#panel === "nearby-confirm") { this.#pendingMobileInvitation = false; this.#panel = "group"; }
     else if (this.#panel === "mobile-invitation") this.#panel = "group";
     else if (this.#panel === "decision") this.#panel = "pending";
@@ -1002,9 +1012,27 @@ export class ChatView implements Component, Focusable {
     return new SelectList(items, 8, this.#selectTheme());
   }
 
+  #switchPermissionOption(direction: 1 | -1): void {
+    const item = this.#permissionList.getSelectedItem();
+    const draft = this.#permissionDraft;
+    if (draft === undefined) return;
+    if (item?.value === "permission") {
+      const values: AgentPermission[] = ["auto", "approval", "blocked"];
+      const index = values.indexOf(draft.permission);
+      draft.permission = values[(index + direction + values.length) % values.length]!;
+    } else if (item?.value === "proactive") {
+      draft.proactiveEnabled = !draft.proactiveEnabled;
+    } else return;
+    this.#permissionList = this.#createPermissionList();
+  }
+
   #createPermissionList(): SelectList {
-    const current = "（当前）";
-    const list = this.#createSelectList([
+    const permission = this.#permissionDraft?.permission ?? this.#permission;
+    const proactiveEnabled = this.#permissionDraft?.proactiveEnabled ?? this.#proactiveEnabled;
+    const labels: Record<AgentPermission, string> = {
+      auto: "自动接收", approval: "需要批准", blocked: "禁止接收",
+    };
+    const items: SelectItem[] = [
       {
         value: "pending",
         label: `待批准请求（${this.#pendingRequests.length}）`,
@@ -1016,23 +1044,13 @@ export class ChatView implements Component, Focusable {
         description: "每 10 轮选择继续或结束",
       },
       {
-        value: "auto",
-        label: `自动接收${this.#permission === "auto" ? current : ""}`,
-        description: "@Agent 后立即进入队列",
-      },
-      {
-        value: "approval",
-        label: `需要批准${this.#permission === "approval" ? current : ""}`,
-        description: "批准后才进入队列",
-      },
-      {
-        value: "blocked",
-        label: `禁止接收${this.#permission === "blocked" ? current : ""}`,
-        description: "拒绝新的 @Agent 请求",
+        value: "permission",
+        label: `被 @ 时：← ${labels[permission]} →`,
+        description: "自动接收 / 需要批准 / 禁止接收",
       },
       {
         value: "proactive",
-        label: `主动参与：${this.#proactiveEnabled ? "开启" : "关闭"}`,
+        label: `主动参与：← ${proactiveEnabled ? "开启" : "关闭"} →`,
         description: proactiveStatusDescription(this.#proactiveStatus),
       },
       ...(this.#showBrokerSettings ? [{
@@ -1040,27 +1058,36 @@ export class ChatView implements Component, Focusable {
         label: "Broker 设置",
         description: "配置独立的 DeepSeek Router API Key",
       }] : []),
-    ]);
+    ];
+    const list = this.#createSelectList(items);
+    list.setSelectedIndex(this.#permissionSelectedIndex);
+    list.onSelectionChange = (item) => {
+      this.#permissionSelectedIndex = items.findIndex((entry) => entry.value === item.value);
+    };
     list.onSelect = (item) => {
       if (item.value === "pending") {
         this.#panel = "pending";
       } else if (item.value === "chains") {
         this.#panel = "chains";
-      } else if (item.value === "proactive") {
-        const enabled = !this.#proactiveEnabled;
-        const synced = this.#actions.updateProactive?.(enabled) ?? false;
-        if (synced) this.#proactiveEnabled = enabled;
-        this.#panel = undefined;
-        this.#error = synced ? undefined : proactiveStatusDescription(this.#proactiveStatus);
       } else if (item.value === "broker-config") {
+        this.#permissionDraft = undefined;
         this.#panel = undefined;
         this.#actions.configureBroker?.();
       } else {
-        const permission = item.value as AgentPermission;
-        this.#permission = permission;
-        const synced = this.#actions.updatePermission(permission);
+        const draft = this.#permissionDraft;
+        let error: string | undefined;
+        if (draft !== undefined && draft.permission !== this.#permission) {
+          this.#permission = draft.permission;
+          if (!this.#actions.updatePermission(draft.permission)) error = "权限已保存，等待同步";
+        }
+        if (draft !== undefined && draft.proactiveEnabled !== this.#proactiveEnabled) {
+          if (this.#actions.updateProactive?.(draft.proactiveEnabled)) {
+            this.#proactiveEnabled = draft.proactiveEnabled;
+          } else error = proactiveStatusDescription(this.#proactiveStatus);
+        }
+        this.#permissionDraft = undefined;
         this.#panel = undefined;
-        this.#error = synced ? undefined : "权限已保存，等待同步";
+        this.#error = error;
       }
       this.#syncFocus();
       this.#tui.requestRender();
