@@ -1,6 +1,6 @@
 {
   "name": "pi-comms",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "description": "Local multi-session communication extension for Pi",
   "type": "module",
