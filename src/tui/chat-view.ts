@@ -658,10 +658,18 @@ export class ChatView implements Component, Focusable {
   }
 
   render(width: number): string[] {
-    if (this.#exitList !== undefined) return this.#renderExit(width);
-    if (this.#panel !== undefined) return this.#renderPanel(width);
-    if (this.#stage !== "chat") return this.#renderSetup(width);
-    return this.#renderChat(width);
+    const lines = this.#exitList !== undefined ? this.#renderExit(width)
+      : this.#panel !== undefined ? this.#renderPanel(width)
+      : this.#stage !== "chat" ? this.#renderSetup(width)
+      : this.#renderChat(width);
+    if (this.#historyViewport) {
+      if (this.#stage === "chat" && (this.#panel !== undefined || this.#exitList !== undefined)) {
+        lines.unshift(...this.#renderHeader(width), "");
+      }
+      // maxHeight only caps an overlay; short panels must still cover the coding UI.
+      while (lines.length < this.#tui.terminal.rows) lines.push("");
+    }
+    return lines;
   }
 
   dispose(): void {

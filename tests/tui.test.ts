@@ -108,7 +108,7 @@ function message(overrides: Partial<HistoryMessage>): HistoryMessage {
   };
 }
 
-function createView(overrides: Partial<ChatViewActions> = {}, fullscreen = false) {
+function createView(overrides: Partial<ChatViewActions> = {}, fullscreen = false, historyViewport?: boolean) {
   const terminal = new TestTerminal();
   const tui = fullscreen ? new TuiAltScreen(terminal) : new TuiMainScreen(terminal);
   const done = vi.fn();
@@ -130,6 +130,7 @@ function createView(overrides: Partial<ChatViewActions> = {}, fullscreen = false
     keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
     done,
     actions,
+    ...(historyViewport === undefined ? {} : { historyViewport }),
   });
   view.focused = true;
   return { view, terminal, tui, actions, done };
@@ -153,6 +154,54 @@ beforeAll(() => {
 });
 
 describe("最小群聊 TUI", () => {
+  it.each([
+    { fullscreen: false, owner: false },
+    { fullscreen: false, owner: true },
+    { fullscreen: true, owner: false },
+    { fullscreen: true, owner: true },
+  ])("群内面板覆盖 coding 界面，Esc 返回聊天且保留草稿（全屏：$fullscreen，群主：$owner）", async ({ fullscreen, owner }) => {
+    const { view, terminal, tui, done, actions } = createView({}, fullscreen, true);
+    tui.addChild({
+      render: () => Array.from({ length: terminal.rows }, () => "CODING_BACKGROUND"),
+      invalidate: () => undefined,
+    });
+    const state = snapshot();
+    state.isOwner = owner;
+    state.groupSettings = { groupId: "group-a", groupName: "开发组", visibility: "local", inviteRequired: false, keepAvailableWhenEmpty: false, openAtLogin: false };
+    view.applySnapshot(state);
+    view.setConnection("connected");
+    tui.showOverlay(view, { width: "100%", maxHeight: "100%", anchor: "top-left" });
+    tui.start();
+    const input = (data: string) => (tui as unknown as { handleTerminalInput(data: string): void }).handleTerminalInput(data);
+    try {
+      await flushRender();
+      input("保留的草稿");
+      for (const [key, title] of [["\x07", owner ? "群组管理" : "群组信息"], ["\x10", "Agent 控制"], ["?", "快捷键"]] as const) {
+        input(key);
+        terminal.clearWrites();
+        tui.requestRender(true);
+        await flushRender();
+        const rendered = terminal.writes.join("");
+        expect(rendered).toContain(title);
+        expect(rendered).not.toContain("CODING_BACKGROUND");
+        expect(view.render(terminal.columns)[0]).toContain("Pi Comms · 开发组");
+        expect(view.render(terminal.columns)).toHaveLength(terminal.rows);
+        input("\x1b");
+        expect(view.render(terminal.columns).join("\n")).toContain("保留的草稿");
+        expect(done).not.toHaveBeenCalled();
+        expect(actions.close).not.toHaveBeenCalled();
+      }
+      input("\x1b");
+      expect(view.render(terminal.columns).join("\n")).toContain("退出群聊？");
+      expect(view.render(terminal.columns)).toHaveLength(terminal.rows);
+      input("\x1b");
+      expect(done).not.toHaveBeenCalled();
+      terminal.rows = 40;
+      input("\x10");
+      expect(view.render(terminal.columns)).toHaveLength(40);
+    } finally { tui.stop(); }
+  });
+
   it("全屏群聊滚轮和翻页查看历史，新消息不拉走阅读位置，回到底部继续跟随", async () => {
     const { view, terminal, tui } = createView({}, true);
     terminal.rows = 18;
