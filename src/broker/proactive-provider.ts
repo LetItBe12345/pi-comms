@@ -3,7 +3,7 @@ import type { GroupParticipantContext } from "../types.js";
 
 export const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 export const DEEPSEEK_MODEL = "deepseek-flash";
-export const ROUTER_PROMPT_VERSION = "router-v3";
+export const ROUTER_PROMPT_VERSION = "router-v4";
 export const FRESHNESS_PROMPT_VERSION = "freshness-v3";
 export const SUMMARY_PROMPT_VERSION = "summary-v1";
 
@@ -278,12 +278,18 @@ export async function withProactiveRetry<T>(
 }
 
 const ROUTER_SYSTEM_PROMPT = `${ROUTER_PROMPT_VERSION}\n` +
-  "Select zero, one, or at most three agents from eligibleAgentIds only when each can add distinct value; " +
-  "correct an important error, add missing expertise, or materially advance the discussion. " +
+  "Help users get answers and solve problems. Select agents from eligibleAgentIds to answer unresolved human questions or carry out requests for help. " +
+  "A short or simple question still deserves an answer; do not require novel expertise or a major contribution. " +
+  "For an unanswered question or request, select the best suitable eligible agent by default. " +
+  "A general-purpose agent can answer ordinary questions even without a specialized description. " +
   "participants is the full group directory for understanding who works on what; " +
+  "questions about group members or agent counts can be answered using this directory. " +
   "never select an agent outside eligibleAgentIds. " +
-  "For greetings, agreement, repetition, or no useful contribution, select null. " +
-  "Default to zero or one. Return pure json only. Example json: {\"targetAgentIds\":[]}.";
+  "You may also select an agent to correct an important error, add missing expertise, or advance the discussion. " +
+  "Select zero for greetings without a question or request, agreement, already answered or resolved requests, or no suitable eligible agent. " +
+  "Select one by default; select at most three only when each can provide distinct complementary help. " +
+  "Return pure json only with targetAgentIds, an array of eligible IDs; use an empty array for zero agents. " +
+  "Example json: {\"targetAgentIds\":[]}.";
 
 const FRESHNESS_SYSTEM_PROMPT = `${FRESHNESS_PROMPT_VERSION}\n` +
   "Decide whether the complete candidate answer is still useful after the newer messages. " +

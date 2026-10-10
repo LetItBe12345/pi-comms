@@ -1594,6 +1594,7 @@ export function createCommsExtension(
             await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
               const view = new ChatView({
                 tui,
+                historyViewport: true,
                 theme,
                 keybindings,
                 done,
@@ -1925,7 +1926,7 @@ export function createCommsExtension(
                 });
               }
               return view;
-            });
+            }, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left" } });
             if (configureFromChat) {
               cachedUserName = activeView?.userName ?? cachedUserName;
               cachedAgentName = activeView?.agentName ?? cachedAgentName;

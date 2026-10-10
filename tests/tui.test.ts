@@ -2,6 +2,7 @@ import { initTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import {
   KeybindingsManager,
   TuiMainScreen,
+  TuiAltScreen,
   TUI_KEYBINDINGS,
   setKeybindings,
   visibleWidth,
@@ -107,9 +108,9 @@ function message(overrides: Partial<HistoryMessage>): HistoryMessage {
   };
 }
 
-function createView(overrides: Partial<ChatViewActions> = {}) {
+function createView(overrides: Partial<ChatViewActions> = {}, fullscreen = false) {
   const terminal = new TestTerminal();
-  const tui = new TuiMainScreen(terminal);
+  const tui = fullscreen ? new TuiAltScreen(terminal) : new TuiMainScreen(terminal);
   const done = vi.fn();
   const actions: ChatViewActions = {
     createGroup: vi.fn(() => "create-1"),
@@ -152,6 +153,48 @@ beforeAll(() => {
 });
 
 describe("最小群聊 TUI", () => {
+  it("全屏群聊滚轮和翻页查看历史，新消息不拉走阅读位置，回到底部继续跟随", async () => {
+    const { view, terminal, tui } = createView({}, true);
+    terminal.rows = 18;
+    const base = Date.now();
+    view.applySnapshot(snapshot(Array.from({ length: 40 }, (_, index) => message({
+      messageId: `scroll-${index}`, groupSeq: index + 1,
+      text: `滚动记录-${String(index + 1).padStart(3, "0")}`,
+      timestamp: base + index * 180_000,
+    }))));
+    view.setConnection("connected");
+    tui.showOverlay(view, { width: "100%", maxHeight: "100%", anchor: "top-left" });
+    tui.start();
+    const input = (data: string) => (tui as unknown as { handleTerminalInput(data: string): void }).handleTerminalInput(data);
+    try {
+      await flushRender();
+      expect(view.render(80)).toHaveLength(terminal.rows);
+      expect(view.render(80).join("\n")).toContain("滚动记录-040");
+      input("\x1b[5~"); // Page Up goes to the focused overlay, not Pi's transcript.
+      await flushRender();
+      const reading = view.render(80).join("\n");
+      expect(reading).not.toContain("滚动记录-040");
+      expect(reading).toContain("历史消息");
+      view.receiveMessage(message({ messageId: "scroll-new", groupSeq: 41, text: "新到消息", timestamp: base + 41 * 180_000 }));
+      expect(view.render(80).join("\n")).toBe(reading);
+      input("\x1b[<64;10;5M"); // Mouse wheel up.
+      await flushRender();
+      expect(view.render(80).join("\n")).not.toBe(reading);
+      input("\x1b[H"); // Home.
+      await flushRender();
+      expect(view.render(80).join("\n")).toContain("滚动记录-001");
+      input("\x1b[<0;100;2M"); // Grab the scrollbar at its top.
+      input("\x1b[<32;100;12M"); // Drag to its bottom.
+      input("\x1b[<0;100;12m");
+      await flushRender();
+      expect(view.render(80).join("\n")).toContain("新到消息");
+      input("\x1b[5~");
+      input("\x1b[F"); // End.
+      await flushRender();
+      expect(view.render(80).join("\n")).toContain("新到消息");
+      expect(view.render(80).join("\n")).toContain("最新消息");
+    } finally { tui.stop(); }
+  });
   it("手机邀请复用附近加入入口，QR 可返回，纯人类成员不显示假 Agent", async () => {
     const mobileInvitation = vi.fn(async () => ({ url: "http://192.168.1.2:43128/#/join/group-a", qr: "██  ██\n██  ██\n" }));
     const { view } = createView({ mobileInvitation });
