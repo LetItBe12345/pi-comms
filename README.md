@@ -176,7 +176,7 @@ Android Chrome 的真实设备验收说明见 [手机验收](./docs/mobile-web-a
 - `@用户名称`：只做公开提醒。
 - `@Agent名称`：公开显示消息，同时把任务注入目标 Pi Session。
 - 连续多个 `@Agent名称`：每个目标独立排队、审批、执行和回复；单个失败不影响其他目标。
-- `Ctrl+P`：打开 Agent 权限、Proactive 开关和请求控制面板。
+- `Ctrl+P`：打开 Agent 权限、Proactive 开关和请求控制面板。上下选择选项，左右切换权限或主动参与开关；Enter 确认保存，Esc 放弃修改。
 - `Shift+Enter`：换行。
 - `Esc`：退出群聊，返回原 Pi 界面。
 

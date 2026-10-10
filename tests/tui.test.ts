@@ -425,7 +425,8 @@ describe("最小群聊 TUI", () => {
     expect(view.render(80).join("\n")).toContain("Agent 控制");
     view.handleInput("\x1b[B");
     view.handleInput("\x1b[B");
-    view.handleInput("\x1b[B");
+    view.handleInput("\x1b[C");
+    expect(updatePermission).not.toHaveBeenCalled();
     view.handleInput("\r");
     expect(updatePermission).toHaveBeenCalledWith("approval");
     expect(view.render(80).join("\n")).toContain("被 @ 时 需批准");
@@ -464,11 +465,58 @@ describe("最小群聊 TUI", () => {
     });
     view.setConnection("connected");
     view.handleInput("\x10");
-    expect(view.render(80).join("\n")).toContain("主动参与：关闭");
-    for (let index = 0; index < 5; index += 1) view.handleInput("\x1b[B");
+    expect(view.render(80).join("\n")).toContain("主动参与：← 关闭 →");
+    for (let index = 0; index < 3; index += 1) view.handleInput("\x1b[B");
+    view.handleInput("\x1b[C");
+    expect(updateProactive).not.toHaveBeenCalled();
     view.handleInput("\r");
     expect(updateProactive).toHaveBeenCalledWith(true);
     expect(view.render(80).join("\n")).toContain("主动参与 开启");
+  });
+
+  it("左右暂存两项设置，Enter 一次确认，实时状态更新保留选择", () => {
+    const updatePermission = vi.fn(() => true);
+    const updateProactive = vi.fn(() => true);
+    const { view } = createView({ updatePermission, updateProactive });
+    view.applySnapshot({ ...snapshot(), proactiveStatus: "ready", ownProactiveEnabled: false });
+    view.handleInput("\x10");
+    view.handleInput("\x1b[B");
+    view.handleInput("\x1b[B");
+    view.handleInput("\x1b[D"); // auto -> blocked
+    expect(view.render(80).join("\n")).toContain("被 @ 时：← 禁止接收 →");
+    view.setProactive(false, "ready");
+    view.handleInput("\x1b[D"); // blocked -> approval; selection survives refresh
+    view.handleInput("\x1b[B");
+    view.handleInput("\x1b[D");
+    expect(updatePermission).not.toHaveBeenCalled();
+    expect(updateProactive).not.toHaveBeenCalled();
+    expect(view.render(80).join("\n")).toContain("↑↓ 选择 · ←→ 切换 · Enter 确认 · Esc 取消");
+    view.handleInput("\r");
+    expect(updatePermission).toHaveBeenCalledExactlyOnceWith("approval");
+    expect(updateProactive).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it("Esc 放弃暂存设置，直接 Enter 不修改当前值", () => {
+    const updatePermission = vi.fn(() => true);
+    const updateProactive = vi.fn(() => true);
+    const { view } = createView({ updatePermission, updateProactive });
+    view.applySnapshot({ ...snapshot(), proactiveStatus: "ready", ownProactiveEnabled: false });
+    view.handleInput("\x10");
+    view.handleInput("\x1b[B");
+    view.handleInput("\x1b[B");
+    view.handleInput("\x1b[C");
+    view.handleInput("\x1b[B");
+    view.handleInput("\x1b[C");
+    view.handleInput("\x1b");
+    expect(updatePermission).not.toHaveBeenCalled();
+    expect(updateProactive).not.toHaveBeenCalled();
+    view.handleInput("\x10");
+    expect(view.render(80).join("\n")).toContain("被 @ 时：← 自动接收 →");
+    expect(view.render(80).join("\n")).toContain("主动参与：← 关闭 →");
+    for (let index = 0; index < 3; index += 1) view.handleInput("\x1b[B");
+    view.handleInput("\r");
+    expect(updatePermission).not.toHaveBeenCalled();
+    expect(updateProactive).not.toHaveBeenCalled();
   });
 
   it("显示自动路由轮数，并通过 Ctrl+P 继续暂停链", () => {

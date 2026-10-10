@@ -32,3 +32,5 @@
 - [阶段 25：Broker MCP 群聊上下文读取](./25-broker-mcp-group-context.md)
 
 - [阶段 26：Broker 路由模型配置引导](./26-broker-router-setup-guide.md)
+
+- [阶段 28：Agent 控制面板键盘交互](./28-agent-control-keyboard.md)

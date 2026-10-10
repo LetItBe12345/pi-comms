@@ -45,6 +45,8 @@
 
 | 27 | [手机 Web UI](./in-progress/27-mobile-web-ui.md) | 二维码邀请独立手机用户，浏览器群聊与现有 Pi Agent 通信 | in-progress（实现与本地验收完成，等待真实手机） | 阶段 25、26 |
 
+| 28 | [Agent 控制面板键盘交互](./done/28-agent-control-keyboard.md) | 上下选择、左右切换、Enter 确认、Esc 取消 | done | 阶段 8、19 |
+
 ## 当前里程碑
 
 阶段 0～16A、17～26 已完成。阶段 16B 等待三台真实设备。阶段 27 实现与本地验收完成，等待真实手机。
