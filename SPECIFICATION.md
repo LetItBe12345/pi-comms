@@ -587,7 +587,7 @@ seenRequestIds: Set<string>;
 - 用户消息最大宽度为终端的 70%，Agent 消息为 85%；小于 60 列时统一为 94%，消息块最小宽度为 12 列。
 - 用户消息按纯文本显示；Agent 消息复用 Pi Markdown、主题和文本换行能力。
 - 使用 Pi Editor 默认键位：Enter 发送，Shift+Enter 或 Ctrl+J 换行，并保留多行粘贴。
-- 不实现自定义滚动，`ChatView` 始终返回当前内存中的完整 timeline，由终端原生 scrollback 查看旧消息。
+- 群聊通过全宽自定义 overlay 展示，聊天记录使用独立视口，底部输入框固定。复用 Pi ScrollView 保存滚动位置与跟随状态；支持 Page Up / Page Down 翻页、Home / End 跳到顶部或底部。Pi 全屏模式还支持滚轮及右侧滚动条拖动，不依赖主聊天区或终端 scrollback。查看历史时新消息不改变阅读位置；回到底部后继续跟随。
 - 普通消息追加、输入和底部状态变化不得清空终端 scrollback；窗口缩放、断线重连快照、控制面板和退出确认允许完整重绘。
 - `@` 只补全在线群成员；`@用户` 公开提醒，`@Agent` 注入目标 Session。
 - 群聊输入中的 `/` 和 `!` 是普通文字，不执行 Pi 命令或 Shell。
@@ -753,13 +753,13 @@ pi-comms/
 - 每群第一条消息启动 batch；后续消息把 debounce 延后到最后一条后 800ms，但从第一条起最多等 2 秒。每群 Router 请求开始时间间隔不少于 5 秒。
 - 整个 Broker 同时只运行一个 DeepSeek 请求。用户发起的 Key 验证优先，其次是 Freshness、Summary、Router。多群 Router 按 round-robin 调度，多个 Freshness 按结果到达时间 FIFO；连续 Freshness 不得让已排队 Summary 长期饿死。
 - Router 输入包含群聊滚动摘要和最近 12 条人类或 Agent 公开文本，按 `groupSeq` 去重排序。候选为 `{ agentId, name, description }`。
-- Router Prompt 要求只在能回答未解决问题、纠正重要错误、补充缺失专业知识或明显推进讨论时选择 Agent；寒暄、附和、重复和无实质内容应返回 `null`。
+- Router Prompt 优先响应尚未回答的人类问题和求助，默认选择一个合适的 eligible Agent。简短问题、普通问题和群成员数量等目录问题也应响应，不要求额外专业价值；通用 Agent 可以回答普通问题。纠正重要错误、补充缺失专业知识或推进讨论也可邀请。只有无问题的寒暄、附和、已回答或已解决的请求、没有合适候选时才返回空数组；最多邀请三个互补 Agent。
 - Router 返回后再次检查目标的当前授权、online、idle 和 membership。不再满足时丢弃，不改选第二名。
 
 ### 19.4 DeepSeek Provider
 
 - Router、Freshness 和 Summary 都使用 Chat Completions JSON Output：`thinking: { type: "disabled" }`、`response_format: { type: "json_object" }`、`temperature: 0`、`stream: false`。Router/Freshness 的 `max_tokens` 为 128；Summary 为 1024。
-- Router、Freshness 和 Summary Prompt 版本分别为 `router-v2`、`freshness-v2` 和 `summary-v1`。Prompt 必须明确包含 `json` 字样和合法 JSON 示例。
+- Router、Freshness 和 Summary Prompt 版本分别为 `router-v4`、`freshness-v3` 和 `summary-v1`。Prompt 必须明确包含 `json` 字样和合法 JSON 示例。
 - Router 只要求 `{ "targetAgentIds": ["agent:..."] }`，空数组表示不邀请；最多 3 个、去重且必须属于本次 eligible 集合。Freshness 只要求 `{ "publish": true }` 或 `{ "publish": false }`。`reason` 可选、忽略且不记录。
 - Provider 只接受纯 JSON。Markdown 代码块不自动剥离。`targetAgentIds` 必须是最多 3 个当前 eligible ID 的数组；重复、未知 ID、非法类型和缺少字段都非法。`publish` 必须是 JSON 布尔值。未知顶层字段允许并忽略。
 - 网络错误、3 秒超时、`429` 和 `5xx` 最多共请求 3 次。两次重试分别 full jitter `0～500ms` 和 `0～1000ms`；`Retry-After` 优先，单次最多等 5 秒。

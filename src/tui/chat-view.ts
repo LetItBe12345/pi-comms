@@ -5,6 +5,8 @@ import {
   Key,
   Markdown,
   SelectList,
+  ScrollView,
+  isViewportTUI,
   matchesKey,
   truncateToWidth,
   visibleWidth,
@@ -16,6 +18,8 @@ import {
   type KeybindingsManager,
   type SelectItem,
   type TUI,
+  type TuiMouseEvent,
+  type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
 import type {
   ErrorPayload,
@@ -102,6 +106,7 @@ export interface ChatViewOptions {
   initialGroupName?: string;
   openGroupPanelOnJoin?: boolean;
   showBrokerSettings?: boolean;
+  historyViewport?: boolean;
 }
 
 interface PendingSetup {
@@ -127,6 +132,10 @@ export class ChatView implements Component, Focusable {
   readonly #groupInput = new Input();
   readonly #inviteInput = new Input();
   readonly #editor: Editor;
+  readonly #historyScroll = new ScrollView({ render: (width) => this.#renderTimeline(width), invalidate: () => {} }, { follow: "end" });
+  readonly #historyViewport: boolean;
+  #historyBar: { y: number; height: number; thumbTop: number; thumbHeight: number; maxScroll: number } | undefined;
+  #historyDragOffset: number | undefined;
   #stage: SetupStage = "user";
   #connection: ConnectionState = "connecting";
   #networkStatus: { state: NetworkStatus; name?: string } = {
@@ -191,6 +200,7 @@ export class ChatView implements Component, Focusable {
 
   constructor(options: ChatViewOptions) {
     this.#tui = options.tui;
+    this.#historyViewport = options.historyViewport ?? isViewportTUI(options.tui);
     this.#theme = options.theme;
     this.#keybindings = options.keybindings;
     this.#done = options.done;
@@ -344,6 +354,7 @@ export class ChatView implements Component, Focusable {
   }
 
   applySnapshot(snapshot: SnapshotPayload): void {
+    if (this.#snapshot?.group?.groupId !== snapshot.group?.groupId) this.#historyScroll.scrollToEnd();
     this.#snapshot = snapshot;
     this.#proactiveEnabled = snapshot.ownProactiveEnabled === true;
     this.#proactiveStatus = snapshot.proactiveStatus ?? "unconfigured";
@@ -589,8 +600,42 @@ export class ChatView implements Component, Focusable {
       this.#requestClose();
       return;
     }
+    if (this.#stage === "chat" && this.#historyViewport) {
+      const scroll = this.#historyScroll;
+      const page = Math.max(1, scroll.viewportHeight - 1);
+      if (this.#keybindings.matches(data, "tui.altScreen.pageUp")) scroll.scrollBy(-page);
+      else if (this.#keybindings.matches(data, "tui.altScreen.pageDown")) scroll.scrollBy(page);
+      else if (this.#keybindings.matches(data, "tui.altScreen.top")) scroll.scrollToStart();
+      else if (this.#keybindings.matches(data, "tui.altScreen.bottom")) scroll.scrollToEnd();
+      else { this.#activeInput()?.handleInput?.(data); this.#tui.requestRender(); return; }
+      this.#tui.requestRender();
+      return;
+    }
     this.#activeInput()?.handleInput?.(data);
     this.#tui.requestRender();
+  }
+
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+    if (this.#stage !== "chat" || this.#panel !== undefined || this.#exitList !== undefined || !this.#historyViewport) return undefined;
+    if (event.type === "wheel") {
+      this.#historyScroll.scrollBy(event.wheelDelta ?? 0);
+      return { handled: true, render: true };
+    }
+    if (event.type === "release" && this.#historyDragOffset !== undefined) {
+      this.#historyDragOffset = undefined;
+      return { handled: true };
+    }
+    const bar = this.#historyBar;
+    if (!bar) return undefined;
+    if (event.type === "press" && event.button === "left" && event.x === event.width - 1 && event.y >= bar.y && event.y < bar.y + bar.height) {
+      const row = event.y - bar.y;
+      this.#historyDragOffset = row >= bar.thumbTop && row < bar.thumbTop + bar.thumbHeight
+        ? row - bar.thumbTop : Math.floor(bar.thumbHeight / 2);
+    } else if (event.type !== "drag" || this.#historyDragOffset === undefined) return undefined;
+    const travel = bar.height - bar.thumbHeight;
+    const row = Math.max(0, Math.min(travel, event.y - bar.y - this.#historyDragOffset));
+    this.#historyScroll.scrollTo(travel > 0 ? Math.round(row / travel * bar.maxScroll) : 0);
+    return { handled: true, capture: true, render: true };
   }
 
   invalidate(): void {
@@ -762,7 +807,7 @@ export class ChatView implements Component, Focusable {
 
   #renderChat(width: number): string[] {
     const header = this.#renderHeader(width);
-    const timeline = this.#renderTimeline(width);
+    const timeline = this.#historyViewport ? this.#historyScroll.render(Math.max(1, width - 1)) : this.#renderTimeline(width);
     const editor = this.#editor.render(width);
     const shortcutText = width < 60
       ? "Esc 返回 · ? 快捷键"
@@ -777,7 +822,26 @@ export class ChatView implements Component, Focusable {
     const error = this.#error === undefined
       ? []
       : [truncateToWidth(this.#theme.fg("warning", this.#error), width)];
-    return [...header, ...timeline, ...error, ...editor, ...this.#renderFooter(width), hint];
+    const footer = this.#renderFooter(width);
+    if (!this.#historyViewport) return [...header, ...timeline, ...error, ...editor, ...footer, hint];
+    const height = Math.max(1, this.#tui.terminal.rows - header.length - error.length - editor.length - footer.length - 2);
+    this.#historyScroll.updateLayout(timeline.length, height, () => this.#tui.requestRender());
+    const top = this.#historyScroll.scrollTop;
+    const visible = timeline.slice(top, top + height);
+    while (visible.length < height) visible.push("");
+    const maxScroll = Math.max(0, timeline.length - height);
+    const thumbHeight = Math.max(1, Math.min(height, Math.floor(height * height / Math.max(1, timeline.length))));
+    const thumbTop = maxScroll > 0 ? Math.round(top / maxScroll * (height - thumbHeight)) : 0;
+    this.#historyBar = maxScroll > 0 ? { y: header.length, height, thumbTop, thumbHeight, maxScroll } : undefined;
+    if (width > 1) {
+      for (let index = 0; index < visible.length; index += 1) {
+        visible[index] += " ".repeat(Math.max(0, width - 1 - visibleWidth(visible[index]!))) +
+          this.#theme.fg("muted", maxScroll === 0 ? " " : index >= thumbTop && index < thumbTop + thumbHeight ? "█" : "│");
+      }
+    }
+    const position = this.#historyScroll.isFollowingEnd ? "最新消息" : "历史消息";
+    const scrollHint = truncateToWidth(this.#theme.fg("dim", `${position} · 滚轮 / PgUp / PgDn 查看历史`), width);
+    return [...header, ...visible, scrollHint, ...error, ...editor, ...footer, hint];
   }
 
   #renderHeader(width: number): string[] {
@@ -931,6 +995,9 @@ export class ChatView implements Component, Focusable {
       lines.push(
         "Ctrl+G  群组管理 / 群组信息",
         "Ctrl+P  Agent 控制",
+        "PgUp/PgDn  查看聊天历史",
+        "Home/End   最早 / 最新消息",
+        "滚轮或拖动右侧滚动条（Pi 全屏模式）",
         "Esc     返回或退出",
         "?       全部快捷键",
       );
