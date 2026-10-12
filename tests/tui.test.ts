@@ -9,7 +9,7 @@ import {
   type Terminal,
 } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { ChatView, type ChatViewActions } from "../src/tui/chat-view.js";
+import { ChatView, type ChatViewActions, type ChatViewOptions } from "../src/tui/chat-view.js";
 import { GroupPicker, RequiredChoice } from "../src/tui/group-picker.js";
 import type { HistoryMessage, SnapshotPayload } from "../src/protocol.js";
 
@@ -108,7 +108,7 @@ function message(overrides: Partial<HistoryMessage>): HistoryMessage {
   };
 }
 
-function createView(overrides: Partial<ChatViewActions> = {}, fullscreen = false, historyViewport?: boolean) {
+function createView(overrides: Partial<ChatViewActions> = {}, fullscreen = false, historyViewport?: boolean, initial: Partial<ChatViewOptions> = {}) {
   const terminal = new TestTerminal();
   const tui = fullscreen ? new TuiAltScreen(terminal) : new TuiMainScreen(terminal);
   const done = vi.fn();
@@ -131,6 +131,7 @@ function createView(overrides: Partial<ChatViewActions> = {}, fullscreen = false
     done,
     actions,
     ...(historyViewport === undefined ? {} : { historyViewport }),
+    ...initial,
   });
   view.focused = true;
   return { view, terminal, tui, actions, done };
@@ -154,6 +155,28 @@ beforeAll(() => {
 });
 
 describe("最小群聊 TUI", () => {
+  it("直接加入已选群组会跳过身份设置，并能修正邀请码后重试", () => {
+    const { view, actions } = createView({}, false, undefined, {
+      initialUserName: "Bob",
+      initialAgentName: "Bob-Pi",
+      initialAgentDescription: "负责测试",
+    });
+    view.setGroups([{ groupId: "nearby", groupName: "附近开发组", onlineSessionCount: 1 }]);
+    view.joinGroup("nearby");
+    view.joinGroup("nearby");
+    expect(actions.joinGroup).toHaveBeenCalledTimes(1);
+    expect(actions.joinGroup).toHaveBeenCalledWith("nearby", "Bob", "Bob-Pi", "负责测试");
+    expect(view.render(80).join("\n")).toContain("正在加入群组");
+    expect(view.render(80).join("\n")).not.toContain("设置用户名称");
+    view.receiveError({ code: "invite_invalid", message: "邀请码不正确", requestId: "join-1" });
+    expect(view.render(80).join("\n")).toContain("输入群组邀请码");
+    type(view, "ABCDE-FGHJK");
+    view.handleInput("\r");
+    expect(actions.joinGroup).toHaveBeenLastCalledWith("nearby", "Bob", "Bob-Pi", "负责测试", "ABCDEFGHJK");
+    view.applySnapshot(snapshot());
+    expect(view.render(80).join("\n")).toContain("Pi Comms · 开发组");
+  });
+
   it.each([
     { fullscreen: false, owner: false },
     { fullscreen: false, owner: true },

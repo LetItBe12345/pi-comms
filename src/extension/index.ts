@@ -1531,19 +1531,6 @@ export function createCommsExtension(
         }
         if (
           connected &&
-          connectionConfig.mode === "lan-client" &&
-          savedMembership?.groupId !== connectionConfig.groupId
-        ) {
-          desiredMembership = {
-            groupId: connectionConfig.groupId,
-            userName: cachedUserName,
-            agentName: cachedAgentName,
-            agentDescription: pendingAgentDescription,
-            inviteCode: connectionConfig.inviteCode,
-          };
-        }
-        if (
-          connected &&
           pendingCreate !== undefined &&
           !(await checkBrokerKeyBeforeCreate(ctx))
         ) {
@@ -1904,6 +1891,13 @@ export function createCommsExtension(
               ctx.ui.setStatus(STATUS_KEY, undefined);
               view.setGroups(availableGroups);
               view.setConnection(brokerClient.connected ? "connected" : "connecting");
+              if (
+                connected &&
+                connectionConfig?.mode === "lan-client" &&
+                savedMembership?.groupId !== connectionConfig.groupId
+              ) {
+                view.joinGroup(connectionConfig.groupId);
+              }
               if (currentGroup !== undefined && clientId !== undefined) {
                 view.applySnapshot({
                   brokerInstanceId: brokerInstanceId ?? "",
