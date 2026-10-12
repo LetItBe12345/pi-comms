@@ -353,6 +353,26 @@ export class ChatView implements Component, Focusable {
     this.#tui.requestRender();
   }
 
+  joinGroup(groupId: string): void {
+    if (this.#pendingSetup !== undefined) return;
+    this.#stage = "join";
+    this.#pendingJoinGroupId = groupId;
+    const id = this.#actions.joinGroup(
+      groupId,
+      this.userName,
+      this.agentName,
+      this.agentDescription,
+    );
+    if (id === undefined) {
+      this.#error = "群聊暂时未连接，正在重试";
+    } else {
+      this.#pendingSetup = { id, stage: "join" };
+      this.#error = "正在加入群组…";
+    }
+    this.#syncFocus();
+    this.#tui.requestRender();
+  }
+
   applySnapshot(snapshot: SnapshotPayload): void {
     if (this.#snapshot?.group?.groupId !== snapshot.group?.groupId) this.#historyScroll.scrollToEnd();
     this.#snapshot = snapshot;
@@ -1607,21 +1627,7 @@ export class ChatView implements Component, Focusable {
       })),
     );
     list.onSelect = (item) => {
-      if (this.#pendingSetup !== undefined) return;
-      this.#pendingJoinGroupId = item.value;
-      const id = this.#actions.joinGroup(
-        item.value,
-        this.userName,
-        this.agentName,
-        this.agentDescription,
-      );
-      if (id === undefined) {
-        this.#error = "群聊暂时未连接，正在重试";
-      } else {
-        this.#pendingSetup = { id, stage: "join" };
-        this.#error = "正在加入群组…";
-      }
-      this.#tui.requestRender();
+      this.joinGroup(item.value);
     };
     list.onCancel = () => this.#goBack();
     return list;

@@ -7,8 +7,12 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
   ExtensionUIContext,
+  Theme,
 } from "@earendil-works/pi-coding-agent";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { initTheme } from "@earendil-works/pi-coding-agent";
+import { KeybindingsManager, TUI_KEYBINDINGS, TuiAltScreen, type Terminal } from "@earendil-works/pi-tui";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ChatView } from "../src/tui/chat-view.js";
 import {
   createBrokerServer,
   type BrokerServer,
@@ -280,6 +284,85 @@ describe("Pi Extension 群组接入", () => {
       a.pi.emit("session_shutdown", a.ctx),
       b.pi.emit("session_shutdown", b.ctx),
     ]);
+  });
+
+  it.each(["nearby", "paste"])("首次通过 %s 选择群组后只填写一次身份，直接入群", async (entry) => {
+    await launchBroker();
+    const a = setup("session-a");
+    await start(a);
+    const groupId = await createGroup(a);
+    const pi = new FakePi();
+    const b = createFakeContext("session-b");
+    Object.assign(b.ctx, { mode: "tui" });
+    const input = vi.fn(async (title: string) => ({
+      "粘贴群组加入信息": `${endpoint.host}:${endpoint.port} ${groupId}`,
+      "你的名称": "Bob",
+      "你的 Agent 名称": "Bob-Pi",
+      "Agent Description": "负责测试",
+    })[title]);
+    let view: ChatView | undefined;
+    let customCalls = 0;
+    Object.assign(b.ctx.ui, {
+      input,
+      custom: async (factory: Parameters<ExtensionUIContext["custom"]>[0]) => {
+        if (customCalls++ === 0) {
+          return entry === "paste" ? { type: "paste" } : {
+            type: "nearby",
+            group: { groupId, endpoint, brokerId: broker!.brokerId },
+          };
+        }
+        const terminal = { columns: 100, rows: 30 } as Terminal;
+        initTheme("dark", false);
+        const theme = {
+          fg: (_color: string, text: string) => text,
+          bg: (_color: string, text: string) => text,
+          bold: (text: string) => text,
+          italic: (text: string) => text,
+          underline: (text: string) => text,
+          inverse: (text: string) => text,
+          strikethrough: (text: string) => text,
+        } as unknown as Theme;
+        view = await factory(
+          new TuiAltScreen(terminal),
+          theme,
+          new KeybindingsManager(TUI_KEYBINDINGS) as Parameters<typeof factory>[2],
+          () => {},
+        ) as ChatView;
+        await waitFor(
+          () => view!.render(100).join("\n").includes("Pi Comms · 开发组"),
+          "首次选择群组后没有自动入群",
+        );
+        expect(view.userName).toBe("Bob");
+        expect(view.agentName).toBe("Bob-Pi");
+        expect(view.agentDescription).toBe("负责测试");
+        view.handleInput("hello from Bob");
+        view.handleInput("\r");
+        await waitFor(
+          () => a.notices.some(({ message }) => message === "[Bob] hello from Bob"),
+          "自动入群后无法发送消息",
+        );
+      },
+    });
+    createCommsExtension({ endpoint, dbPath })(pi.api);
+    try {
+      await pi.emit("session_start", b.ctx);
+      await pi.commands.get("comms")!("", b.ctx as ExtensionCommandContext);
+      expect(input.mock.calls.map(([title]) => title)).toEqual([
+        ...(entry === "paste" ? ["粘贴群组加入信息"] : []),
+        "你的名称", "你的 Agent 名称", "Agent Description",
+      ]);
+      expect(customCalls).toBe(2);
+      expect(pi.appendedEntries).toContainEqual(expect.objectContaining({
+        customType: "pi-comms-membership",
+        data: expect.objectContaining({ groupId, userName: "Bob", agentName: "Bob-Pi" }),
+      }));
+    } finally {
+      view?.dispose();
+      await Promise.all([
+        pi.emit("session_shutdown", b.ctx),
+        a.pi.emit("session_shutdown", a.ctx),
+      ]);
+    }
   });
 
   it("未入群不能发送，并能查看本机群组列表", async () => {
